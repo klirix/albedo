@@ -235,6 +235,74 @@ test "decodes BSONBinary" {
     try std.testing.expectEqual(expected_subtype, binary.subtype);
 }
 
+pub const BSONBoolean = struct {
+    value: bool,
+
+    pub fn write(self: BSONBoolean, memory: []u8) void {
+        memory[0] = if (self.value) 0x01 else 0x00;
+    }
+
+    pub fn size(_: BSONBoolean) u32 {
+        return 1;
+    }
+
+    pub fn read(memory: []u8) BSONBoolean {
+        return BSONBoolean{ .value = memory[0] != 0x00 };
+    }
+};
+
+test "encodes BSONBoolean" {
+    var allocator = std.testing.allocator;
+    const test_bool = true;
+    var boolean = BSONBoolean{ .value = test_bool };
+    const actual = allocator.alloc(u8, boolean.size()) catch unreachable;
+    boolean.write(actual);
+    defer allocator.free(actual);
+
+    const expected_bool = @constCast(&[_]u8{0x01});
+    const expected: []u8 = expected_bool[0..];
+    try std.testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "decodes BSONBoolean" {
+    const test_memory = @constCast(&[_]u8{0x01});
+    const expected_bool = true;
+    const boolean = BSONBoolean.read(test_memory[0..]);
+    try std.testing.expectEqual(expected_bool, boolean.value);
+}
+
+pub const BSONNull = struct {
+    pub fn write(_: BSONNull, memory: []u8) void {
+        // Null type does not need to write any data
+    }
+
+    pub fn size(_: BSONNull) u32 {
+        return 0;
+    }
+
+    pub fn read(_: []u8) BSONNull {
+        return BSONNull{};
+    }
+};
+
+test "encodes BSONNull" {
+    var allocator = std.testing.allocator;
+    var null_value = BSONNull{};
+    const actual = allocator.alloc(u8, null_value.size()) catch unreachable;
+    null_value.write(actual);
+    defer allocator.free(actual);
+
+    const expected_null = @constCast(&[_]u8{});
+    const expected: []u8 = expected_null[0..];
+    try std.testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "decodes BSONNull" {
+    const test_memory = @constCast(&[_]u8{});
+    const null_value = BSONNull.read(test_memory[0..]);
+    // No value to compare, just check that it can be read
+}
+
 pub const BSONValue = union(BSONValueType) {
     double: BSONDouble,
     string: BSONString,
@@ -244,6 +312,8 @@ pub const BSONValue = union(BSONValueType) {
     datetime: BSONInt64,
     int32: BSONInt32,
     int64: BSONInt64,
+    boolean: BSONBoolean,
+    null: BSONNull,
 };
 
 const BSONValueType = enum(u8) {
@@ -254,9 +324,9 @@ const BSONValueType = enum(u8) {
     binary = 0x05,
     // 0x06, // undefined
     // 0x07, // ObjectId
-    // 0x08, // boolean
+    boolean = 0x08,
     datetime = 0x09, // UTC datetime
-    // 0x0A, // null
+    null = 0x0A,
     // 0x0B, // regex
     // 0x0D, // JavaScript
     int32 = 0x10,
@@ -310,6 +380,9 @@ const BSONDocument = struct {
                 .document => BSONValue{ .document = try BSONDocument.read(allocator, item_memory) },
                 .datetime => BSONValue{ .datetime = BSONInt64.read(item_memory) },
                 .int64 => BSONValue{ .int64 = BSONInt64.read(item_memory) },
+                .binary => BSONValue{ .binary = BSONBinary.read(item_memory) },
+                .boolean => BSONValue{ .boolean = BSONBoolean.read(item_memory) },
+                .null => BSONValue{ .null = BSONNull.read(item_memory) },
                 // else => unreachable,
             };
 
@@ -321,6 +394,9 @@ const BSONDocument = struct {
                 .array => value.array.len,
                 .datetime => 8,
                 .int64 => 8,
+                .binary => value.binary.size(),
+                .boolean => 1,
+                .null => 0,
                 // else => unreachable,
             };
 
@@ -336,6 +412,8 @@ const BSONDocument = struct {
 
     pub fn deinit(self: *BSONDocument) void {
         defer self.values.deinit();
+        const scaner = std.json.Scanner.initStreaming(std.testing.allocator);
+        scaner.
         var iter = self.values.valueIterator();
         while (iter.next()) |item| {
             switch (item.*) {
