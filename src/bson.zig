@@ -187,16 +187,63 @@ test "decodes BSONInt64" {
     try std.testing.expectEqual(expected_double, double.value);
 }
 
-const BSONValue = union(BSONValueType) {
+pub const BSONBinary = struct {
+    value: []u8,
+    subtype: u8,
+
+    pub fn write(self: BSONBinary, memory: []u8) void {
+        const length = @as(u32, @truncate(self.value.len));
+        std.mem.copyForwards(u8, memory[0..4], &mem.toBytes(length));
+        memory[4] = self.subtype;
+        std.mem.copyForwards(u8, memory[5..], self.value);
+    }
+
+    pub fn size(self: BSONBinary) u32 {
+        return 5 + @as(u32, @truncate(self.value.len));
+    }
+
+    pub fn read(memory: []u8) BSONBinary {
+        const length = std.mem.bytesToValue(u32, memory[0..4]);
+        const subtype = memory[4];
+        return BSONBinary{
+            .value = memory[5 .. 5 + length],
+            .subtype = subtype,
+        };
+    }
+};
+
+test "encodes BSONBinary" {
+    var allocator = std.testing.allocator;
+    const test_binary = [_]u8{ 0x01, 0x02, 0x03 };
+    const test_subtype: u8 = 0x00;
+    var binary = BSONBinary{ .value = @constCast(&test_binary), .subtype = test_subtype };
+    const actual = allocator.alloc(u8, binary.size()) catch unreachable;
+    binary.write(actual);
+    defer allocator.free(actual);
+
+    const expected_binary = @constCast(&[_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03 });
+    const expected: []u8 = expected_binary[0..];
+    try std.testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "decodes BSONBinary" {
+    const test_memory = @constCast(&[_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03 });
+    const expected_binary = [_]u8{ 0x01, 0x02, 0x03 };
+    const expected_subtype: u8 = 0x00;
+    const binary = BSONBinary.read(test_memory[0..]);
+    try std.testing.expectEqualSlices(u8, &expected_binary, binary.value);
+    try std.testing.expectEqual(expected_subtype, binary.subtype);
+}
+
+pub const BSONValue = union(BSONValueType) {
     double: BSONDouble,
     string: BSONString,
     document: BSONDocument,
     array: BSONDocument,
+    binary: BSONBinary,
     datetime: BSONInt64,
     int32: BSONInt32,
     int64: BSONInt64,
-    // u64: u64,
-    // f32: f32,
 };
 
 const BSONValueType = enum(u8) {
@@ -204,7 +251,7 @@ const BSONValueType = enum(u8) {
     string = 0x02,
     document = 0x03,
     array = 0x04,
-    // binary = 0x05,
+    binary = 0x05,
     // 0x06, // undefined
     // 0x07, // ObjectId
     // 0x08, // boolean
