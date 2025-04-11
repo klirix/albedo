@@ -19,10 +19,10 @@ pub const BSONString = struct {
         return 4 + @as(u32, @truncate(self.value.len)) + 1;
     }
 
-    pub fn read(memory: []u8) BSONString {
+    pub fn read(memory: []const u8) BSONString {
         const length = std.mem.bytesToValue(u32, memory[0..4]) - 1;
 
-        return BSONString{ .value = memory[4 .. 4 + length] };
+        return BSONString{ .value = @constCast(memory[4 .. 4 + length]) };
     }
 };
 
@@ -82,7 +82,7 @@ pub const BSONDouble = struct {
         return 8;
     }
 
-    pub fn read(memory: []u8) BSONDouble {
+    pub fn read(memory: []const u8) BSONDouble {
         return BSONDouble{
             .value = std.mem.bytesToValue(f64, memory),
         };
@@ -103,7 +103,7 @@ test "encodes BSONDouble" {
 }
 
 test "decodes BSONDouble" {
-    const test_memory = @constCast(&[_]u8{ 0x77, 0xbe, 0x9f, 0x1a, 0x2f, 0xdd, 0x5e, 0x40 });
+    const test_memory = (&[_]u8{ 0x77, 0xbe, 0x9f, 0x1a, 0x2f, 0xdd, 0x5e, 0x40 });
     const expected_double = 123.456;
     const double = BSONDouble.read(test_memory[0..]);
     try std.testing.expectEqual(expected_double, double.value);
@@ -123,7 +123,7 @@ pub const BSONInt32 = struct {
         return 4;
     }
 
-    pub fn read(memory: []u8) BSONInt32 {
+    pub fn read(memory: []const u8) BSONInt32 {
         return BSONInt32{
             .value = std.mem.bytesToValue(i32, memory),
         };
@@ -164,7 +164,7 @@ pub const BSONInt64 = struct {
         return 8;
     }
 
-    pub fn read(memory: []u8) BSONInt64 {
+    pub fn read(memory: []const u8) BSONInt64 {
         return BSONInt64{
             .value = std.mem.bytesToValue(i64, memory),
         };
@@ -192,7 +192,7 @@ test "decodes BSONInt64" {
 }
 
 pub const BSONBinary = struct {
-    value: []u8,
+    value: []const u8,
     subtype: u8,
 
     pub fn write(self: BSONBinary, memory: []u8) void {
@@ -206,7 +206,7 @@ pub const BSONBinary = struct {
         return 5 + @as(u32, @truncate(self.value.len));
     }
 
-    pub fn read(memory: []u8) BSONBinary {
+    pub fn read(memory: []const u8) BSONBinary {
         const length = std.mem.bytesToValue(u32, memory[0..4]);
         const subtype = memory[4];
         return BSONBinary{
@@ -250,7 +250,7 @@ pub const BSONBoolean = struct {
         return 1;
     }
 
-    pub fn read(memory: []u8) BSONBoolean {
+    pub fn read(memory: []const u8) BSONBoolean {
         return BSONBoolean{ .value = memory[0] != 0x00 };
     }
 };
@@ -284,7 +284,7 @@ pub const BSONNull = struct {
         return 0;
     }
 
-    pub fn read(_: []u8) BSONNull {
+    pub fn read(_: []const u8) BSONNull {
         return BSONNull{};
     }
 };
@@ -360,13 +360,13 @@ const BSONValueType = enum(u8) {
 
 const TypeNamePair = struct {
     type: BSONValueType,
-    name: []u8,
+    name: []const u8,
     len: u32,
-    pub fn read(bytes: []u8) ?TypeNamePair {
+    pub fn read(bytes: []const u8) ?TypeNamePair {
         if (bytes[0] == 0x00) return null;
         var length: u32 = 0;
         while (bytes[length + 1] != 0) length += 1;
-        const name: []u8 = bytes[1 .. 2 + length];
+        const name: []const u8 = bytes[1 .. 2 + length];
         const name_size: u32 = @truncate(name.len);
 
         return TypeNamePair{
@@ -388,7 +388,7 @@ pub const BSONObjectId = struct {
         return 12;
     }
 
-    pub fn read(memory: []u8) BSONObjectId {
+    pub fn read(memory: []const u8) BSONObjectId {
         var buffer: [12:0]u8 = undefined;
         std.mem.copyForwards(u8, buffer[0..], memory[0..12]);
         return BSONObjectId{ .value = ObjectId{ .buffer = buffer } };
@@ -415,8 +415,42 @@ test "decodes BSONObjectId" {
     try std.testing.expectEqualSlices(u8, expected_object_id.buffer[0..], object_id.value.buffer[0..]);
 }
 
-fn readDocument(allocator: mem.Allocator, memory: []u8, map: *std.StringHashMap(BSONValue)) mem.Allocator.Error!void {
+fn readDocument(allocator: mem.Allocator, memory: []const u8) mem.Allocator.Error![]BSONKeyValuePair {
     var idx: u32 = 0;
+    var docLen: u32 = 0;
+    while (TypeNamePair.read(memory[idx..])) |pair| {
+        idx += pair.len;
+
+        // std.debug.print("\n Pair: {x}\n", .{pair.len});
+
+        // std.debug.print("\nString length: {x}\n", .{memory[idx..]});
+
+        const item_memory = memory[idx..];
+
+        var value = switch (pair.type) {
+            .string => BSONValue{ .string = BSONString.read(item_memory) },
+            .double => BSONValue{ .double = BSONDouble.read(item_memory) },
+            .int32 => BSONValue{ .int32 = BSONInt32.read(item_memory) },
+            .array => BSONValue{ .array = try BSONDocument.read(allocator, item_memory) },
+            .document => BSONValue{ .document = try BSONDocument.read(allocator, item_memory) },
+            .datetime => BSONValue{ .datetime = BSONInt64.read(item_memory) },
+            .int64 => BSONValue{ .int64 = BSONInt64.read(item_memory) },
+            .binary => BSONValue{ .binary = BSONBinary.read(item_memory) },
+            .boolean => BSONValue{ .boolean = BSONBoolean.read(item_memory) },
+            .null => BSONValue{ .null = BSONNull.read(item_memory) },
+            .objectId => BSONValue{ .objectId = BSONObjectId.read(item_memory) },
+            // else => unreachable,
+        };
+
+        idx += value.size();
+
+        // std.debug.print("{x} {}", .{ item_memory, value.size() });
+
+        docLen += 1;
+    }
+    idx = 0;
+    var keyValPairs = try allocator.alloc(BSONKeyValuePair, docLen);
+    var i: u32 = 0;
     while (TypeNamePair.read(memory[idx..])) |pair| {
         idx += pair.len;
 
@@ -445,42 +479,66 @@ fn readDocument(allocator: mem.Allocator, memory: []u8, map: *std.StringHashMap(
 
         std.debug.print("{x} {}", .{ item_memory, value.size() });
 
-        try map.put(pair.name, value);
+        keyValPairs[i] = BSONKeyValuePair{
+            .key = pair.name,
+            .value = value,
+        };
+        i += 1;
     }
+    return keyValPairs;
 }
 
-const BSONDocument = struct {
-    values: std.StringHashMap(BSONValue),
-    len: u32,
+const BSONKeyValuePair = struct {
+    key: []const u8,
+    value: BSONValue,
+};
 
-    pub fn read(allocator: mem.Allocator, memory: []u8) !BSONDocument {
-        var map = std.StringHashMap(BSONValue).init(allocator);
+const BSONDocument = struct {
+    values: []BSONKeyValuePair,
+    len: u32,
+    ally: mem.Allocator,
+
+    pub fn read(allocator: mem.Allocator, memory: []const u8) !BSONDocument {
         const length = mem.bytesToValue(u32, memory[0..4]);
 
-        try readDocument(allocator, memory[4..], &map);
+        const kvPairs = try readDocument(allocator, memory[4..]);
         return BSONDocument{
-            .values = map,
+            .values = kvPairs,
             .len = length,
+            .ally = allocator,
         };
     }
 
-    pub fn deinit(self: *BSONDocument) void {
-        defer self.values.deinit();
+    fn get(self: *@This(), key: []const u8) ?BSONValue {
+        for (self.values) |value| {
+            if (mem.eql(u8, value.key, key)) {
+                return value.value;
+            }
+        }
+        return null;
+    }
 
-        var iter = self.values.valueIterator();
-        while (iter.next()) |item| {
-            switch (item.*) {
+    pub fn deinit(self: *BSONDocument) void {
+
+        // std.debug.print("{any}", .{self.values});
+
+        for (self.values) |*item| {
+            switch (item.value) {
                 inline else => {
                     continue;
                 },
                 .document => {
-                    item.*.document.deinit();
+                    std.debug.print("DOC", .{});
+                    item.value.document.deinit();
+                    // std.debug.print("\nDOC DEINIT, {any}", .{value.document.values});
                 },
                 .array => {
-                    item.*.array.deinit();
+                    std.debug.print("ARRY", .{});
+                    item.value.array.deinit();
                 },
             }
         }
+        self.ally.free(self.values);
     }
 };
 
@@ -488,24 +546,24 @@ test "BSONDoc read" {
     // std.AutoHashMap([]u8, BSONValue).init(allocator: Allocator)
     const empty_obj = "\x05\x00\x00\x00\x00";
 
-    var doc = try BSONDocument.read(std.testing.allocator, @constCast(empty_obj));
+    var doc = try BSONDocument.read(std.testing.allocator, empty_obj);
     defer doc.deinit();
 
     try std.testing.expect(doc.len == 5);
-    try std.testing.expect(doc.values.count() == 0);
+    try std.testing.expect(doc.values.len == 0);
 
-    var a_is_one_buff: [14]u8 = ("\x0e\x00\x00\x00\x02\x31\x00\x02\x00\x00\x00\x61\x00\x00").*;
+    var a_is_one_buff: [14:0]u8 = "\x0e\x00\x00\x00\x02\x31\x00\x02\x00\x00\x00\x61\x00\x00".*;
     const a_is_one = a_is_one_buff[0..];
 
-    var doc_a = try BSONDocument.read(std.testing.allocator, (a_is_one));
+    var doc_a = try BSONDocument.read(std.testing.allocator, a_is_one);
     defer doc_a.deinit();
 
-    try std.testing.expectEqual(1, doc_a.values.count());
+    try std.testing.expectEqual(1, doc_a.values.len);
     // std.debug.print("{x}", .{doc_a.values});
     // const key_string = "\x31\x00";
     // const key_slice: []u8 = @constCast(key_string);
     // const key: [*]u8 = @ptrCast(key_slice);
-    const value = doc_a.values.get("\x31\x00") orelse unreachable;
+    const value = doc_a.get(("\x31\x00")) orelse unreachable;
     // var iter = doc_a.values.keyIterator();
     // while (iter.next()) |item| {
     //     std.debug.print("{x}", .{item});
@@ -516,11 +574,11 @@ test "BSONDoc read" {
 test "BSONDoc embedded documents" {
     const obj = "\x16\x00\x00\x00\x03\x31\x00\x0e\x00\x00\x00\x02\x61\x00\x02\x00\x00\x00\x62\x00\x00\x00";
 
-    var doc = try BSONDocument.read(std.testing.allocator, @constCast(obj));
+    var doc = try BSONDocument.read(std.testing.allocator, obj);
     defer doc.deinit();
 
-    var embedded = doc.values.get("1\x00") orelse unreachable;
-    const text = embedded.document.values.get("a\x00").?.string.value;
+    var embedded = doc.get("1\x00") orelse unreachable;
+    const text = embedded.document.get("a\x00").?.string.value;
 
     try std.testing.expectEqualStrings("\x62", text);
 
@@ -530,11 +588,11 @@ test "BSONDoc embedded documents" {
 test "BSONDoc embedded array" {
     const obj = "\x16\x00\x00\x00\x04\x61\x00\x0e\x00\x00\x00\x02\x30\x00\x02\x00\x00\x00\x62\x00\x00\x00";
 
-    var doc = try BSONDocument.read(std.testing.allocator, @constCast(obj));
+    var doc = try BSONDocument.read(std.testing.allocator, obj);
     defer doc.deinit();
 
-    var embedded = doc.values.get("a\x00") orelse unreachable;
-    const text = embedded.array.values.get("0\x00").?.string.value;
+    var embedded = doc.get("a\x00") orelse unreachable;
+    const text = embedded.array.get("0\x00").?.string.value;
 
     try std.testing.expectEqualStrings("\x62", text);
 
