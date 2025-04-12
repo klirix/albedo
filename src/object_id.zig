@@ -1,14 +1,14 @@
 const std = @import("std");
 const crypto = std.crypto;
 
-var process_rand = rand: {
+const process_rand = rand: {
     const arr = [5]u8{ 0, 0, 0, 0, 0 };
     crypto.random.bytes(arr);
     break :rand arr;
 };
 
 pub const ObjectId = struct {
-    buffer: [12:0]u8,
+    buffer: [12]u8,
 
     pub fn init() ObjectId {
         const time = @as(i32, @truncate(std.time.timestamp()));
@@ -17,7 +17,7 @@ pub const ObjectId = struct {
         return ObjectId{ .buffer = .{time ++ process_rand ++ rand} };
     }
 
-    pub fn parseString(str: *[24]u8) ObjectId {
+    pub fn parseString(str: []const u8) ObjectId {
         var buffer: [12:0]u8 = [12:0]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         for (str, 0..) |digit, i| {
             const idx = @divFloor(i, 2);
@@ -37,7 +37,7 @@ pub const ObjectId = struct {
         return ObjectId{ .buffer = buffer };
     }
 
-    // returns time in seconds
+    /// Returns time in seconds since epoch
     pub fn timestamp(self: ObjectId) i32 {
         const beBuffer = &[_]u8{ self.buffer[3], self.buffer[2], self.buffer[1], self.buffer[0] };
         return std.mem.bytesToValue(i32, beBuffer);
@@ -56,7 +56,7 @@ pub const ObjectId = struct {
 };
 
 test "test parse string" {
-    const objid = ObjectId.parseString(@constCast("507c7f79bcf86cd7994f6c0e"));
+    const objid = ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
     try std.testing.expectEqualSlices(
         u8,
         "\x50\x7c\x7f\x79\xbc\xf8\x6c\xd7\x99\x4f\x6c\x0e",
@@ -65,7 +65,7 @@ test "test parse string" {
 }
 
 test "test timestamp get" {
-    const objid = ObjectId.parseString(@constCast("507c7f79bcf86cd7994f6c0e"));
+    const objid = ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
     // std.debug.print("{x} {x}", .{ 0x507c7f79, objid.timestamp() });
     try std.testing.expectEqual(0x507c7f79, objid.timestamp());
 }
