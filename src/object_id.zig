@@ -1,24 +1,24 @@
 const std = @import("std");
 const crypto = std.crypto;
 
-const process_rand = rand: {
-    const arr = [5]u8{ 0, 0, 0, 0, 0 };
-    crypto.random.bytes(arr);
-    break :rand arr;
-};
+// var process_rand = rand: {
+//     var arr = [5]u8{ 0, 0, 0, 0, 0 };
+//     crypto.random.bytes(&arr);
+//     break :rand arr;
+// };
 
 pub const ObjectId = struct {
     buffer: [12]u8,
 
     pub fn init() ObjectId {
         const time = @as(i32, @truncate(std.time.timestamp()));
-        const rand = [3]u8{ 0, 0, 0 };
-        crypto.random.bytes(rand);
-        return ObjectId{ .buffer = .{time ++ process_rand ++ rand} };
+        var rand = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        crypto.random.bytes(&rand);
+        return ObjectId{ .buffer = std.mem.toBytes(time) ++ rand };
     }
 
     pub fn parseString(str: []const u8) ObjectId {
-        var buffer: [12:0]u8 = [12:0]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        var buffer: [12]u8 = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         for (str, 0..) |digit, i| {
             const idx = @divFloor(i, 2);
             const rd = @rem(i, 2);
@@ -38,9 +38,8 @@ pub const ObjectId = struct {
     }
 
     /// Returns time in seconds since epoch
-    pub fn timestamp(self: ObjectId) i32 {
-        const beBuffer = &[_]u8{ self.buffer[3], self.buffer[2], self.buffer[1], self.buffer[0] };
-        return std.mem.bytesToValue(i32, beBuffer);
+    pub fn timestamp(self: ObjectId) u32 {
+        return std.mem.readInt(u32, self.buffer[0..4], .big);
     }
 
     pub fn toString(self: ObjectId) [24:0]u8 {
@@ -52,6 +51,10 @@ pub const ObjectId = struct {
             res[i * 2 + 1] = (low + '0') * @intFromBool(low < 0xa) | (low + 'a' - 10) * @intFromBool(low > 0xa);
         }
         return res;
+    }
+
+    pub inline fn toInt(self: ObjectId) u96 {
+        return std.mem.readInt(u96, self.buffer[0..12], .big);
     }
 };
 
@@ -72,6 +75,10 @@ test "test timestamp get" {
 
 test "Test" {
     std.debug.print("{x}", .{@as(i32, @truncate(std.time.timestamp()))});
+}
+
+test "Test2" {
+    _ = ObjectId.init();
 }
 
 test "test gen str" {
