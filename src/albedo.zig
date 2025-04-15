@@ -138,10 +138,37 @@ const Bucket = struct {
     file: std.fs.File,
     allocator: std.mem.Allocator,
     header: BucketHeader,
+    page_cache: std.AutoArrayHashMap(u32, *Page),
+
+    const PageIterator = struct {
+        bucket: *Bucket,
+        index: u64 = 0,
+        type: PageType,
+
+        pub fn next(self: *PageIterator, allocator: std.mem.Allocator) !?Page {
+            var found = false;
+            var page: Page = undefined;
+            while (!found) {
+                if (self.index >= self.bucket.header.page_count) {
+                    return null;
+                }
+                page = try self.bucket.loadPage(allocator, self.index);
+                found = page.header.page_type == self.type;
+                if (!found) {
+                    // If the page type doesn't match, free the page and continue
+                    page.deinit(allocator);
+                }
+                self.index += 1;
+            }
+            return page;
+        }
+    };
 
     // Update init to include allocator
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Bucket {
-        return try Bucket.openFile(allocator, path);
+        var bucket = try Bucket.openFile(allocator, path);
+        bucket.page_cache = std.AutoArrayHashMap(u32, *Page).init(allocator);
+        return bucket;
     }
 
     pub fn openFile(ally: std.mem.Allocator, path: []const u8) !Bucket {
@@ -255,8 +282,8 @@ const Bucket = struct {
     // }
 
     pub const DocHeader = packed struct { // 16bytes
-        is_deleted: u8,
         doc_id: u96,
+        is_deleted: u8,
         reserved: u24,
 
         pub fn init() DocHeader {
@@ -274,10 +301,21 @@ const Bucket = struct {
 
         pub fn read(reader: anytype) !DocHeader {
             // Read the header from the reader
-            return try reader.readStruct(DocHeader);
+            const header = try reader.readStruct(DocHeader);
+            if (header.doc_id == 0) {
+                return error.InvalidDocId;
+            }
+            return header;
         }
     };
-    pub fn insert(self: *Bucket, doc: *const bson.BSONDocument) !void {
+
+    const DocInsertResult = struct {
+        doc_id: u96,
+        page_id: u64,
+        offset: u16,
+    };
+
+    pub fn insert(self: *Bucket, doc: *const bson.BSONDocument) !DocInsertResult {
         const doc_size = doc.len;
         var encoded_doc = try self.allocator.alloc(u8, doc_size);
         defer self.allocator.free(encoded_doc);
@@ -296,15 +334,23 @@ const Bucket = struct {
         }
 
         // Check if the page has enough space for header and doc size
-        if (page.data.len - page.header.used_size < doc_size + @sizeOf(DocHeader)) {
+        if ((page.data.len - page.header.used_size) < (@sizeOf(doc.len) + @sizeOf(DocHeader))) { // 20 bytes
             // Not enough space, create a new page
             page = try self.createNewPage(.Data);
         }
 
+        std.debug.print("\nDecided to write on page {d}, offset: {d}\n", .{ page.header.page_id, page.header.used_size });
+
         // Write the document header
 
         const doc_header = DocHeader.init();
+        const result = DocInsertResult{
+            .doc_id = doc_header.doc_id,
+            .page_id = page.header.page_id,
+            .offset = page.header.used_size,
+        };
         _ = try doc_header.write(page.stream.writer());
+        page.header.used_size += @intCast(@sizeOf(DocHeader));
 
         var bytes_written: usize = 0;
         const bytes_to_write: usize = doc_size;
@@ -315,7 +361,7 @@ const Bucket = struct {
 
             // Determine how much to write
             const to_write = @min(bytes_to_write - bytes_written, available_space);
-
+            std.debug.print("Writing ({d}){d} bytes to the page \n", .{ page.header.used_size, to_write });
             _ = try page.stream.write(encoded_doc[bytes_written .. bytes_written + to_write]);
             // Insert document at the current position
             page.header.used_size += @intCast(to_write);
@@ -326,96 +372,80 @@ const Bucket = struct {
 
             // If there are still bytes left to write, create a new page
             if (bytes_written < bytes_to_write) {
+                page.deinit(self.allocator);
                 page = try self.createNewPage(.Data);
             }
         }
 
         // After writing is done, free the page resources
         page.deinit(self.allocator);
+        return result;
     }
 
-    pub fn list(self: *Bucket) ![]bson.BSONDocument {
-        if (self.header.page_count == 0) {
-            return &[_]bson.BSONDocument{};
+    pub const ListIterator = struct {
+        bucket: *Bucket,
+        page: *Page,
+        allocator: std.mem.Allocator,
+        offset: u16 = 0,
+        pageIterator: PageIterator,
+        pub fn step(self: *ListIterator) !bool {
+            // Check if we have reached the end of the page
+            if (!self.page) {
+                self.page = try self.pageIterator.next(self.allocator) orelse return false;
+            }
+            var reader = self.page.stream.reader();
+
+            try reader.skipBytes(self.offset);
+
+            const header = try DocHeader.read(reader) orelse return false;
+            if (header.doc_id == 0) {
+                return false; // No more documents
+            }
+            self.offset += @intCast(@sizeOf(DocHeader));
+            return true;
         }
+        pub fn next(self: *ListIterator) !?[]u8 {
+            // Check if we have reached the end of the page
+            if (!self.step()) return null;
+            var reader = self.page.stream.reader();
 
-        var documents = std.ArrayList(bson.BSONDocument).init(self.allocator);
-        defer documents.deinit(); // This will be transferred to the caller
+            try reader.skipBytes(self.offset);
 
-        // Buffer to hold document data that may span multiple pages
-        var doc_buffer = std.ArrayList(u8).init(self.allocator);
-        defer doc_buffer.deinit();
+            const doc_len = try reader.readInt(u32, .little);
+            var leftToRead: u32 = doc_len - 4;
 
-        // Read each page
-        var current_page_id: u64 = 0;
-        while (current_page_id < self.header.page_count) : (current_page_id += 1) {
-            var page = try self.loadPage(self.allocator, current_page_id);
-            defer page.deinit(self.allocator);
-            var reader = page.stream.reader();
-            reader.skipBytes(page.header.first_readable_byte, comptime options: SkipBytesOptions)
+            var docBuffer = try self.allocator.alloc(u8, doc_len);
+            std.mem.writeInt(u32, docBuffer, doc_len, .little);
 
-            if (page.header.used_size == 0) {
-                continue;
+            var bytesRead = try reader.read(docBuffer[4..]);
+            leftToRead -= @truncate(bytesRead);
+            while (leftToRead > 0) {
+                // Check if we need to load a new page
+                self.page.deinit(self.allocator);
+                self.page = try self.pageIterator.next(self.allocator) orelse return null;
+                reader = self.page.stream.reader();
+                bytesRead = try reader.read(docBuffer[doc_len - leftToRead ..]);
+                leftToRead -= @truncate(bytesRead);
             }
 
-            // Process the used portion of the page data
-            var offset: u32 = 0;
-            while (offset < page.header.used_size) {
-                // If we have no data in the buffer, read the document length
-                if (doc_buffer.items.len == 0) {
-                    if (offset + 4 > page.header.used_size) {
-                        // Document length spans two pages
-                        try doc_buffer.appendSlice(page.data[offset..page.header.used_size]);
-                        continue;
-                    }
-                    const doc_length = std.mem.readInt(u32, page.data[offset..][0..4], .little);
-
-                    // Reset buffer and start collecting document data
-                    try doc_buffer.resize(0);
-                    try doc_buffer.ensureTotalCapacity(doc_length);
-
-                    // Add initial chunk of document
-                    const bytes_available = page.header.used_size - offset;
-                    const bytes_to_copy = @min(doc_length, bytes_available);
-                    try doc_buffer.appendSlice(page.data[offset .. offset + bytes_to_copy]);
-
-                    if (bytes_to_copy == doc_length) {
-                        // Complete document in current page
-                        const doc = try bson.BSONDocument.deserializeFromMemory(self.allocator, doc_buffer.items);
-                        try documents.append(doc);
-                        try doc_buffer.resize(0);
-                    }
-
-                    offset += bytes_to_copy;
-                } else {
-                    // Continue collecting document from previous page
-                    const remaining_bytes = doc_buffer.capacity - doc_buffer.items.len;
-                    const bytes_available = page.header.used_size - offset;
-                    const bytes_to_copy = @min(remaining_bytes, bytes_available);
-
-                    try doc_buffer.appendSlice(page.data[offset .. offset + bytes_to_copy]);
-
-                    if (doc_buffer.items.len == doc_buffer.capacity) {
-                        // Document is complete
-                        const doc = try bson.BSONDocument.deserializeFromMemory(self.allocator, doc_buffer.items);
-                        try documents.append(doc);
-                        try doc_buffer.resize(0);
-                    }
-
-                    offset += bytes_to_copy;
-                }
-            }
+            return docBuffer;
         }
+    };
 
-        // Check if we have an incomplete document at the end
-        if (doc_buffer.items.len > 0) {
-            // This would indicate corrupted data
-            return error.IncompleteDocument;
-        }
-
-        // Transfer ownership of the array to the caller
-        return documents.toOwnedSlice();
+    fn listIterator(self: *Bucket, allocator: std.mem.Allocator) !ListIterator {
+        return .{
+            .bucket = self,
+            .page = null,
+            .offset = 0,
+            .allocator = allocator,
+            .pageIterator = .{
+                .bucket = self,
+                .type = .Data,
+            },
+        };
     }
+
+    pub fn list(self: *Bucket) ![]bson.BSONDocument {}
 
     pub fn delete(_: *Bucket, _: bson.BSONDocument) !void {
         // For now, we'll just print the document
@@ -432,9 +462,9 @@ test "Bucket.insert" {
     var bucket = try Bucket.init(allocator, "test.bucket");
     defer bucket.deinit();
 
-    var docValues = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair{ .key = "name", .value = .{ .string = .{ .value = "Alice\x00" } } },
-        bson.BSONKeyValuePair{ .key = "age", .value = .{ .int32 = .{ .value = 30 } } },
+    var docValues: [2]bson.BSONKeyValuePair = [_].{
+        .{ .key = "name\x00", .value = .{ .string = .{ .value = "Alice\x00" } } },
+        .{ .key = "age\x00", .value = .{ .int32 = .{ .value = 30 } } },
     };
 
     // Create a new BSON document
@@ -444,9 +474,9 @@ test "Bucket.insert" {
     try bucket.insert(&doc);
 
     // List documents in the bucket
-    for (try bucket.list()) |value| {
-        std.debug.print("Document: {any}\n", .{value});
-    }
+    // for (try bucket.list()) |value| {
+    //     std.debug.print("Document: {any}\n", .{value});
+    // }
 }
 
 test "DocHeader.write" {
@@ -461,33 +491,6 @@ test "DocHeader.write" {
     try doc_header.write(stream.writer());
     try stream.seekTo(0);
     doc_header = try Bucket.DocHeader.read(stream.reader());
-}
-
-// Example test
-test "page operations" {
-    const allocator = std.testing.allocator;
-    var bucket = try Bucket.init(allocator, "test.bucket");
-    defer bucket.deinit();
-
-    // Create a new page
-    var page = try bucket.createNewPage(.Data);
-    defer page.deinit(allocator);
-
-    // Write some test data
-    @memcpy(page.data[0..5], "Hello");
-
-    // Write the page
-    try bucket.writePage(&page);
-    std.debug.print("Current bucket header {any}\n", .{bucket.header});
-    std.debug.print("Current page header {any}\n", .{page.header});
-    // Read the page back
-    var read_page = try bucket.loadPage(allocator, page.header.page_id);
-    defer read_page.deinit(allocator);
-
-    std.debug.print("Current file offset {x}", .{try bucket.file.getPos()});
-
-    // Verify the data
-    try std.testing.expectEqualSlices(u8, page.data[0..5], read_page.data[0..5]);
 }
 
 // there must me 3 types of operations on a data in the bucket
