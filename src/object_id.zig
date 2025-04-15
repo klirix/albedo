@@ -56,6 +56,12 @@ pub const ObjectId = struct {
     pub inline fn toInt(self: ObjectId) u96 {
         return std.mem.readInt(u96, self.buffer[0..12], .big);
     }
+
+    pub fn fromInt(value: u96) ObjectId {
+        var buffer: [12]u8 = undefined;
+        std.mem.writeInt(u96, &buffer, value, .big);
+        return ObjectId{ .buffer = buffer };
+    }
 };
 
 test "test parse string" {
