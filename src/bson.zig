@@ -363,6 +363,22 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
+    pub fn eql(self: *const BSONValue, other: *const BSONValue) bool {
+        return switch (self.*) {
+            .string => self.string.value == other.string.value,
+            .double => self.double.value == other.double.value,
+            .int32 => self.int32.value == other.int32.value,
+            .document => self.document == other.document,
+            .array => self.array == other.array,
+            .datetime => self.datetime.value == other.datetime.value,
+            .int64 => self.int64.value == other.int64.value,
+            .binary => self.binary.value == other.binary.value,
+            .boolean => self.boolean.value == other.boolean.value,
+            .null => true,
+            .objectId => self.objectId.value.buffer == other.objectId.value.buffer,
+        };
+    }
+
     pub fn read(ally: mem.Allocator, memory: []const u8, pairType: BSONValueType) mem.Allocator.Error!BSONValue {
         return switch (pairType) {
             .string => BSONValue{ .string = BSONString.read(memory) },

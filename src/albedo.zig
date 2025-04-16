@@ -400,14 +400,14 @@ const Bucket = struct {
         return result;
     }
 
-    pub const ListIterator = struct {
+    pub const ScanIterator = struct {
         bucket: *Bucket,
         page: Page,
         allocator: std.mem.Allocator,
         initialized: bool = false,
         offset: u16 = 0,
         pageIterator: PageIterator,
-        pub fn step(self: *ListIterator) !bool {
+        pub fn step(self: *ScanIterator) !bool {
             if (!self.initialized) {
                 self.initialized = true;
                 self.page = try self.pageIterator.next() orelse return false;
@@ -440,7 +440,7 @@ const Bucket = struct {
             self.offset += @intCast(@sizeOf(DocHeader));
             return true;
         }
-        pub fn next(self: *ListIterator) !?[]u8 {
+        pub fn next(self: *ScanIterator) !?[]u8 {
             // Check if we have reached the end of the page
             if (!try self.step()) return null;
             var stream = std.io.fixedBufferStream(self.page.data);
@@ -471,17 +471,15 @@ const Bucket = struct {
         }
     };
 
-    fn listIterator(self: *Bucket, allocator: std.mem.Allocator) !ListIterator {
-        const pageIterator: PageIterator = PageIterator{
-            .bucket = self,
-            .type = .Data,
-        };
-
+    fn scanIterator(self: *Bucket, allocator: std.mem.Allocator) !ScanIterator {
         return .{
             .bucket = self,
             .page = undefined,
             .allocator = allocator,
-            .pageIterator = pageIterator,
+            .pageIterator = .{
+                .bucket = self,
+                .type = .Data,
+            },
         };
     }
 
@@ -492,7 +490,7 @@ const Bucket = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         var docList = std.ArrayList(bson.BSONDocument).init(allocator);
-        var iterator = try self.listIterator(allocator);
+        var iterator = try self.scanIterator(allocator);
         std.debug.print("initialized list iterators\n", .{});
         while (try iterator.next()) |doc| {
             std.debug.print("doc buff {any}\n", .{doc});
@@ -504,7 +502,7 @@ const Bucket = struct {
         for (docList.items) |item| {
             std.debug.print("Document: {any}\n", .{item.values});
         }
-        std.debug.print("DOCS GOOD", .{});
+        // std.debug.print("DOCS GOOD", .{});
     }
 
     pub fn delete(_: *Bucket, _: bson.BSONDocument) !void {
