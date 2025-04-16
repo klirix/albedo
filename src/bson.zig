@@ -168,6 +168,27 @@ pub const BSONInt64 = struct {
     }
 };
 
+pub const BSONDatetime = struct {
+    // code: i8, // 0x02
+    value: u64,
+
+    pub fn write(self: BSONDatetime, memory: []u8) void {
+        // var memory = try allocator.alloc(u8, 4 + self.length);
+
+        std.mem.copyForwards(u8, memory, &mem.toBytes(self.value));
+    }
+
+    pub fn size(_: BSONDatetime) u32 {
+        return 8;
+    }
+
+    pub fn read(memory: []const u8) BSONDatetime {
+        return BSONDatetime{
+            .value = std.mem.bytesToValue(u64, memory),
+        };
+    }
+};
+
 test "encodes BSONInt64" {
     var allocator = std.testing.allocator;
     const test_int = 32;
@@ -311,7 +332,7 @@ pub const BSONValue = union(BSONValueType) {
     binary: BSONBinary,
     objectId: BSONObjectId,
     boolean: BSONBoolean,
-    datetime: BSONInt64,
+    datetime: BSONDatetime,
     null: BSONNull,
     int32: BSONInt32,
     int64: BSONInt64,
@@ -350,6 +371,21 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
+    pub fn valueOrder(self: *const BSONValue) u8 {
+        return switch (self.*) {
+            .null => 1,
+            .double, .int32, .int64 => 2,
+            .string => 3,
+            .document => 4,
+            .array => 5,
+            .binary => 6,
+            .objectId => 7,
+            .boolean => 8,
+            .datetime => 9,
+            .timestamp => 10,
+        };
+    }
+
     pub fn asessSize(memory: []const u8, pairType: BSONValueType) u32 {
         return switch (pairType) {
             .document, .array => std.mem.bytesToValue(u32, memory[0..4]),
@@ -363,19 +399,53 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn eql(self: *const BSONValue, other: *const BSONValue) bool {
+    pub fn order(self: *const BSONValue, other: *const BSONValue) std.math.Order {
+        const a_val = self.valueOrder();
+        const b_val = other.valueOrder();
+        if (a_val != b_val) {
+            return std.math.order(a_val, b_val);
+        }
+
         return switch (self.*) {
-            .string => self.string.value == other.string.value,
-            .double => self.double.value == other.double.value,
-            .int32 => self.int32.value == other.int32.value,
-            .document => self.document == other.document,
-            .array => self.array == other.array,
-            .datetime => self.datetime.value == other.datetime.value,
-            .int64 => self.int64.value == other.int64.value,
-            .binary => self.binary.value == other.binary.value,
-            .boolean => self.boolean.value == other.boolean.value,
-            .null => true,
-            .objectId => self.objectId.value.buffer == other.objectId.value.buffer,
+            .string => std.mem.order(u8, self.string.value, other.string.value),
+            .int32, .int64, .double => orderNums(self, other),
+            .document => .eq,
+            .array => std.math.order(self.array.len, self.array.len),
+            .datetime => std.math.order(self.datetime.value, other.datetime.value),
+            .binary => .eq,
+            .boolean => std.math.order(self.boolean.value, other.boolean.value),
+            .null => .eq,
+            .objectId => std.mem.order(self.objectId.value.toInt(), other.objectId.value.toInt()),
+        };
+    }
+
+    fn orderNums(a: *const BSONValue, b: *const BSONValue) std.math.Order {
+        return switch (a.*) {
+            .double => {
+                return switch (b.*) {
+                    .double => std.math.order(a.double.value, b.double.value),
+                    .int32 => std.math.order(a.double.value, @as(f64, @floatFromInt(b.int32.value))),
+                    .int64 => std.math.order(a.double.value, @as(f64, @floatFromInt(b.int64.value))),
+                    else => unreachable,
+                };
+            },
+            .int32 => {
+                return switch (b.*) {
+                    .double => std.math.order(@as(f64, @floatFromInt(a.int32.value)), b.double.value),
+                    .int32 => std.math.order(a.int32.value, b.int32.value),
+                    .int64 => std.math.order(@as(i64, a.int32.value), b.int64.value),
+                    else => unreachable,
+                };
+            },
+            .int64 => {
+                return switch (b.*) {
+                    .double => std.math.order(@as(f64, @floatFromInt(a.int64.value)), b.double.value),
+                    .int32 => std.math.order(a.int64.value, @as(i64, b.int32.value)),
+                    .int64 => std.math.order(a.int64.value, b.int64.value),
+                    else => unreachable,
+                };
+            },
+            else => unreachable,
         };
     }
 
@@ -386,7 +456,7 @@ pub const BSONValue = union(BSONValueType) {
             .int32 => BSONValue{ .int32 = BSONInt32.read(memory) },
             .array => BSONValue{ .array = try BSONDocument.deserializeFromMemory(ally, memory) },
             .document => BSONValue{ .document = try BSONDocument.deserializeFromMemory(ally, memory) },
-            .datetime => BSONValue{ .datetime = BSONInt64.read(memory) },
+            .datetime => BSONValue{ .datetime = BSONDatetime.read(memory) },
             .int64 => BSONValue{ .int64 = BSONInt64.read(memory) },
             .binary => BSONValue{ .binary = BSONBinary.read(memory) },
             .boolean => BSONValue{ .boolean = BSONBoolean.read(memory) },
@@ -563,7 +633,7 @@ pub const BSONDocument = struct {
                     _ = try pair.value.array.write(writer);
                 },
                 .datetime => {
-                    try writer.writeInt(i64, pair.value.datetime.value, .little);
+                    try writer.writeInt(u64, pair.value.datetime.value, .little);
                 },
                 .int64 => {
                     try writer.writeInt(i64, pair.value.int64.value, .little);
