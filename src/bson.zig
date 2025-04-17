@@ -798,14 +798,14 @@ pub const BSONDocument = struct {
     }
 
     pub fn getPath(self: *const BSONDocument, keys: []const []const u8) ?BSONValue {
-        var value: BSONValue = self;
-
-        for (keys) |key| {
-            if (value) |v| {
-                value = v.document.get(key);
-            } else {
-                value = self.get(key);
-            }
+        if (keys.len == 0) return null;
+        const retValue = self.get(keys[0]);
+        if (keys.len == 1 or retValue == null) return retValue;
+        const val = retValue orelse return null;
+        if (val.valueType() == BSONValueType.document) {
+            return val.document.getPath(keys[1..]);
+        } else if (val.valueType() == BSONValueType.array) {
+            return val.array.getPath(keys[1..]);
         }
         return null;
     }
@@ -820,9 +820,10 @@ pub const BSONDocument = struct {
         };
         const pairs_slice = pairs[0..];
         var doc = BSONDocument.fromPairs(allocator, pairs_slice);
-        defer doc.deinit();
 
-        const value = doc.getPath(.{"test"});
+        const testString = "test";
+        const path = &[1][]const u8{testString[0..]};
+        const value = doc.getPath(path) orelse unreachable;
         try std.testing.expectEqualStrings("test", value.string.value);
     }
 
@@ -845,9 +846,12 @@ pub const BSONDocument = struct {
             },
         };
         var doc = BSONDocument.fromPairs(allocator, &pairs);
-        defer doc.deinit();
 
-        const value = doc.getPath(.{ "nested", "test" });
+        const nestedString = "nested";
+        const testString = "test";
+        const path = &[2][]const u8{ nestedString[0..], testString[0..] };
+
+        const value = doc.getPath(path) orelse unreachable;
         try std.testing.expectEqualStrings("lmao", value.string.value);
     }
 
