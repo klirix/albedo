@@ -1,0 +1,29 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb-dap",
+      "request": "launch",
+      "name": "Debug",
+      "program": "${workspaceFolder}/zig-out/bin/test-${fileBasenameNoExtension}",
+      // "args": ["/home/askhat/zig/zig"],
+      "cwd": "${workspaceFolder}",
+      // "args": ["one", "two", "three"],
+      // "env": {
+      //   "FOO": "1",
+      //   "BAR": ""
+      // }
+      "preLaunchTask": "zig: build-test"
+    },
+    {
+      "type": "lldb-dap",
+      "request": "launch",
+      "name": "Build",
+      "program": "zig",
+      "args": ["test", " -femit-bin=zig-out/bin/my-test", "src/albedo.zig"]
+    }
+  ]
+}
