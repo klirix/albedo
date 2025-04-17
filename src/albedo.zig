@@ -322,10 +322,10 @@ const Bucket = struct {
 
     pub fn insert(self: *Bucket, doc: *bson.BSONDocument) !DocInsertResult {
         const docId = ObjectId.init();
-        if (doc.get("_id\x00") == null) {
+        if (doc.get("_id") == null) {
             // If the document doesn't have an _id, generate one
             const objectId = docId;
-            try doc.set("_id\x00", .{ .objectId = .{ .value = objectId } });
+            try doc.set("_id", .{ .objectId = .{ .value = objectId } });
         }
 
         const doc_size = doc.len;
@@ -365,6 +365,7 @@ const Bucket = struct {
             .offset = page.header.used_size,
         };
         var stream = std.io.fixedBufferStream(page.data);
+        try stream.seekTo(page.header.used_size);
         _ = try doc_header.write(stream.writer());
         page.header.used_size += @intCast(@sizeOf(DocHeader));
 
@@ -525,9 +526,9 @@ test "Bucket.insert" {
 
     var docValues = try std.testing.allocator.alloc(bson.BSONKeyValuePair, 2);
 
-    docValues[0] = .{ .key = "name\x00", .value = .{ .string = .{ .value = "Alice\x00" } } };
+    docValues[0] = .{ .key = "name", .value = .{ .string = .{ .value = "Alice" } } };
 
-    docValues[1] = .{ .key = "age\x00", .value = .{ .int32 = .{ .value = 30 } } };
+    docValues[1] = .{ .key = "age", .value = .{ .int32 = .{ .value = 30 } } };
 
     // Create a new BSON document
     var doc = bson.BSONDocument.fromPairs(std.testing.allocator, docValues[0..]);
