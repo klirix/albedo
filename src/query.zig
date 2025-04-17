@@ -16,9 +16,9 @@ const std = @import("std");
 const bson = @import("bson.zig");
 const Allocator = std.mem.Allocator;
 
-const Path = []const [:0]const u8; // "field.subfield".split('.')
+const Path = [][]const u8; // "field.subfield".split('.')
 
-const FilterType = enum {
+pub const FilterType = enum {
     eq,
     ne,
     lt,
@@ -26,12 +26,31 @@ const FilterType = enum {
     in,
 };
 
-const PathValuePair = struct {
+pub const PathValuePair = struct {
     path: Path,
     value: bson.BSONValue,
 };
 
-const Filter = union(FilterType) {
+pub fn parsePath(ally: Allocator, pathSrc: []const u8) ![][]const u8 {
+    var pathIter = std.mem.splitScalar(u8, pathSrc, '.');
+    const pathLen = std.mem.count(u8, pathSrc, ".") + 1;
+    var path: Path = try ally.alloc([]const u8, pathLen);
+    var crumbleIdx: usize = 0;
+    while (pathIter.next()) |crumble| : (crumbleIdx += 1) {
+        path[crumbleIdx] = crumble;
+    }
+    return path;
+}
+
+test "test parse path" {
+    const ally = std.testing.allocator;
+    const path = try parsePath(ally, "field.subfield");
+    defer ally.free(path);
+    try std.testing.expectEqualSlices(u8, "field", path[0]);
+    try std.testing.expectEqualSlices(u8, "subfield", path[1]);
+}
+
+pub const Filter = union(FilterType) {
     eq: PathValuePair,
     ne: PathValuePair,
     lt: PathValuePair,
@@ -41,58 +60,279 @@ const Filter = union(FilterType) {
         values: []bson.BSONValue,
     },
 
-    pub fn parseDoc(*const bson.BSONDocument) ![]Filter {
-        var filters: []Filter = &[]Filter{};
-        for (doc) |pair| {
-            const path = pair.key;
-            const value = pair.value;
-            if (value.isBSONDocument()) |doc| {
-                for (doc) |filterPair| {
-                    const filterType = filterPair.key;
-                    const filterValue = filterPair.value;
-                    switch (filterType) {
-                        FilterType.eq => filters.append(Filter.eq(PathValuePair{ .path = path, .value = filterValue })),
-                        FilterType.ne => filters.append(Filter.ne(PathValuePair{ .path = path, .value = filterValue })),
-                        FilterType.lt => filters.append(Filter.lt(PathValuePair{ .path = path, .value = filterValue })),
-                        FilterType.gt => filters.append(Filter.gt(PathValuePair{ .path = path, .value = filterValue })),
-                        FilterType.in => filters.append(Filter.in(PathValuePair{ .path = path, .values = filterValue })),
+    pub fn deinit(self: *Filter, ally: Allocator) void {
+        switch (self.*) {
+            .in => |*inFilter| {
+                ally.free(inFilter.path);
+                ally.free(inFilter.values);
+            },
+            .eq, .ne, .lt, .gt => |*filter| {
+                ally.free(filter.path);
+            },
+        }
+    }
+
+    fn parseDoc(ally: Allocator, doc: *const bson.BSONDocument) ![]Filter {
+        var filters = try ally.alloc(Filter, doc.values.len);
+        for (doc.values, 0..) |pair, i| {
+            const path = try parsePath(ally, pair.key);
+            if (path.len == 0) return error.InvalidQueryPath;
+
+            switch (pair.value) {
+                .document => |*operatorDoc| {
+                    if (operatorDoc.values.len != 1) return error.InvalidQueryOperatorSize;
+                    const operatorPair = operatorDoc.values[0];
+                    if (std.mem.eql(u8, operatorPair.key, "$eq")) {
+                        filters[i] = Filter{ .eq = .{ .path = path, .value = operatorPair.value } };
+                    } else if (std.mem.eql(u8, operatorPair.key, "$ne")) {
+                        filters[i] = Filter{ .ne = .{ .path = path, .value = operatorPair.value } };
+                    } else if (std.mem.eql(u8, operatorPair.key, "$lt")) {
+                        filters[i] = Filter{ .lt = .{ .path = path, .value = operatorPair.value } };
+                    } else if (std.mem.eql(u8, operatorPair.key, "$gt")) {
+                        filters[i] = Filter{ .gt = .{ .path = path, .value = operatorPair.value } };
+                    } else if (std.mem.eql(u8, operatorPair.key, "$in")) {
+                        const inValues = operatorPair.value;
+                        if (inValues != bson.BSONValueType.array) {
+                            return error.InvalidInOperatorValue;
+                        }
+                        var values: []bson.BSONValue = try ally.alloc(bson.BSONValue, inValues.array.values.len);
+                        for (inValues.array.values, 0..) |value, j| {
+                            values[j] = value.value;
+                        }
+                        filters[i] = Filter{
+                            .in = .{ .path = path, .values = values },
+                        };
+                    } else {
+                        return error.InvalidQueryOperator;
                     }
-                }
+                },
+                else => return error.InvalidQueryFilter,
             }
         }
         return filters;
     }
+
+    pub fn parse(ally: Allocator, doc: *const bson.BSONValue) ![]Filter {
+        switch (doc.*) {
+            .document => |*document| {
+                return try parseDoc(ally, document);
+            },
+            else => return error.InvalidQueryRoot,
+        }
+    }
+
+    pub fn match(self: *Filter, doc: *const bson.BSONDocument) bool {
+        switch (self.*) {
+            .eq => |eqFilter| {
+                const pathResult = doc.getPath(eqFilter.path);
+                if (pathResult) |value| {
+                    return value.eql(eqFilter.value);
+                } else {
+                    return false;
+                }
+            },
+            .ne => |neFilter| {
+                const pathResult = doc.getPath(neFilter.path);
+                if (pathResult) |value| {
+                    return !value.order(neFilter.value);
+                } else {
+                    return false;
+                }
+            },
+            .lt => |ltFilter| {
+                if (doc.getPath(ltFilter.path)) |value| {
+                    return value.order(ltFilter.value) == .lt;
+                } else {
+                    return false;
+                }
+            },
+            .gt => |gtFilter| {
+                if (doc.getPath(gtFilter.path)) |value| {
+                    return value.order(gtFilter.value) == .gt;
+                } else {
+                    return false;
+                }
+            },
+            .in => |inFilter| {
+                if (doc.getPath(inFilter.path)) |value| {
+                    for (inFilter.values) |inValue| {
+                        if (value.eql(inValue)) return true;
+                    }
+                    return false;
+                } else {
+                    return false;
+                }
+            },
+        }
+    }
 };
 
+test "Filter.parse" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$eq", .value = .{ .string = bson.BSONString{ .value = "value" } } },
+    };
+    const opDoc = bson.BSONDocument.fromPairs(ally, &opPairs);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "field.subfield", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filters = try Filter.parse(ally, &bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*filter| filter.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(filters.len, 1);
+    const filter = filters[0];
+    switch (filter) {
+        .eq => |*eqFilter| {
+            try std.testing.expectEqualSlices(u8, "field", eqFilter.path[0]);
+            try std.testing.expectEqualSlices(u8, "subfield", eqFilter.path[1]);
+            try std.testing.expectEqualStrings(eqFilter.value.string.value, "value");
+        },
+        else => unreachable,
+    }
+}
+
 const SortType = enum {
-    Asc,
-    Desc,
+    asc,
+    desc,
 };
 
 const Sort = union(SortType) {
-    Asc: Path,
-    Desc: Path,
+    asc: Path,
+    desc: Path,
+
+    pub fn parse(ally: Allocator, doc: bson.BSONValue) !Sort {
+        if (doc != bson.BSONValueType.document) return error.InvalidQuerySort;
+        if (doc.document.values.len != 1) return error.InvalidQuerySortParamLength;
+        const pair = doc.document.values[0];
+        if (pair.value != bson.BSONValueType.string) return error.InvalidQuerySortParamType;
+        const path = try parsePath(ally, pair.value.string.value);
+        if (path.len == 0) return error.InvalidQueryPath;
+        if (std.mem.eql(u8, pair.key, "asc")) {
+            return Sort{ .asc = path };
+        } else if (std.mem.eql(u8, pair.key, "desc")) {
+            return Sort{ .desc = path };
+        } else {
+            return error.InvalidQuerySort;
+        }
+    }
 };
+
+test "Sort.parse" {
+    const ally = std.testing.allocator;
+    var sortPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "asc", .value = .{ .string = bson.BSONString{ .value = "field" } } },
+    };
+    const sortDoc = bson.BSONDocument.fromPairs(ally, &sortPairs);
+    const sort = try Sort.parse(ally, bson.BSONValue{ .document = sortDoc });
+    defer {
+        switch (sort) {
+            .asc => |ascSort| ally.free(ascSort),
+            .desc => |descSort| ally.free(descSort),
+        }
+    }
+    switch (sort) {
+        .asc => |ascSort| {
+            try std.testing.expectEqualSlices(u8, "field", ascSort[0]);
+        },
+        else => unreachable,
+    }
+}
 
 const Sector = struct {
     offset: ?u64,
     limit: ?u64,
+
+    pub fn parse(doc: *const bson.BSONValue) !Sector {
+        if (doc.* != bson.BSONValueType.document) return error.InvalidQuerySector;
+        var offset: ?u64 = null;
+        const document = doc.document;
+        if (document.get("offset")) |offsetVal| switch (offsetVal) {
+            .int32 => |*offsetValue| {
+                if (offsetValue.value < 0) return error.OffsetValueNegative;
+                offset = @intCast(offsetValue.value);
+            },
+
+            .int64 => |*offsetValue| {
+                if (offsetValue.value < 0) return error.OffsetValueNegative;
+                offset = @intCast(offsetValue.value);
+            },
+            else => return error.InvalidQueryOffset,
+        };
+        var limit: ?u64 = null;
+        if (document.get("limit")) |limitVal| switch (limitVal) {
+            .int32 => |*limitValue| {
+                if (limitValue.value < 0) return error.LimitValueNegative;
+                limit = @intCast(limitValue.value);
+            },
+
+            .int64 => |*limitValue| {
+                if (limitValue.value < 0) return error.LimitValueNegative;
+                limit = @intCast(limitValue.value);
+            },
+            else => return error.InvalidQueryOffset,
+        };
+        return Sector{
+            .offset = offset,
+            .limit = limit,
+        };
+    }
 };
 
+test "Sector.parse" {
+    const ally = std.testing.allocator;
+    var sectorPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "offset", .value = .{ .int32 = .{ .value = 10 } } },
+        .{ .key = "limit", .value = .{ .int32 = .{ .value = 10 } } },
+    };
+    const sectorDoc = bson.BSONDocument.fromPairs(ally, &sectorPairs);
+    const sector = try Sector.parse(&bson.BSONValue{ .document = sectorDoc });
+    try std.testing.expectEqual(sector.offset, 10);
+    try std.testing.expectEqual(sector.limit, 10);
+}
+
 pub const Query = struct {
+    const defaultFilters = []Filter{};
     filters: []Filter = &[]Filter{},
     sorts: ?Sort,
     sector: ?Sector,
-    projection: bson.Document,
+    // projection: bson.Document,
 
     pub fn parse(ally: Allocator, rawQuery: []const u8) !void {
         const queryDoc = try bson.BSONDocument.deserializeFromMemory(ally, rawQuery);
         defer queryDoc.deinit();
 
         const filterDoc = queryDoc.get("query");
-        if (filterDoc) |doc| {}
-        self.sorts = doc.get("sort") orelse return error.InvalidQuery;
-        self.sector = doc.get("sector") orelse return error.InvalidQuery;
-        self.projection = doc.get("projection") orelse return error.InvalidQuery;
+        const filters = if (filterDoc) |doc| try Filter.parse(ally, doc) else defaultFilters;
+        const sortDoc = queryDoc.get("sort");
+        const sort = if (sortDoc) |doc| try Sort.parse(ally, doc) else null;
+        const sectorDoc = queryDoc.get("sector");
+        const sector = if (sectorDoc) |doc| try Sector.parse(doc) else null;
+        return Query{
+            .filters = filters,
+            .sorts = sort,
+            .sector = sector,
+            // .projection = queryDoc.get("projection") catch bson.Document{},
+        };
+    }
+
+    pub fn deinit(self: *Query, ally: Allocator) void {
+        for (self.filters) |*filter| filter.deinit(ally);
+        ally.free(self.filters);
+        if (self.sorts) |sort| {
+            switch (sort) {
+                .asc => |ascSort| ally.free(ascSort),
+                .desc => |descSort| ally.free(descSort),
+            }
+        }
+    }
+
+    pub fn match(self: *const Query, doc: *bson.BSONDocument) !bool {
+        for (self.filters) |*filter| {
+            if (!filter.match(doc)) return false;
+        }
+        return true;
     }
 };

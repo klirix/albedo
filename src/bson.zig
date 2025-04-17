@@ -401,7 +401,64 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn order(self: *const BSONValue, other: *const BSONValue) std.math.Order {
+    pub fn eql(self: *const BSONValue, other: BSONValue) bool {
+        if (self.* == BSONValueType.array) {
+            if (other == BSONValueType.array) {
+                if (self.array.len != other.array.len) return false;
+                for (self.array.values) |pair| {
+                    const arrayElem = other.array.get(pair.key);
+                    if (arrayElem) |elem| {
+                        switch (elem) {
+                            .document, .array => {
+                                return false;
+                            },
+                            else => {
+                                if (!pair.value.eql(elem)) {
+                                    return false;
+                                }
+                            },
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                return true;
+            } else switch (other) {
+                .document, .array => {
+                    return false;
+                },
+
+                else => {
+                    for (self.array.values) |pair| {
+                        if (pair.value.eql(other)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                },
+            }
+        }
+
+        if (self.valueType() != other.valueType()) {
+            return false;
+        }
+
+        return switch (self.*) {
+            .string => std.mem.eql(u8, self.string.value, other.string.value),
+            .int32 => self.int32.value == other.int32.value,
+            .int64 => self.int64.value == other.int64.value,
+            .double => self.double.value == other.double.value,
+            .document => false,
+            .datetime => self.datetime.value == other.datetime.value,
+            .binary => std.mem.eql(u8, self.binary.value, other.binary.value),
+            .boolean => self.boolean.value == other.boolean.value,
+            .null => true,
+            .objectId => self.objectId.value.toInt() == other.objectId.value.toInt(),
+            else => false,
+        };
+    }
+
+    pub fn order(self: *const BSONValue, other: BSONValue) std.math.Order {
         const a_val = self.valueOrder();
         const b_val = other.valueOrder();
         if (a_val != b_val) {
@@ -468,7 +525,32 @@ pub const BSONValue = union(BSONValueType) {
     }
 };
 
-const BSONValueType = enum(u8) {
+test "BSONValue.eql array -> int32" {
+    var arrayPairs = [_]BSONKeyValuePair{
+        BSONKeyValuePair{
+            .key = "0",
+            .value = BSONValue{ .int32 = BSONInt32{ .value = 123 } },
+        },
+        BSONKeyValuePair{
+            .key = "1",
+            .value = BSONValue{ .int32 = BSONInt32{ .value = 123 } },
+        },
+    };
+    const doc = BSONValue{ .array = BSONDocument.fromPairs(std.testing.allocator, &arrayPairs) };
+    const other = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
+    const otherfalse = BSONValue{ .int32 = BSONInt32{ .value = 321 } };
+    try std.testing.expectEqual(true, doc.eql(other));
+
+    try std.testing.expectEqual(false, doc.eql(otherfalse));
+}
+
+test "BSONValue.eql int32" {
+    const double = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
+    const other = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
+    try std.testing.expectEqual(true, double.eql(other));
+}
+
+pub const BSONValueType = enum(u8) {
     double = 0x01,
     string = 0x02,
     document = 0x03,
@@ -706,7 +788,7 @@ pub const BSONDocument = struct {
         memory[idx] = 0;
     }
 
-    pub fn get(self: *@This(), key: []const u8) ?BSONValue {
+    pub fn get(self: *const @This(), key: []const u8) ?BSONValue {
         for (self.values) |value| {
             if (mem.eql(u8, value.key, key)) {
                 return value.value;
@@ -716,7 +798,8 @@ pub const BSONDocument = struct {
     }
 
     pub fn getPath(self: *const BSONDocument, keys: []const []const u8) ?BSONValue {
-        var value: ?BSONValue = null;
+        var value: BSONValue = self;
+
         for (keys) |key| {
             if (value) |v| {
                 value = v.document.get(key);
@@ -724,7 +807,48 @@ pub const BSONDocument = struct {
                 value = self.get(key);
             }
         }
-        return value;
+        return null;
+    }
+
+    test "Document.getPath single value" {
+        const allocator = std.testing.allocator;
+        var pairs = [_]BSONKeyValuePair{
+            BSONKeyValuePair{
+                .key = "test",
+                .value = BSONValue{ .string = BSONString{ .value = "test" } },
+            },
+        };
+        const pairs_slice = pairs[0..];
+        var doc = BSONDocument.fromPairs(allocator, pairs_slice);
+        defer doc.deinit();
+
+        const value = doc.getPath(.{"test"});
+        try std.testing.expectEqualStrings("test", value.string.value);
+    }
+
+    test "Document.getPath multiple keys" {
+        const allocator = std.testing.allocator;
+        var innerPairs = [_]BSONKeyValuePair{
+            BSONKeyValuePair{
+                .key = "test",
+                .value = BSONValue{ .string = BSONString{ .value = "lmao" } },
+            },
+        };
+        var pairs = [_]BSONKeyValuePair{
+            BSONKeyValuePair{
+                .key = "test",
+                .value = BSONValue{ .string = BSONString{ .value = "test" } },
+            },
+            BSONKeyValuePair{
+                .key = "nested",
+                .value = BSONValue{ .document = BSONDocument.fromPairs(allocator, &innerPairs) },
+            },
+        };
+        var doc = BSONDocument.fromPairs(allocator, &pairs);
+        defer doc.deinit();
+
+        const value = doc.getPath(.{ "nested", "test" });
+        try std.testing.expectEqualStrings("lmao", value.string.value);
     }
 
     pub fn set(self: *@This(), key: [:0]const u8, value: BSONValue) !void {
