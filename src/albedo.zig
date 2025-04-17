@@ -2,6 +2,7 @@ const std = @import("std");
 const bson = @import("bson.zig");
 const File = std.fs.File;
 const ObjectId = @import("object_id.zig").ObjectId;
+const query = @import("query.zig");
 
 const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
@@ -433,7 +434,7 @@ const Bucket = struct {
                 return err;
             };
 
-            std.debug.print("Page approved, header {x}\n", .{header.reserved});
+            // std.debug.print("Page approved, header {x}\n", .{header.reserved});
 
             if (header.doc_id == 0) {
                 return false; // No more documents
@@ -484,31 +485,40 @@ const Bucket = struct {
         };
     }
 
-    pub fn list(self: *Bucket) !void {
+    pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]bson.BSONDocument {
         // For now, we'll just print the document
-        std.debug.print("Listing documents...\n", .{});
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
+
         var docList = std.ArrayList(bson.BSONDocument).init(allocator);
         var iterator = try self.scanIterator(allocator);
-        std.debug.print("initialized list iterators\n", .{});
+        var docsAdded: u64 = 0;
+        var docsSkipped: u64 = 0;
         while (try iterator.next()) |doc| {
-            std.debug.print("doc buff {any}\n", .{doc});
             const bson_doc = try bson.BSONDocument.deserializeFromMemory(allocator, doc);
-            try docList.append(bson_doc);
-        }
-        std.debug.print("read document buffers\n", .{});
 
-        for (docList.items) |item| {
-            std.debug.print("Document: {any}\n", .{item.values});
+            if (try q.match(&bson_doc)) {
+                if (q.sector) |sector| if (sector.offset) |offset| {
+                    if (docsSkipped < offset) {
+                        docsSkipped += 1;
+                        continue;
+                    }
+                };
+                try docList.append(bson_doc);
+                docsAdded += 1;
+                if (q.sector) |sector| if (sector.limit) |limit| {
+                    if (docsAdded >= limit) {
+                        break;
+                    }
+                };
+            }
         }
+
+        return try docList.toOwnedSlice();
         // std.debug.print("DOCS GOOD", .{});
     }
 
     pub fn delete(_: *Bucket, _: bson.BSONDocument) !void {
         // For now, we'll just print the document
-        std.debug.print("Deleting document: {s}\n", .{});
+
     }
 
     pub fn deinit(self: *Bucket) void {
@@ -521,23 +531,41 @@ const Bucket = struct {
 };
 
 test "Bucket.insert" {
-    var bucket = try Bucket.init(std.testing.allocator, "test.bucket");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var bucket = try Bucket.init(allocator, "test.bucket");
     defer bucket.deinit();
 
-    var docValues = try std.testing.allocator.alloc(bson.BSONKeyValuePair, 2);
+    var docValues = try allocator.alloc(bson.BSONKeyValuePair, 2);
 
     docValues[0] = .{ .key = "name", .value = .{ .string = .{ .value = "Alice" } } };
 
-    docValues[1] = .{ .key = "age", .value = .{ .int32 = .{ .value = 30 } } };
+    docValues[1] = .{ .key = "age", .value = .{ .int32 = .{ .value = 37 } } };
 
     // Create a new BSON document
-    var doc = bson.BSONDocument.fromPairs(std.testing.allocator, docValues[0..]);
+    var doc = bson.BSONDocument.fromPairs(allocator, docValues[0..]);
     defer doc.deinit();
 
     // Insert the document into the bucket
     _ = try bucket.insert(&doc);
 
-    try bucket.list();
+    const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {"age": {"$eq": 37}},
+        \\  "sector": {"offset": 16, "limit": 10},
+        \\  "sort": {"desc": "age"}
+        \\}
+    ));
+
+    const qResult = try bucket.list(allocator, q);
+    if (q.sortConfig) |sortConfig| {
+        std.mem.sort(bson.BSONDocument, qResult, sortConfig, query.Query.sort);
+    }
+
+    for (qResult) |item| {
+        std.debug.print("Document age: {any}\n", .{item.values[1].value.int32.value});
+    }
 }
 
 test "DocHeader.write" {

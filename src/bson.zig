@@ -4,7 +4,7 @@ const ObjectId = @import("./object_id.zig").ObjectId;
 
 pub const BSONString = struct {
     // code: i8, // 0x02
-    value: [:0]const u8,
+    value: []const u8,
 
     pub fn write(self: BSONString, memory: []u8) void {
         // var memory = try allocator.alloc(u8, 4 + self.length);
@@ -22,7 +22,7 @@ pub const BSONString = struct {
     pub fn read(memory: []const u8) BSONString {
         const length = std.mem.bytesToValue(u32, memory[0..4]);
 
-        return BSONString{ .value = memory[4 .. 4 + length - 1 :0] };
+        return BSONString{ .value = memory[4 .. 4 + length - 1] };
     }
 };
 
@@ -384,7 +384,6 @@ pub const BSONValue = union(BSONValueType) {
             .objectId => 7,
             .boolean => 8,
             .datetime => 9,
-            .timestamp => 10,
         };
     }
 
@@ -467,14 +466,14 @@ pub const BSONValue = union(BSONValueType) {
 
         return switch (self.*) {
             .string => std.mem.order(u8, self.string.value, other.string.value),
-            .int32, .int64, .double => orderNums(self, other),
+            .int32, .int64, .double => orderNums(self, &other),
             .document => .eq,
             .array => std.math.order(self.array.len, self.array.len),
             .datetime => std.math.order(self.datetime.value, other.datetime.value),
             .binary => .eq,
-            .boolean => std.math.order(self.boolean.value, other.boolean.value),
+            .boolean => .eq,
             .null => .eq,
-            .objectId => std.mem.order(self.objectId.value.toInt(), other.objectId.value.toInt()),
+            .objectId => std.math.order(self.objectId.value.toInt(), other.objectId.value.toInt()),
         };
     }
 
@@ -572,13 +571,13 @@ pub const BSONValueType = enum(u8) {
 
 const TypeNamePair = struct {
     type: BSONValueType,
-    name: [:0]const u8,
+    name: []const u8,
     len: u32,
     pub fn read(bytes: []const u8) ?TypeNamePair {
         if (bytes[0] == 0x00) return null;
         var length: u32 = 0;
         while (bytes[length + 1] != 0) length += 1;
-        const name: [:0]const u8 = bytes[1..(1 + length) :0];
+        const name: []const u8 = bytes[1..(1 + length)];
         const name_size: u32 = @truncate(name.len + 1);
 
         return TypeNamePair{
@@ -656,14 +655,172 @@ fn readDocument(allocator: mem.Allocator, memory: []const u8) mem.Allocator.Erro
 }
 
 pub const BSONKeyValuePair = struct {
-    key: [:0]const u8,
+    key: []const u8,
     value: BSONValue,
 };
+
+test "from json" {
+    const json = "{ \"key\": {\"key2\": \"val\"} }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const allocator = arena.allocator();
+    const doc = try BSONDocument.fromJSON(allocator, json);
+    defer arena.deinit();
+
+    try std.testing.expectEqualStrings("key", doc.values[0].key);
+    try std.testing.expectEqualStrings("val", doc.values[0].value.document.values[0].value.string.value);
+}
 
 pub const BSONDocument = struct {
     values: []BSONKeyValuePair,
     len: u32,
     ally: mem.Allocator,
+
+    pub fn fromJSON(ally: mem.Allocator, json: []const u8) !BSONDocument {
+        var jsonStream = std.json.Scanner.initCompleteInput(ally, json);
+        defer jsonStream.deinit();
+
+        const docVal = try jsonToDoc(&jsonStream, ally);
+
+        return docVal.document;
+    }
+
+    fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) !BSONValue {
+        var pairs = std.ArrayList(BSONKeyValuePair).init(allocator);
+        if (try json.next() != .object_begin) {
+            return error.InvalidJSON;
+        }
+        var token = try json.nextAlloc(allocator, .alloc_always);
+        while (token != .object_end) {
+            if (token != .allocated_string) {
+                return error.InvalidJSON;
+            }
+            const key = token.allocated_string[0..];
+            const nextType = try json.peekNextTokenType();
+
+            switch (nextType) {
+                .number => {
+                    token = try json.nextAlloc(allocator, .alloc_always);
+                    if (std.mem.indexOf(u8, token.allocated_number, ".") != null) {
+                        const value = BSONValue{
+                            .double = BSONDouble{
+                                .value = try std.fmt.parseFloat(f64, token.allocated_number),
+                            },
+                        };
+                        try pairs.append(BSONKeyValuePair{
+                            .key = key,
+                            .value = value,
+                        });
+                    } else {
+                        const value = BSONValue{
+                            .int32 = BSONInt32{ .value = try std.fmt.parseInt(i32, token.allocated_number, 10) },
+                        };
+                        try pairs.append(BSONKeyValuePair{
+                            .key = key,
+                            .value = value,
+                        });
+                    }
+                },
+                .string => {
+                    token = try json.nextAlloc(allocator, .alloc_always);
+                    const value = BSONValue{ .string = BSONString{ .value = token.allocated_string } };
+                    try pairs.append(BSONKeyValuePair{
+                        .key = key,
+                        .value = value,
+                    });
+                },
+                .true, .false => |tok| {
+                    token = try json.nextAlloc(allocator, .alloc_always);
+                    const value = BSONValue{
+                        .boolean = BSONBoolean{ .value = if (tok == .true) true else false },
+                    };
+                    try pairs.append(BSONKeyValuePair{
+                        .key = key,
+                        .value = value,
+                    });
+                },
+                .null => {
+                    token = try json.nextAlloc(allocator, .alloc_always);
+                    const value = BSONValue{ .null = BSONNull{} };
+                    try pairs.append(BSONKeyValuePair{
+                        .key = key,
+                        .value = value,
+                    });
+                },
+                .object_begin => {
+                    // token = try json.nextAlloc(allocator, .alloc_always);
+                    const value = try jsonToDoc(json, allocator);
+                    try pairs.append(BSONKeyValuePair{
+                        .key = key,
+                        .value = value,
+                    });
+                },
+                // .array_begin => {
+                //     // token = try json.nextAlloc(allocator, .alloc_always);
+                //     const value = try jsonToArray(json, allocator);
+                //     try pairs.append(BSONKeyValuePair{
+                //         .key = key,
+                //         .value = value,
+                //     });
+                // },
+                .object_end => {
+                    break;
+                },
+                else => {
+                    return error.InvalidJSON;
+                },
+            }
+            token = try json.nextAlloc(allocator, .alloc_always);
+        }
+        return BSONValue{
+            .document = BSONDocument.fromPairs(allocator, try pairs.toOwnedSlice()),
+        };
+    }
+
+    fn jsonToArray(json: anytype, allocator: mem.Allocator) !BSONValue {
+        var pairs = std.ArrayList(BSONKeyValuePair).init(allocator);
+        if (json.next() != .array_begin) {
+            return error.InvalidJSON;
+        }
+        var token = try json.next();
+        while (token != .array_end) {
+            token = json.nextAlloc(allocator, .alloc_always);
+            if (token != .string) {
+                return error.InvalidJSON;
+            }
+            const key = token.string;
+            const nextType = try json.peekNextTokenType(allocator);
+
+            switch (nextType) {
+                .number => {
+                    token = try json.nextAlloc(allocator, .alloc_always);
+                    if (std.mem.indexOf(u8, token, ".")) {
+                        const value = BSONValue{ .double = BSONDouble{ .value = token.number } };
+                        try pairs.append(BSONKeyValuePair{
+                            .key = key,
+                            .value = value,
+                        });
+                    } else {
+                        const value = BSONValue{ .int32 = BSONInt32{ .value = token.number } };
+                        try pairs.append(BSONKeyValuePair{
+                            .key = key,
+                            .value = value,
+                        });
+                    }
+                },
+                .string => {
+                    token = try json.nextAlloc(allocator, .alloc_always);
+                    const value = BSONValue{ .string = BSONString{ .value = token.allocated_string } };
+                    try pairs.append(BSONKeyValuePair{
+                        .key = key,
+                        .value = value,
+                    });
+                },
+                else => {
+                    return error.InvalidJSON;
+                },
+            }
+        }
+    }
 
     pub fn deserializeFromMemory(allocator: mem.Allocator, memory: []const u8) mem.Allocator.Error!BSONDocument {
         const length = mem.bytesToValue(u32, memory[0..4]);
