@@ -1064,7 +1064,6 @@ test "BSONDocument write" {
     };
     const pairs_slice = pairs[0..];
     var doc = BSONDocument.fromPairs(allocator, pairs_slice);
-    std.debug.print("doc len: {d}", .{doc.len});
     // const actual = allocator.alloc(u8, 100) catch unreachable;
 
     try doc.write(list.writer());
@@ -1082,7 +1081,7 @@ test "BSONDocument serializeToMemory" {
     };
     const pairs_slice = pairs[0..];
     var doc = BSONDocument.fromPairs(allocator, pairs_slice);
-    std.debug.print("doc len: {d}", .{doc.len});
+    // std.debug.print("doc len: {d}", .{doc.len});
     const actual = allocator.alloc(u8, 100) catch unreachable;
 
     doc.serializeToMemory(actual);
@@ -1145,7 +1144,7 @@ test "BSONDoc set docs" {
     try doc.set("_id", .{ .objectId = .{ .value = objid } });
     const text = doc.get("_id").?.objectId.value;
 
-    std.debug.print("{any}\n", .{doc.values});
+    // std.debug.print("{any}\n", .{doc.values});
 
     try std.testing.expectEqual(text.toInt(), objid.toInt());
 

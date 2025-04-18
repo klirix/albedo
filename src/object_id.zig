@@ -42,13 +42,13 @@ pub const ObjectId = struct {
         return std.mem.readInt(u32, self.buffer[0..4], .big);
     }
 
-    pub fn toString(self: ObjectId) [24:0]u8 {
-        var res = ([_:0]u8{0} ** 24);
+    pub fn toString(self: ObjectId) [24]u8 {
+        var res = ([_]u8{0} ** 24);
         inline for (self.buffer, 0..) |byte, i| {
             const high = byte >> 4;
             const low = byte & 0xF;
-            res[i * 2] = (high + '0') * @intFromBool(high < 0xa) | (high + 'a' - 10) * @intFromBool(high > 0xa);
-            res[i * 2 + 1] = (low + '0') * @intFromBool(low < 0xa) | (low + 'a' - 10) * @intFromBool(low > 0xa);
+            res[i * 2] = if (high < 0xa) high + '0' else high + 'a' - 10;
+            res[i * 2 + 1] = if (low < 0xa) low + '0' else low + 'a' - 10;
         }
         return res;
     }
@@ -77,10 +77,6 @@ test "test timestamp get" {
     const objid = ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
     // std.debug.print("{x} {x}", .{ 0x507c7f79, objid.timestamp() });
     try std.testing.expectEqual(0x507c7f79, objid.timestamp());
-}
-
-test "Test" {
-    std.debug.print("{x}", .{@as(i32, @truncate(std.time.timestamp()))});
 }
 
 test "Test2" {
