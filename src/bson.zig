@@ -684,6 +684,14 @@ pub const BSONDocument = struct {
         return docVal.document;
     }
 
+    pub fn fromStaticPairs(allocator: mem.Allocator, comptime pairs: anytype) BSONDocument {
+        return BSONDocument{
+            .values = pairs,
+            .len = @as(u32, @truncate(pairs.len)),
+            .ally = allocator,
+        };
+    }
+
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) !BSONValue {
         var pairs = std.ArrayList(BSONKeyValuePair).init(allocator);
         if (try json.next() != .object_begin) {

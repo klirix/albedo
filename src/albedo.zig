@@ -133,7 +133,15 @@ const Page = struct {
     }
 };
 
-const Bucket = struct {
+const BucketInitErrors = error{
+    FileStatError,
+    InvalidPath,
+    InvalidDocId,
+    FileOpenError,
+    FileReadError,
+};
+
+pub const Bucket = struct {
     file: std.fs.File,
     allocator: std.mem.Allocator,
     header: BucketHeader,
@@ -161,29 +169,35 @@ const Bucket = struct {
     };
 
     // Update init to include allocator
-    pub fn init(allocator: std.mem.Allocator, path: []const u8) !Bucket {
+    pub fn init(allocator: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
         var bucket = try Bucket.openFile(allocator, path);
         bucket.page_cache = std.AutoArrayHashMap(u64, Page).init(allocator);
         return bucket;
     }
 
-    pub fn openFile(ally: std.mem.Allocator, path: []const u8) !Bucket {
+    pub fn openFile(ally: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
         const stat: ?File.Stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
             error.FileNotFound => null, // If the file doesn't exist, return null
             // error.InvalidPath => return error.InvalidPath, // Return an error if the path is invalid
-            else => return err, // Return any other errors
+            else => {
+                std.debug.print("Error opening file: {any}\n", .{err});
+                return BucketInitErrors.FileStatError; // Return null for any other errors
+            }, // Return any other errors
         };
         var file: File = undefined; // Change to a pointer for better management
         if (stat) |s| {
             // If the file exists, check if it's a directory
             // std.debug.print("\nFile exists, opening...\n ", .{});
             if (s.kind == .directory) {
-                return error.InvalidPath; // Return an error if it's a directory
+                return BucketInitErrors.InvalidPath; // Return an error if it's a directory
             }
 
             // Open the file for reading and writing
-            file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-            const header_bytes = try file.reader().readBytesNoEof(@sizeOf(BucketHeader));
+            file = std.fs.cwd().openFile(
+                path,
+                .{ .mode = .read_write },
+            ) catch return BucketInitErrors.FileOpenError;
+            const header_bytes = file.reader().readBytesNoEof(@sizeOf(BucketHeader)) catch return BucketInitErrors.FileReadError;
             return .{
                 .file = file,
                 .header = BucketHeader.read(header_bytes[0..@sizeOf(BucketHeader)]),
@@ -193,12 +207,14 @@ const Bucket = struct {
         } else {
             // std.debug.print("\nFile doesnt exists, creating...\n ", .{});
             // If the file doesn't exist, create it
-            _ = try std.fs.cwd().createFile(path, .{});
+            _ = std.fs.cwd().createFile(path, .{}) catch return BucketInitErrors.FileOpenError;
 
             // Reopen the file for reading and writing
-            file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+            file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch {
+                return BucketInitErrors.FileOpenError;
+            };
 
-            _ = try file.write(BucketHeader.init().write()[0..64]);
+            _ = file.write(BucketHeader.init().write()[0..64]) catch return BucketInitErrors.FileReadError;
 
             // std.debug.print("{d}", .{bytes_written});
             return .{
@@ -353,7 +369,7 @@ const Bucket = struct {
             page = try self.createNewPage(.Data);
         }
 
-        std.debug.print("\nDecided to write on page {d}, offset: {d}\n", .{ page.header.page_id, page.header.used_size });
+        // std.debug.print("\nDecided to write on page {d}, offset: {d}\n", .{ page.header.page_id, page.header.used_size });
 
         // Write the document header
         const doc_header = DocHeader{
@@ -380,7 +396,7 @@ const Bucket = struct {
 
             // Determine how much to write
             const to_write = @min(bytes_to_write - bytes_written, available_space);
-            std.debug.print("Writing ({d}){d} bytes to the page \n", .{ page.header.used_size, to_write });
+            // std.debug.print("Writing ({d}){d} bytes to the page \n", .{ page.header.used_size, to_write });
             _ = try stream.write(encoded_doc[bytes_written .. bytes_written + to_write]);
             // Insert document at the current position
             page.header.used_size += @intCast(to_write);
@@ -429,7 +445,7 @@ const Bucket = struct {
             if (!self.initialized) {
                 self.initialized = true;
                 self.page = try self.pageIterator.next() orelse return null;
-                std.debug.print("List iterator initialized, page {d} loaded\n", .{self.page.header.page_id});
+                // std.debug.print("List iterator initialized, page {d} loaded\n", .{self.page.header.page_id});
             }
 
             if (self.offset >= self.page.data.len - 20) {
@@ -532,7 +548,7 @@ const Bucket = struct {
         while (try iterator.next()) |doc| {
             const bson_doc = try bson.BSONDocument.deserializeFromMemory(allocator, doc.data);
 
-            if (!try q.match(&bson_doc)) continue;
+            if (!q.match(&bson_doc)) continue;
             if (q.sector) |sector| if (sector.offset) |offset| {
                 if (docsSkipped < offset) {
                     docsSkipped += 1;
@@ -569,7 +585,7 @@ const Bucket = struct {
         var docsSkipped: u64 = 0;
         while (try iterator.next()) |doc| {
             const bson_doc = try bson.BSONDocument.deserializeFromMemory(allocator, doc.data);
-            if (!try q.match(&bson_doc)) continue;
+            if (!q.match(&bson_doc)) continue;
             if (q.sector) |sector| if (sector.offset) |offset| {
                 if (docsSkipped < offset) {
                     docsSkipped += 1;
@@ -581,12 +597,6 @@ const Bucket = struct {
                 .page_id = doc.page_id,
                 .offset = doc.offset,
             });
-
-            std.debug.print("Deleting at offset: {any}\n", .{.{
-                .header = doc.header,
-                .page_id = doc.page_id,
-                .offset = doc.offset,
-            }});
             docsAdded += 1;
             if (q.sector) |sector| if (sector.limit) |limit| {
                 if (docsAdded >= limit) {
@@ -601,7 +611,6 @@ const Bucket = struct {
             location.header.is_deleted = 1;
             var file = self.file;
             const offset = @sizeOf(BucketHeader) + @sizeOf(PageHeader) + (location.page_id * DEFAULT_PAGE_SIZE);
-            std.debug.print("Deleting at offset: {any}", .{offset});
             try file.seekTo(offset + location.offset);
             try writer.writeStruct(location.header);
         }
@@ -617,37 +626,37 @@ const Bucket = struct {
     }
 };
 
-// test "Bucket.insert" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//     const allocator = arena.allocator();
-//     var bucket = try Bucket.init(allocator, "test.bucket");
-//     defer bucket.deinit();
+test "Bucket.insert" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var bucket = try Bucket.init(allocator, "test.bucket");
+    defer bucket.deinit();
 
-//     // Create a new BSON document
-//     var doc = try bson.BSONDocument.fromJSON(allocator,
-//         \\ {
-//         \\  "name": "Alice",
-//         \\  "age": 37
-//         \\ }
-//     );
+    // Create a new BSON document
+    var doc = try bson.BSONDocument.fromJSON(allocator,
+        \\ {
+        \\  "name": "Alice",
+        \\  "age": 37
+        \\ }
+    );
 
-//     // Insert the document into the bucket
-//     _ = try bucket.insert(&doc);
+    // Insert the document into the bucket
+    _ = try bucket.insert(&doc);
 
-//     const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-//         \\{
-//         \\  "sector": {}
-//         \\}
-//     ));
+    const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "sector": {}
+        \\}
+    ));
 
-//     const qResult = try bucket.list(allocator, q);
+    const qResult = try bucket.list(allocator, q);
 
-//     for (qResult) |item| {
-//         const oId = item.get("_id").?.objectId.value;
-//         std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
-//     }
-// }
+    for (qResult) |item| {
+        const oId = item.get("_id").?.objectId.value;
+        std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
+    }
+}
 
 test "DocHeader.write" {
     var fixedBuffer: [64]u8 = [_]u8{0} ** 64;
@@ -700,6 +709,6 @@ test "Bucket.delete" {
 
     docs = try bucket.list(allocator, listQ);
     const newDocCount = docs.len;
-    std.debug.print("Deleted {d} documents, new count: {d}\n", .{ docCount - newDocCount, newDocCount });
+
     try std.testing.expect(newDocCount < docCount);
 }

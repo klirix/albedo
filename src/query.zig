@@ -72,15 +72,25 @@ pub const Filter = union(FilterType) {
         }
     }
 
-    fn parseDoc(ally: Allocator, doc: *const bson.BSONDocument) ![]Filter {
+    pub const FilterParsingErrors = error{
+        InvalidQueryFilter,
+        InvalidQueryPath,
+        InvalidQueryOperator,
+        InvalidQueryOperatorSize,
+        InvalidInOperatorValue,
+        InvalidQueryRoot,
+        OutOfMemory,
+    };
+
+    fn parseDoc(ally: Allocator, doc: *const bson.BSONDocument) FilterParsingErrors![]Filter {
         var filters = try ally.alloc(Filter, doc.values.len);
         for (doc.values, 0..) |pair, i| {
             const path = try parsePath(ally, pair.key);
-            if (path.len == 0) return error.InvalidQueryPath;
+            if (path.len == 0) return FilterParsingErrors.InvalidQueryPath;
 
             switch (pair.value) {
                 .document => |*operatorDoc| {
-                    if (operatorDoc.values.len != 1) return error.InvalidQueryOperatorSize;
+                    if (operatorDoc.values.len != 1) return FilterParsingErrors.InvalidQueryOperatorSize;
                     const operatorPair = operatorDoc.values[0];
                     if (std.mem.eql(u8, operatorPair.key, "$eq")) {
                         filters[i] = Filter{ .eq = .{ .path = path, .value = operatorPair.value } };
@@ -93,7 +103,7 @@ pub const Filter = union(FilterType) {
                     } else if (std.mem.eql(u8, operatorPair.key, "$in")) {
                         const inValues = operatorPair.value;
                         if (inValues != bson.BSONValueType.array) {
-                            return error.InvalidInOperatorValue;
+                            return FilterParsingErrors.InvalidInOperatorValue;
                         }
                         var values: []bson.BSONValue = try ally.alloc(bson.BSONValue, inValues.array.values.len);
                         for (inValues.array.values, 0..) |value, j| {
@@ -103,7 +113,7 @@ pub const Filter = union(FilterType) {
                             .in = .{ .path = path, .values = values },
                         };
                     } else {
-                        return error.InvalidQueryOperator;
+                        return FilterParsingErrors.InvalidQueryOperator;
                     }
                 },
                 .string, .int32, .int64, .objectId, .datetime, .boolean, .null => {
@@ -112,18 +122,18 @@ pub const Filter = union(FilterType) {
                     };
                 },
 
-                else => return error.InvalidQueryFilter,
+                else => return FilterParsingErrors.InvalidQueryFilter,
             }
         }
         return filters;
     }
 
-    pub fn parse(ally: Allocator, doc: *const bson.BSONValue) ![]Filter {
+    pub fn parse(ally: Allocator, doc: *const bson.BSONValue) FilterParsingErrors![]Filter {
         switch (doc.*) {
             .document => |*document| {
                 return try parseDoc(ally, document);
             },
-            else => return error.InvalidQueryRoot,
+            else => return FilterParsingErrors.InvalidQueryRoot,
         }
     }
 
@@ -209,7 +219,15 @@ const SortConfig = union(SortType) {
     asc: Path,
     desc: Path,
 
-    pub fn parse(ally: Allocator, doc: bson.BSONValue) !SortConfig {
+    pub const SortParsingErrors = error{
+        InvalidQuerySort,
+        InvalidQuerySortParamLength,
+        InvalidQuerySortParamType,
+        InvalidQueryPath,
+        OutOfMemory,
+    };
+
+    pub fn parse(ally: Allocator, doc: bson.BSONValue) SortParsingErrors!SortConfig {
         if (doc != bson.BSONValueType.document) return error.InvalidQuerySort;
         if (doc.document.values.len != 1) return error.InvalidQuerySortParamLength;
         const pair = doc.document.values[0];
@@ -251,34 +269,42 @@ const Sector = struct {
     offset: ?u64,
     limit: ?u64,
 
-    pub fn parse(doc: *const bson.BSONValue) !Sector {
-        if (doc.* != bson.BSONValueType.document) return error.InvalidQuerySector;
+    pub const SectorParsingErrors = error{
+        InvalidQuerySector,
+        InvalidQueryOffset,
+        InvalidQueryLimit,
+        OffsetValueNegative,
+        LimitValueNegative,
+    };
+
+    pub fn parse(doc: *const bson.BSONValue) SectorParsingErrors!Sector {
+        if (doc.* != bson.BSONValueType.document) return SectorParsingErrors.InvalidQuerySector;
         var offset: ?u64 = null;
         const document = doc.document;
         if (document.get("offset")) |offsetVal| switch (offsetVal) {
             .int32 => |*offsetValue| {
-                if (offsetValue.value < 0) return error.OffsetValueNegative;
+                if (offsetValue.value < 0) return SectorParsingErrors.OffsetValueNegative;
                 offset = @intCast(offsetValue.value);
             },
 
             .int64 => |*offsetValue| {
-                if (offsetValue.value < 0) return error.OffsetValueNegative;
+                if (offsetValue.value < 0) return SectorParsingErrors.OffsetValueNegative;
                 offset = @intCast(offsetValue.value);
             },
-            else => return error.InvalidQueryOffset,
+            else => return SectorParsingErrors.InvalidQueryOffset,
         };
         var limit: ?u64 = null;
         if (document.get("limit")) |limitVal| switch (limitVal) {
             .int32 => |*limitValue| {
-                if (limitValue.value < 0) return error.LimitValueNegative;
+                if (limitValue.value < 0) return SectorParsingErrors.LimitValueNegative;
                 limit = @intCast(limitValue.value);
             },
 
             .int64 => |*limitValue| {
-                if (limitValue.value < 0) return error.LimitValueNegative;
+                if (limitValue.value < 0) return SectorParsingErrors.LimitValueNegative;
                 limit = @intCast(limitValue.value);
             },
-            else => return error.InvalidQueryOffset,
+            else => return SectorParsingErrors.InvalidQueryOffset,
         };
         return Sector{
             .offset = offset,
@@ -307,14 +333,18 @@ pub const Query = struct {
     sector: ?Sector,
     // projection: bson.Document,
 
-    pub fn parseRaw(ally: Allocator, rawQuery: []const u8) !Query {
+    pub fn parseRaw(ally: Allocator, rawQuery: []const u8) QueryParsingErrors!Query {
         var queryDoc = try bson.BSONDocument.deserializeFromMemory(ally, rawQuery);
         defer queryDoc.deinit();
 
         return parse(ally, queryDoc);
     }
 
-    pub fn parse(ally: Allocator, queryDoc: bson.BSONDocument) !Query {
+    pub const QueryParsingErrors = (SortConfig.SortParsingErrors ||
+        Filter.FilterParsingErrors ||
+        Sector.SectorParsingErrors);
+
+    pub fn parse(ally: Allocator, queryDoc: bson.BSONDocument) QueryParsingErrors!Query {
         const filterDoc = queryDoc.get("query");
         const filters = if (filterDoc) |*doc| try Filter.parse(ally, doc) else @constCast(defaultFilters[0..]);
         const sortDoc = queryDoc.get("sort");
@@ -340,7 +370,7 @@ pub const Query = struct {
         }
     }
 
-    pub fn match(self: *const Query, doc: *const bson.BSONDocument) !bool {
+    pub fn match(self: *const Query, doc: *const bson.BSONDocument) bool {
         for (self.filters) |*filter| {
             if (!filter.match(doc)) return false;
         }
