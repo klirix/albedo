@@ -106,6 +106,12 @@ pub const Filter = union(FilterType) {
                         return error.InvalidQueryOperator;
                     }
                 },
+                .string, .int32, .int64, .objectId, .datetime, .boolean, .null => {
+                    filters[i] = Filter{
+                        .eq = .{ .path = path, .value = pair.value },
+                    };
+                },
+
                 else => return error.InvalidQueryFilter,
             }
         }

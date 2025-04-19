@@ -17,13 +17,6 @@
       //   "BAR": ""
       // }
       "preLaunchTask": "zig: build-test"
-    },
-    {
-      "type": "lldb-dap",
-      "request": "launch",
-      "name": "Build",
-      "program": "zig",
-      "args": ["test", " -femit-bin=zig-out/bin/my-test", "src/albedo.zig"]
     }
   ]
 }

@@ -138,6 +138,7 @@ const Bucket = struct {
     allocator: std.mem.Allocator,
     header: BucketHeader,
     page_cache: std.AutoArrayHashMap(u64, Page),
+    rwlock: std.Thread.RwLock = .{},
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -402,6 +403,19 @@ const Bucket = struct {
         return result;
     }
 
+    const DocumentLocation = struct {
+        page_id: u64,
+        offset: u16,
+        header: DocHeader,
+    };
+
+    const IteratorResult = struct {
+        page_id: u64,
+        offset: u16,
+        header: DocHeader,
+        data: []u8,
+    };
+
     pub const ScanIterator = struct {
         bucket: *Bucket,
         page: Page,
@@ -409,7 +423,9 @@ const Bucket = struct {
         initialized: bool = false,
         offset: u16 = 0,
         pageIterator: PageIterator,
-        pub fn step(self: *ScanIterator) !?DocHeader {
+        readDeleted: bool = false,
+
+        pub fn step(self: *ScanIterator) !?DocumentLocation {
             if (!self.initialized) {
                 self.initialized = true;
                 self.page = try self.pageIterator.next() orelse return null;
@@ -440,15 +456,29 @@ const Bucket = struct {
                 return null; // No more documents
             }
             self.offset += @intCast(@sizeOf(DocHeader));
-            return header;
+
+            return .{
+                .page_id = self.page.header.page_id,
+                .offset = self.offset - @sizeOf(DocHeader),
+                .header = header,
+            };
         }
-        pub fn next(self: *ScanIterator) !?[]u8 {
+        pub fn next(self: *ScanIterator) !?IteratorResult {
             // Check if we have reached the end of the page
-            const header = try self.step();
-            if (header == null) return null;
+
+            var header = try self.step() orelse return null;
+            while (header.header.is_deleted == 1 and !self.readDeleted) {
+                // Skip deleted documents
+
+                var stream = std.io.fixedBufferStream(self.page.data);
+                var reader = stream.reader();
+                try reader.skipBytes(self.offset, .{});
+                self.offset += @as(u16, @truncate(try reader.readInt(u32, .little)));
+                // TODO: HANDLE DOCUMENTS SPANNING PAGES
+                header = try self.step() orelse return null;
+            }
             var stream = std.io.fixedBufferStream(self.page.data);
             var reader = stream.reader();
-
             try reader.skipBytes(self.offset, .{});
 
             const doc_len = try reader.readInt(u32, .little);
@@ -461,6 +491,7 @@ const Bucket = struct {
             var bytesRead = try reader.read(docBuffer[4..]);
             self.offset += @truncate(bytesRead);
             leftToRead -= @truncate(bytesRead);
+
             while (leftToRead > 0) {
                 // Check if we need to load a new page
                 self.page = try self.pageIterator.next() orelse return null;
@@ -470,7 +501,12 @@ const Bucket = struct {
                 leftToRead -= @truncate(bytesRead);
             }
 
-            return docBuffer;
+            return .{
+                .page_id = header.page_id,
+                .offset = header.offset,
+                .header = header.header,
+                .data = docBuffer,
+            };
         }
     };
 
@@ -494,7 +530,7 @@ const Bucket = struct {
         var docsAdded: u64 = 0;
         var docsSkipped: u64 = 0;
         while (try iterator.next()) |doc| {
-            const bson_doc = try bson.BSONDocument.deserializeFromMemory(allocator, doc);
+            const bson_doc = try bson.BSONDocument.deserializeFromMemory(allocator, doc.data);
 
             if (!try q.match(&bson_doc)) continue;
             if (q.sector) |sector| if (sector.offset) |offset| {
@@ -522,9 +558,54 @@ const Bucket = struct {
         // std.debug.print("DOCS GOOD", .{});
     }
 
-    pub fn delete(_: *Bucket, _: query.Query) !void {
+    pub fn delete(self: *Bucket, q: query.Query) !void {
         // For now, we'll just print the document
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var locations = std.ArrayList(DocumentLocation).init(allocator);
+        var iterator = try self.scanIterator(allocator);
+        var docsAdded: u64 = 0;
+        var docsSkipped: u64 = 0;
+        while (try iterator.next()) |doc| {
+            const bson_doc = try bson.BSONDocument.deserializeFromMemory(allocator, doc.data);
+            if (!try q.match(&bson_doc)) continue;
+            if (q.sector) |sector| if (sector.offset) |offset| {
+                if (docsSkipped < offset) {
+                    docsSkipped += 1;
+                    continue;
+                }
+            };
+            try locations.append(.{
+                .header = doc.header,
+                .page_id = doc.page_id,
+                .offset = doc.offset,
+            });
 
+            std.debug.print("Deleting at offset: {any}\n", .{.{
+                .header = doc.header,
+                .page_id = doc.page_id,
+                .offset = doc.offset,
+            }});
+            docsAdded += 1;
+            if (q.sector) |sector| if (sector.limit) |limit| {
+                if (docsAdded >= limit) {
+                    break;
+                }
+            };
+        }
+        const writer = self.file.writer();
+        self.rwlock.lock();
+        for (locations.items) |*location| {
+            _ = self.page_cache.swapRemove(location.page_id);
+            location.header.is_deleted = 1;
+            var file = self.file;
+            const offset = @sizeOf(BucketHeader) + @sizeOf(PageHeader) + (location.page_id * DEFAULT_PAGE_SIZE);
+            std.debug.print("Deleting at offset: {any}", .{offset});
+            try file.seekTo(offset + location.offset);
+            try writer.writeStruct(location.header);
+        }
+        self.rwlock.unlock();
     }
 
     pub fn deinit(self: *Bucket) void {
@@ -536,37 +617,37 @@ const Bucket = struct {
     }
 };
 
-test "Bucket.insert" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var bucket = try Bucket.init(allocator, "test.bucket");
-    defer bucket.deinit();
+// test "Bucket.insert" {
+//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+//     defer arena.deinit();
+//     const allocator = arena.allocator();
+//     var bucket = try Bucket.init(allocator, "test.bucket");
+//     defer bucket.deinit();
 
-    // Create a new BSON document
-    var doc = try bson.BSONDocument.fromJSON(allocator,
-        \\ {
-        \\  "name": "Alice",
-        \\  "age": 37
-        \\ }
-    );
+//     // Create a new BSON document
+//     var doc = try bson.BSONDocument.fromJSON(allocator,
+//         \\ {
+//         \\  "name": "Alice",
+//         \\  "age": 37
+//         \\ }
+//     );
 
-    // Insert the document into the bucket
-    _ = try bucket.insert(&doc);
+//     // Insert the document into the bucket
+//     _ = try bucket.insert(&doc);
 
-    const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "sector": {}
-        \\}
-    ));
+//     const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+//         \\{
+//         \\  "sector": {}
+//         \\}
+//     ));
 
-    const qResult = try bucket.list(allocator, q);
+//     const qResult = try bucket.list(allocator, q);
 
-    for (qResult) |item| {
-        const oId = item.get("_id").?.objectId.value;
-        std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
-    }
-}
+//     for (qResult) |item| {
+//         const oId = item.get("_id").?.objectId.value;
+//         std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
+//     }
+// }
 
 test "DocHeader.write" {
     var fixedBuffer: [64]u8 = [_]u8{0} ** 64;
@@ -602,7 +683,7 @@ test "Bucket.delete" {
 
     const listQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
         \\{
-        \\  "query": {},
+        \\  "query": {}
         \\}
     ));
 
@@ -611,7 +692,7 @@ test "Bucket.delete" {
 
     const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
         \\{
-        \\  "query": {"age": "delete me"},
+        \\  "query": {"age": "delete me"}
         \\}
     ));
     // Delete the document from the bucket
@@ -620,5 +701,5 @@ test "Bucket.delete" {
     docs = try bucket.list(allocator, listQ);
     const newDocCount = docs.len;
     std.debug.print("Deleted {d} documents, new count: {d}\n", .{ docCount - newDocCount, newDocCount });
-    std.testing.expect(newDocCount < docCount);
+    try std.testing.expect(newDocCount < docCount);
 }

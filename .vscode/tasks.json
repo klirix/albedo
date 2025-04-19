@@ -6,7 +6,20 @@
     {
       "label": "zig: build-test",
       "type": "shell",
-      "command": "zig test --test-no-exec -femit-bin=zig-out/bin/test-${fileBasenameNoExtension} ${file}"
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "command": "zig test --test-no-exec -femit-bin=zig-out/bin/test-${fileBasenameNoExtension} ${file}",
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
     }
   ]
 }
