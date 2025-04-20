@@ -38,6 +38,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const simple_module = b.dependency("napigen", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("napigen");
+
+    exe.root_module.addImport("napigen", simple_module);
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
