@@ -14,7 +14,10 @@ pub const ObjectId = struct {
         const time = @as(i32, @truncate(std.time.timestamp()));
         var rand = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
         crypto.random.bytes(&rand);
-        return ObjectId{ .buffer = std.mem.toBytes(time) ++ rand };
+        var buffer: [12]u8 = undefined;
+        std.mem.writeInt(i32, buffer[0..4], time, .big);
+        @memcpy(buffer[4..], &rand);
+        return ObjectId{ .buffer = buffer };
     }
 
     pub fn parseString(str: []const u8) ObjectId {
@@ -54,12 +57,12 @@ pub const ObjectId = struct {
     }
 
     pub inline fn toInt(self: ObjectId) u96 {
-        return std.mem.readInt(u96, self.buffer[0..12], .big);
+        return std.mem.readInt(u96, self.buffer[0..12], .little);
     }
 
     pub fn fromInt(value: u96) ObjectId {
         var buffer: [12]u8 = undefined;
-        std.mem.writeInt(u96, &buffer, value, .big);
+        std.mem.writeInt(u96, &buffer, value, .little);
         return ObjectId{ .buffer = buffer };
     }
 };

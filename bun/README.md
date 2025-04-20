@@ -1,4 +1,4 @@
-# js-example
+# albedo-bun
 
 To install dependencies:
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
-const ObjectId = @import("./object_id.zig").ObjectId;
+pub const ObjectId = @import("./object_id.zig").ObjectId;
 
 pub const BSONString = struct {
     // code: i8, // 0x02
@@ -10,8 +10,9 @@ pub const BSONString = struct {
         // var memory = try allocator.alloc(u8, 4 + self.length);
         const length = @as(u32, @truncate(self.value.len)) + 1;
 
-        std.mem.copyForwards(u8, memory[0..4], &mem.toBytes(length));
-        std.mem.copyForwards(u8, memory[4 .. length + 3], self.value);
+        std.mem.writeInt(u32, memory[0..4], length, .little);
+        // std.mem.copyForwards(u8, memory[4 .. length + 3], self.value);
+        @memcpy(memory[4 .. 4 + length - 1], self.value);
         memory[length + 3] = 0x00;
     }
 
@@ -115,7 +116,7 @@ pub const BSONInt32 = struct {
     pub fn write(self: BSONInt32, memory: []u8) void {
         // var memory = try allocator.alloc(u8, 4 + self.length);
 
-        std.mem.copyForwards(u8, memory, &mem.toBytes(self.value));
+        std.mem.writeInt(i32, memory[0..4], self.value, .little);
     }
 
     pub fn size(_: BSONInt32) u32 {
@@ -339,6 +340,17 @@ pub const BSONValue = union(BSONValueType) {
     int32: BSONInt32,
     int64: BSONInt64,
 
+    pub fn init(value: anytype) BSONValue {
+        return switch (@TypeOf(value)) {
+            f64 => BSONValue{ .double = BSONDouble{ .value = value } },
+            []u8 => BSONValue{ .string = BSONString{ .value = value } },
+            BSONDocument => BSONValue{ .document = value },
+            BSONBinary => BSONValue{ .binary = BSONBinary{ .value = value, .subtype = 1 } },
+            ObjectId => BSONValue{ .objectId = .{ .value = value } },
+            else => |unsupportedType| @compileError(std.fmt.comptimePrint("Unsupported BSONValue type: {any}", .{unsupportedType})),
+        };
+    }
+
     pub fn toString() [:0]u8 {}
 
     pub fn size(self: *const BSONValue) u32 {
@@ -452,7 +464,7 @@ pub const BSONValue = union(BSONValueType) {
             .binary => std.mem.eql(u8, self.binary.value, other.binary.value),
             .boolean => self.boolean.value == other.boolean.value,
             .null => true,
-            .objectId => self.objectId.value.toInt() == other.objectId.value.toInt(),
+            .objectId => |objid| std.mem.eql(u8, &objid.value.buffer, &other.objectId.value.buffer),
             else => false,
         };
     }
@@ -592,16 +604,12 @@ pub const BSONObjectId = struct {
     value: ObjectId,
 
     pub fn write(self: BSONObjectId, memory: []u8) void {
-        std.mem.copyForwards(u8, memory, self.value.buffer[0..]);
-    }
-
-    pub fn size(_: BSONObjectId) u32 {
-        return 12;
+        @memcpy(memory[0..12], &self.value.buffer);
     }
 
     pub fn read(memory: []const u8) BSONObjectId {
         var buffer: [12:0]u8 = undefined;
-        std.mem.copyForwards(u8, buffer[0..], memory[0..12]);
+        @memcpy(buffer[0..], memory[0..12]);
         return BSONObjectId{ .value = ObjectId{ .buffer = buffer } };
     }
 };
@@ -610,7 +618,7 @@ test "encodes BSONObjectId" {
     var allocator = std.testing.allocator;
     const test_object_id = ObjectId.parseString(("507c7f79bcf86cd7994f6c0e"));
     var object_id = BSONObjectId{ .value = test_object_id };
-    const actual = allocator.alloc(u8, object_id.size()) catch unreachable;
+    const actual = allocator.alloc(u8, 12) catch unreachable;
     object_id.write(actual);
     defer allocator.free(actual);
 
@@ -675,6 +683,14 @@ pub const BSONDocument = struct {
     len: u32,
     ally: mem.Allocator,
 
+    pub fn init(allocator: mem.Allocator) BSONDocument {
+        return BSONDocument{
+            .values = &[_]BSONKeyValuePair{},
+            .len = 5,
+            .ally = allocator,
+        };
+    }
+
     pub fn fromJSON(ally: mem.Allocator, json: []const u8) !BSONDocument {
         var jsonStream = std.json.Scanner.initCompleteInput(ally, json);
         defer jsonStream.deinit();
@@ -682,14 +698,6 @@ pub const BSONDocument = struct {
         const docVal = try jsonToDoc(&jsonStream, ally);
 
         return docVal.document;
-    }
-
-    pub fn fromStaticPairs(allocator: mem.Allocator, comptime pairs: anytype) BSONDocument {
-        return BSONDocument{
-            .values = pairs,
-            .len = @as(u32, @truncate(pairs.len)),
-            .ally = allocator,
-        };
     }
 
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) !BSONValue {
@@ -907,12 +915,12 @@ pub const BSONDocument = struct {
     }
 
     pub fn serializeToMemory(self: *const BSONDocument, memory: []u8) void {
-        std.mem.copyForwards(u8, memory[0..4], &mem.toBytes(self.len));
+        std.mem.writeInt(u32, memory[0..4], self.len, .little);
         var idx: u32 = 4;
         for (self.values) |pair| {
             memory[idx] = @intFromEnum(pair.value.valueType());
             idx += 1;
-            std.mem.copyForwards(u8, memory[idx..], pair.key);
+            @memcpy(memory[idx .. idx + pair.key.len], pair.key);
             memory[idx + @as(u32, @truncate(pair.key.len))] = 0x00;
             idx += @as(u32, @truncate(pair.key.len)) + 1;
             switch (pair.value) {

@@ -26,10 +26,29 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    lib.linkLibC();
+
+    b.installArtifact(lib);
+
+    const static = b.addStaticLibrary(.{
+        .name = "albedo",
+        // In this case the main source file is merely a path, however, in more
+        // complicated build scripts, this could be a generated file.
+
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    static.bundle_compiler_rt = true;
+
+    static.linkLibC();
+
+    b.installArtifact(static);
+
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
-    b.installArtifact(lib);
 
     const exe = b.addExecutable(.{
         .name = "albedo",
@@ -37,6 +56,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    exe.linkLibC();
 
     const simple_module = b.dependency("napigen", .{
         .target = target,

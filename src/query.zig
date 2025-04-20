@@ -351,12 +351,15 @@ pub const Query = struct {
         const sortConfig = if (sortDoc) |doc| try SortConfig.parse(ally, doc) else null;
         const sectorDoc = queryDoc.get("sector");
         const sector = if (sectorDoc) |*doc| try Sector.parse(doc) else null;
-        return Query{
+
+        const query = Query{
             .filters = filters,
             .sortConfig = sortConfig,
             .sector = sector,
             // .projection = queryDoc.get("projection") catch bson.Document{},
         };
+
+        return query;
     }
 
     pub fn deinit(self: *Query, ally: Allocator) void {
@@ -417,5 +420,31 @@ test "Query.parse" {
     // const buffer = try ally.alloc(u8, queryDoc.len);
     // queryDoc.serializeToMemory(buffer);
     var query = try Query.parse(ally, queryDoc);
+    defer query.deinit(ally);
+}
+
+test "Query.match matches objectId correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const ally = arena.allocator();
+    defer arena.deinit();
+
+    const objId = bson.ObjectId.init();
+
+    var doc = bson.BSONDocument.init(ally);
+    try doc.set("_id", bson.BSONValue.init(objId));
+
+    const objId2 = bson.ObjectId.init();
+    var doc2 = bson.BSONDocument.init(ally);
+    try doc.set("_id", bson.BSONValue.init(objId2));
+
+    var queryDoc = bson.BSONDocument.init(ally);
+    try queryDoc.set("query", bson.BSONValue.init(doc));
+
+    // const buffer = try ally.alloc(u8, queryDoc.len);
+    // queryDoc.serializeToMemory(buffer);
+    var query = try Query.parse(ally, queryDoc);
+
+    try std.testing.expect(query.match(&doc));
+    try std.testing.expect(!query.match(&doc2));
     defer query.deinit(ally);
 }

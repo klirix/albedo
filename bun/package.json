@@ -1,5 +1,5 @@
 {
-  "name": "js-example",
+  "name": "albedo-bun",
   "module": "index.ts",
   "type": "module",
   "devDependencies": {

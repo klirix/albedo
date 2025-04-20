@@ -19,7 +19,7 @@ fn initModule(js: *napigen.JsContext, exports: napigen.napi_value) anyerror!napi
     return exports;
 }
 
-fn bsonToNapi(bsonDoc: *bson.BSONDocument) napigen.Value {
+fn bsonToNapi(_: *bson.BSONDocument) napigen.Value {
     // Convert BSON document to NAPI value
     // This is a placeholder for actual conversion logic
 
@@ -38,7 +38,7 @@ const Result = enum(u8) {
     InvalidFormat,
 };
 
-pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
+pub export fn albedo_open(path: [*:0]u8, out: *align(64) *albedo.Bucket) Result {
     const pathProper = std.mem.span(path);
     const db = allocator.create(albedo.Bucket) catch return Result.OutOfMemory;
     db.* = albedo.Bucket.init(allocator, pathProper) catch |err| switch (err) {
@@ -47,10 +47,11 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
         },
     };
     out.* = db;
+    std.debug.print("DB POINTER {x}, {*}", .{db});
     return Result.OK;
 }
 
-pub export fn albedo_close(bucket: *albedo.Bucket) Result {
+pub export fn albedo_close(bucket: *align(64) albedo.Bucket) Result {
     bucket.deinit();
     allocator.destroy(bucket);
     return Result.OK;
