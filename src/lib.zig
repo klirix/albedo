@@ -63,8 +63,8 @@ pub export fn albedo_insert(bucket: *albedo.Bucket, docBuffer: [*:0]u8) Result {
     // This is a placeholder for actual insertion logic
 }
 
-pub export fn albedo_delete(bucket: *albedo.Bucket, docBuffer: [*:0]u8) Result {
-    const docBufferProper = std.mem.span(docBuffer);
+pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen: u16) Result {
+    const docBufferProper = queryBuffer[0..queryLen];
 
     const query = Query.parseRaw(allocator, docBufferProper) catch |err| switch (err) {
         Query.QueryParsingErrors.OutOfMemory => {
@@ -91,10 +91,11 @@ const RequestIterator = struct {
     bucket: *albedo.Bucket,
     results: []bson.BSONDocument,
     arena: std.heap.ArenaAllocator,
+    new: bool = true,
 };
 
-pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*:0]u8, outIterator: **RequestIterator) Result {
-    const queryBufferProper = std.mem.span(queryBuffer);
+pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen: u16, outIterator: **RequestIterator) Result {
+    const queryBufferProper = queryBuffer[0..queryLen];
     var queryArena = std.heap.ArenaAllocator.init(allocator);
     const queryArenaAllocator = queryArena.allocator();
     var queryDoc = bson.BSONDocument.deserializeFromMemory(
@@ -139,7 +140,6 @@ pub export fn albedo_data(iterator: *RequestIterator, outDoc: [*]u8) Result {
         return Result.Error;
     }
     const doc = iterator.results[iterator.idx];
-    iterator.idx += 1;
 
     // Transform the outDoc pointer into a slice of the size of the current document
     const outDocSlice = outDoc[0..doc.len];
@@ -154,7 +154,11 @@ pub export fn albedo_next(iterator: *RequestIterator) Result {
     if (iterator.idx >= iterator.results.len) {
         return Result.EOS;
     }
-    iterator.idx += 1;
+    if (iterator.new) {
+        iterator.new = false;
+    } else {
+        iterator.idx += 1;
+    }
     return Result.Data;
 }
 
