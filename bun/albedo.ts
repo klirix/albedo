@@ -18,6 +18,10 @@ const { symbols: albedo } = dlopen(`libalbedo.${suffix}`, {
     args: [FFIType.pointer, FFIType.pointer, FFIType.pointer],
     returns: "u8",
   },
+  albedo_delete: {
+    args: [FFIType.pointer, FFIType.pointer],
+    returns: "u8",
+  },
   albedo_data_size: {
     args: [FFIType.pointer],
     returns: "u32",
@@ -93,16 +97,30 @@ class Bucket {
     }
   }
 
+  delete(query: Query["query"], options: { sector?: Query["sector"] } = {}) {
+    const queryBuf = BSON.serialize({ query });
+    const queryPtr = ptr(queryBuf);
+    const result = albedo.albedo_delete(this.pointer, queryPtr);
+    if (result !== 0) {
+      throw new Error("Failed to delete from Albedo database");
+    }
+  }
+
   *list(
     query: Query["query"] = {},
-    sort: Query["sort"] = undefined,
-    sector: Query["sector"] = undefined
+    options: {
+      sort?: Query["sort"];
+      sector?: Query["sector"];
+    } = {}
   ) {
+    console.time("serialize");
     const queryBuf = BSON.serialize({
       query,
-      ...(sort ? sort : {}),
-      ...(sector ? sector : {}),
+      ...(options.sort ? { sort: options.sort } : {}),
+      ...(options.sector ? { sector: options.sector } : {}),
     });
+    console.timeEnd("serialize");
+
     const queryPtr = ptr(queryBuf);
     const iterPtr = new BigInt64Array(1); // 8 bytes for a pointer
     const iterPtrPtr = ptr(iterPtr);

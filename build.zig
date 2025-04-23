@@ -22,11 +22,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = b.standardOptimizeOption(.{
-            .preferred_optimize_mode = .ReleaseFast,
+            .preferred_optimize_mode = .Debug,
         }),
     });
 
-    lib.linkLibC();
+    // lib.linkLibC();
 
     b.installArtifact(lib);
 

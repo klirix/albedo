@@ -14,6 +14,7 @@
 /// }
 const std = @import("std");
 const bson = @import("bson.zig");
+const BSONDoc = bson.BSONDocument;
 const Allocator = std.mem.Allocator;
 
 const Path = [][]const u8; // "field.subfield".split('.')
@@ -27,7 +28,7 @@ pub const FilterType = enum {
 };
 
 pub const PathValuePair = struct {
-    path: Path,
+    path: []const u8,
     value: bson.BSONValue,
 };
 
@@ -55,16 +56,12 @@ pub const Filter = union(FilterType) {
     ne: PathValuePair,
     lt: PathValuePair,
     gt: PathValuePair,
-    in: struct {
-        path: Path,
-        values: []bson.BSONValue,
-    },
+    in: PathValuePair,
 
     pub fn deinit(self: *Filter, ally: Allocator) void {
         switch (self.*) {
             .in => |*inFilter| {
                 ally.free(inFilter.path);
-                ally.free(inFilter.values);
             },
             .eq, .ne, .lt, .gt => |*filter| {
                 ally.free(filter.path);
@@ -83,35 +80,40 @@ pub const Filter = union(FilterType) {
     };
 
     fn parseDoc(ally: Allocator, doc: *const bson.BSONDocument) FilterParsingErrors![]Filter {
-        var filters = try ally.alloc(Filter, doc.values.len);
-        for (doc.values, 0..) |pair, i| {
-            const path = try parsePath(ally, pair.key);
+        var filters = try ally.alloc(Filter, doc.keyNumber());
+        var iter = doc.iter();
+        var i: usize = 0;
+        while (iter.next()) |pair| : (i += 1) {
+            const path = pair.key;
             if (path.len == 0) return FilterParsingErrors.InvalidQueryPath;
 
             switch (pair.value) {
                 .document => |*operatorDoc| {
-                    if (operatorDoc.values.len != 1) return FilterParsingErrors.InvalidQueryOperatorSize;
-                    const operatorPair = operatorDoc.values[0];
-                    if (std.mem.eql(u8, operatorPair.key, "$eq")) {
-                        filters[i] = Filter{ .eq = .{ .path = path, .value = operatorPair.value } };
-                    } else if (std.mem.eql(u8, operatorPair.key, "$ne")) {
-                        filters[i] = Filter{ .ne = .{ .path = path, .value = operatorPair.value } };
-                    } else if (std.mem.eql(u8, operatorPair.key, "$lt")) {
-                        filters[i] = Filter{ .lt = .{ .path = path, .value = operatorPair.value } };
-                    } else if (std.mem.eql(u8, operatorPair.key, "$gt")) {
-                        filters[i] = Filter{ .gt = .{ .path = path, .value = operatorPair.value } };
-                    } else if (std.mem.eql(u8, operatorPair.key, "$in")) {
-                        const inValues = operatorPair.value;
-                        if (inValues != bson.BSONValueType.array) {
-                            return FilterParsingErrors.InvalidInOperatorValue;
-                        }
-                        var values: []bson.BSONValue = try ally.alloc(bson.BSONValue, inValues.array.values.len);
-                        for (inValues.array.values, 0..) |value, j| {
-                            values[j] = value.value;
-                        }
+                    if (operatorDoc.get("$eq")) |operand| {
                         filters[i] = Filter{
-                            .in = .{ .path = path, .values = values },
+                            .eq = .{ .path = path, .value = operand },
                         };
+                        continue;
+                    } else if (operatorDoc.get("$in")) |operand| {
+                        filters[i] = Filter{
+                            .in = .{ .path = path, .value = operand },
+                        };
+                        continue;
+                    } else if (operatorDoc.get("$ne")) |operand| {
+                        filters[i] = Filter{
+                            .ne = .{ .path = path, .value = operand },
+                        };
+                        continue;
+                    } else if (operatorDoc.get("$lt")) |operand| {
+                        filters[i] = Filter{
+                            .lt = .{ .path = path, .value = operand },
+                        };
+                        continue;
+                    } else if (operatorDoc.get("$gt")) |operand| {
+                        filters[i] = Filter{
+                            .gt = .{ .path = path, .value = operand },
+                        };
+                        continue;
                     } else {
                         return FilterParsingErrors.InvalidQueryOperator;
                     }
@@ -137,7 +139,7 @@ pub const Filter = union(FilterType) {
         }
     }
 
-    pub fn match(self: *Filter, doc: *const bson.BSONDocument) bool {
+    pub fn match(self: *Filter, doc: bson.BSONDocument) bool {
         switch (self.*) {
             .eq => |eqFilter| {
                 const pathResult = doc.getPath(eqFilter.path);
@@ -171,8 +173,9 @@ pub const Filter = union(FilterType) {
             },
             .in => |inFilter| {
                 if (doc.getPath(inFilter.path)) |value| {
-                    for (inFilter.values) |inValue| {
-                        if (value.eql(inValue)) return true;
+                    var inIter = inFilter.value.array.iter();
+                    while (inIter.next()) |pair| {
+                        if (value.eql(pair.value)) return true;
                     }
                     return false;
                 } else {
@@ -188,22 +191,22 @@ test "Filter.parse" {
     var opPairs = [_]bson.BSONKeyValuePair{
         .{ .key = "$eq", .value = .{ .string = bson.BSONString{ .value = "value" } } },
     };
-    const opDoc = bson.BSONDocument.fromPairs(ally, &opPairs);
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
     var filterPairs = [_]bson.BSONKeyValuePair{
         .{ .key = "field.subfield", .value = .{ .document = opDoc } },
     };
-    const filterDoc = bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, &bson.BSONValue{ .document = filterDoc });
     defer {
-        for (filters) |*filter| filter.deinit(ally);
         ally.free(filters);
     }
     try std.testing.expectEqual(filters.len, 1);
     const filter = filters[0];
     switch (filter) {
         .eq => |*eqFilter| {
-            try std.testing.expectEqualSlices(u8, "field", eqFilter.path[0]);
-            try std.testing.expectEqualSlices(u8, "subfield", eqFilter.path[1]);
+            try std.testing.expectEqualSlices(u8, "field.subfield", eqFilter.path);
             try std.testing.expectEqualStrings(eqFilter.value.string.value, "value");
         },
         else => unreachable,
@@ -216,23 +219,23 @@ const SortType = enum {
 };
 
 const SortConfig = union(SortType) {
-    asc: Path,
-    desc: Path,
+    asc: []const u8,
+    desc: []const u8,
 
     pub const SortParsingErrors = error{
         InvalidQuerySort,
         InvalidQuerySortParamLength,
         InvalidQuerySortParamType,
         InvalidQueryPath,
-        OutOfMemory,
     };
 
-    pub fn parse(ally: Allocator, doc: bson.BSONValue) SortParsingErrors!SortConfig {
+    pub fn parse(doc: bson.BSONValue) SortParsingErrors!SortConfig {
         if (doc != bson.BSONValueType.document) return error.InvalidQuerySort;
-        if (doc.document.values.len != 1) return error.InvalidQuerySortParamLength;
-        const pair = doc.document.values[0];
+        if (doc.document.keyNumber() != 1) return error.InvalidQuerySortParamLength;
+        var iter = doc.document.iter();
+        const pair = iter.next() orelse return error.InvalidQuerySort;
         if (pair.value != bson.BSONValueType.string) return error.InvalidQuerySortParamType;
-        const path = try parsePath(ally, pair.value.string.value);
+        const path = pair.value.string.value;
         if (path.len == 0) return error.InvalidQueryPath;
         if (std.mem.eql(u8, pair.key, "asc")) {
             return SortConfig{ .asc = path };
@@ -246,20 +249,18 @@ const SortConfig = union(SortType) {
 
 test "Sort.parse" {
     const ally = std.testing.allocator;
-    var sortPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "asc", .value = .{ .string = bson.BSONString{ .value = "field" } } },
-    };
-    const sortDoc = bson.BSONDocument.fromPairs(ally, &sortPairs);
-    const sort = try SortConfig.parse(ally, bson.BSONValue{ .document = sortDoc });
-    defer {
-        switch (sort) {
-            .asc => |ascSort| ally.free(ascSort),
-            .desc => |descSort| ally.free(descSort),
-        }
-    }
+    const sortDoc = try bson.BSONDocument.fromJSON(ally,
+        \\ {
+        \\   "asc": "field"
+        \\ }
+    );
+    defer sortDoc.deinit(ally);
+    std.debug.print("SORT DOC:{any}\n", .{sortDoc.buffer});
+    const sort = try SortConfig.parse(bson.BSONValue{ .document = sortDoc });
+
     switch (sort) {
         .asc => |ascSort| {
-            try std.testing.expectEqualSlices(u8, "field", ascSort[0]);
+            try std.testing.expectEqualSlices(u8, "field", ascSort);
         },
         else => unreachable,
     }
@@ -319,7 +320,8 @@ test "Sector.parse" {
         .{ .key = "offset", .value = .{ .int32 = .{ .value = 10 } } },
         .{ .key = "limit", .value = .{ .int32 = .{ .value = 10 } } },
     };
-    const sectorDoc = bson.BSONDocument.fromPairs(ally, &sectorPairs);
+    const sectorDoc = try bson.BSONDocument.fromPairs(ally, &sectorPairs);
+    defer sectorDoc.deinit(ally);
     const sector = try Sector.parse(&bson.BSONValue{ .document = sectorDoc });
     try std.testing.expectEqual(sector.offset, 10);
     try std.testing.expectEqual(sector.limit, 10);
@@ -334,8 +336,7 @@ pub const Query = struct {
     // projection: bson.Document,
 
     pub fn parseRaw(ally: Allocator, rawQuery: []const u8) QueryParsingErrors!Query {
-        var queryDoc = try bson.BSONDocument.deserializeFromMemory(ally, rawQuery);
-        defer queryDoc.deinit();
+        const queryDoc = bson.BSONDocument.init(rawQuery);
 
         return parse(ally, queryDoc);
     }
@@ -348,7 +349,7 @@ pub const Query = struct {
         const filterDoc = queryDoc.get("query");
         const filters = if (filterDoc) |*doc| try Filter.parse(ally, doc) else @constCast(defaultFilters[0..]);
         const sortDoc = queryDoc.get("sort");
-        const sortConfig = if (sortDoc) |doc| try SortConfig.parse(ally, doc) else null;
+        const sortConfig = if (sortDoc) |doc| try SortConfig.parse(doc) else null;
         const sectorDoc = queryDoc.get("sector");
         const sector = if (sectorDoc) |*doc| try Sector.parse(doc) else null;
 
@@ -373,7 +374,7 @@ pub const Query = struct {
         }
     }
 
-    pub fn match(self: *const Query, doc: *const bson.BSONDocument) bool {
+    pub fn match(self: *const Query, doc: bson.BSONDocument) bool {
         for (self.filters) |*filter| {
             if (!filter.match(doc)) return false;
         }
@@ -430,21 +431,23 @@ test "Query.match matches objectId correctly" {
 
     const objId = bson.ObjectId.init();
 
-    var doc = bson.BSONDocument.init(ally);
-    try doc.set("_id", bson.BSONValue.init(objId));
+    var doc = bson.BSONDocument.initEmpty();
+    doc = try doc.set(ally, "_id", bson.BSONValue.init(objId));
+    defer doc.deinit(ally);
 
     const objId2 = bson.ObjectId.init();
-    var doc2 = bson.BSONDocument.init(ally);
-    try doc.set("_id", bson.BSONValue.init(objId2));
+    var doc2 = bson.BSONDocument.initEmpty();
+    doc2 = try doc.set(ally, "_id", bson.BSONValue.init(objId2));
+    defer doc2.deinit(ally);
 
-    var queryDoc = bson.BSONDocument.init(ally);
-    try queryDoc.set("query", bson.BSONValue.init(doc));
-
+    var queryDoc = bson.BSONDocument.initEmpty();
+    queryDoc = try queryDoc.set(ally, "query", bson.BSONValue.init(doc));
+    defer queryDoc.deinit(ally);
     // const buffer = try ally.alloc(u8, queryDoc.len);
     // queryDoc.serializeToMemory(buffer);
     var query = try Query.parse(ally, queryDoc);
 
-    try std.testing.expect(query.match(&doc));
-    try std.testing.expect(!query.match(&doc2));
+    try std.testing.expect(query.match(doc));
+    try std.testing.expect(!query.match(doc2));
     defer query.deinit(ally);
 }

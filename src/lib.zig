@@ -4,7 +4,7 @@ const albedo = @import("./albedo.zig");
 const bson = @import("./bson.zig");
 const Query = @import("./query.zig").Query;
 
-const allocator = std.heap.c_allocator;
+const allocator = std.heap.page_allocator;
 
 const Bucket = albedo.Bucket;
 
@@ -44,15 +44,7 @@ pub export fn albedo_insert(bucket: *albedo.Bucket, docBuffer: [*]u8) Result {
     const docSize = std.mem.readInt(u32, docBuffer[0..4], .little);
     const docBufferProper = docBuffer[0..docSize];
 
-    var doc = bson.BSONDocument.deserializeFromMemory(
-        allocator,
-        docBufferProper,
-    ) catch |err| switch (err) {
-        else => {
-            return Result.Error;
-        },
-    };
-    defer doc.deinit();
+    var doc = bson.BSONDocument.init(docBufferProper);
 
     _ = bucket.insert(&doc) catch |err| switch (err) {
         else => {
@@ -134,7 +126,7 @@ pub export fn albedo_data_size(iterator: *RequestIterator) u32 {
         return 0;
     }
     const doc = iterator.results[iterator.idx];
-    return doc.len;
+    return @truncate(doc.buffer.len);
 }
 
 pub export fn albedo_data(iterator: *RequestIterator, outDoc: [*]u8) Result {
@@ -144,10 +136,10 @@ pub export fn albedo_data(iterator: *RequestIterator, outDoc: [*]u8) Result {
     const doc = iterator.results[iterator.idx];
 
     // Transform the outDoc pointer into a slice of the size of the current document
-    const outDocSlice = outDoc[0..doc.len];
+    // const outDocSlice = outDoc[0..doc.len];
 
     // Serialize the BSON document into memory
-    doc.serializeToMemory(outDocSlice);
+    @memcpy(outDoc, doc.buffer);
 
     return Result.OK;
 }

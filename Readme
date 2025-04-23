@@ -1,0 +1,2 @@
+Build and copy stuff:
+zig build && cp ./zig-out/lib/libalbedo.so ./bun/libalbedo.so
