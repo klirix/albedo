@@ -1,4 +1,12 @@
-import { dlopen, ptr, suffix, FFIType, type Pointer, read } from "bun:ffi";
+import {
+  dlopen,
+  ptr,
+  suffix,
+  FFIType,
+  type Pointer,
+  read,
+  toBuffer,
+} from "bun:ffi";
 import { BSON, ObjectId } from "bson";
 
 const { symbols: albedo } = dlopen(`libalbedo.${suffix}`, {
@@ -141,12 +149,15 @@ class Bucket {
         );
         continue;
       }
-      const dataPtr = new Uint8Array(size);
-      const res = albedo.albedo_data(iterHandle, ptr(dataPtr));
+      const dataPtrPtr = ptr(new BigInt64Array(1));
+      const res = albedo.albedo_data(iterHandle, dataPtrPtr);
+
       if (res !== 0) {
         throw new Error("Failed to get data from Albedo database");
       }
-      yield BSON.deserialize(dataPtr);
+      yield BSON.deserialize(
+        toBuffer(read.ptr(dataPtrPtr) as Pointer, 0, size)
+      );
     }
     albedo.albedo_close_iterator(iterHandle);
   }
