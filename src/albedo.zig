@@ -473,6 +473,8 @@ pub const Bucket = struct {
         offset: u16 = 0,
         pageIterator: PageIterator,
         readDeleted: bool = false,
+        resultBuffer: []u8 = undefined,
+        resBufferIdx: usize = 0,
 
         fn init(bucket: *Bucket, allocator: std.mem.Allocator) !ScanIterator {
             return .{
@@ -483,6 +485,7 @@ pub const Bucket = struct {
                     .bucket = bucket,
                     .type = .Data,
                 },
+                .resultBuffer = try allocator.alloc(u8, 512 * 1024),
             };
         }
 
@@ -556,7 +559,13 @@ pub const Bucket = struct {
             const doc_len = mem.readInt(u32, self.page.data[self.offset..][0..4], .little);
             var leftToCopy: u32 = doc_len;
 
-            var docBuffer = try self.allocator.alloc(u8, doc_len);
+            if (self.resBufferIdx + doc_len > self.resultBuffer.len) {
+                // Resize the buffer if needed
+                const newSize = @max(self.resBufferIdx + doc_len, self.resultBuffer.len * 2);
+                self.resultBuffer = try self.allocator.alloc(u8, newSize);
+            }
+            var docBuffer = self.resultBuffer[self.resBufferIdx .. self.resBufferIdx + doc_len];
+            self.resBufferIdx += doc_len;
 
             var writableBuffer = docBuffer[0..doc_len];
             var availableToCopy: u16 = @truncate(@min(doc_len, self.page.data.len - self.offset));

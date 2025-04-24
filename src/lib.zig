@@ -129,17 +129,17 @@ pub export fn albedo_data_size(iterator: *RequestIterator) u32 {
     return @truncate(doc.buffer.len);
 }
 
-pub export fn albedo_data(iterator: *RequestIterator, outDoc: [*]u8) Result {
+pub export fn albedo_data(iterator: *RequestIterator, outDoc: *[*]u8) Result {
     if (iterator.idx >= iterator.results.len) {
         return Result.Error;
     }
     const doc = iterator.results[iterator.idx];
+    const buff = doc.buffer;
 
     // Transform the outDoc pointer into a slice of the size of the current document
     // const outDocSlice = outDoc[0..doc.len];
-
     // Serialize the BSON document into memory
-    @memcpy(outDoc, doc.buffer);
+    outDoc.* = @constCast(buff.ptr);
 
     return Result.OK;
 }

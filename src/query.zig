@@ -292,6 +292,11 @@ const Sector = struct {
                 if (offsetValue.value < 0) return SectorParsingErrors.OffsetValueNegative;
                 offset = @intCast(offsetValue.value);
             },
+
+            .double => |*offsetValue| {
+                if (offsetValue.value < 0) return SectorParsingErrors.OffsetValueNegative;
+                offset = @intFromFloat(offsetValue.value);
+            },
             else => return SectorParsingErrors.InvalidQueryOffset,
         };
         var limit: ?u64 = null;
@@ -305,12 +310,18 @@ const Sector = struct {
                 if (limitValue.value < 0) return SectorParsingErrors.LimitValueNegative;
                 limit = @intCast(limitValue.value);
             },
+
+            .double => |*limitValue| {
+                if (limitValue.value < 0) return SectorParsingErrors.LimitValueNegative;
+                limit = @intFromFloat(limitValue.value);
+            },
             else => return SectorParsingErrors.InvalidQueryOffset,
         };
-        return Sector{
+        const sector = Sector{
             .offset = offset,
             .limit = limit,
         };
+        return sector;
     }
 };
 

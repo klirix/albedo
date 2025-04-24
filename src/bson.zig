@@ -509,7 +509,7 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    fn write(self: *const BSONValue, writer: anytype) !void {
+    pub fn write(self: *const BSONValue, writer: anytype) !void {
         switch (self.*) {
             .string => {
                 try writer.writeInt(u32, @as(u32, @truncate(self.string.value.len)) + 1, .little);
