@@ -1,4 +1,5 @@
 const std = @import("std");
+const napigen = @import("napigen");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -13,7 +14,9 @@ pub fn build(b: *std.Build) void {
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{
+        .preferred_optimize_mode = .ReleaseFast,
+    });
 
     const lib = b.addSharedLibrary(.{
         .name = "albedo",
@@ -21,14 +24,27 @@ pub fn build(b: *std.Build) void {
         // complicated build scripts, this could be a generated file.
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
-        .optimize = b.standardOptimizeOption(.{
-            .preferred_optimize_mode = .Debug,
-        }),
+        .optimize = optimize,
+    });
+
+    const node_lib = b.addSharedLibrary(.{
+        .name = "albedo_node",
+        // In this case the main source file is merely a path, however, in more
+        // complicated build scripts, this could be a generated file.
+        .root_source_file = b.path("src/napi.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     // lib.linkLibC();
 
     b.installArtifact(lib);
+
+    napigen.setup(node_lib);
+
+    b.installArtifact(node_lib);
+    const copy_node_step = b.addInstallLibFile(node_lib.getEmittedBin(), "libalbedo.node");
+    b.getInstallStep().dependOn(&copy_node_step.step);
 
     const static = b.addStaticLibrary(.{
         .name = "albedo",
