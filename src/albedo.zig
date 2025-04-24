@@ -307,10 +307,11 @@ pub const Bucket = struct {
     //     std.debug.print("Inserting document: {s}\n", .{});
     // }
 
-    pub const DocHeader = packed struct { // 16bytes
+    pub const DocHeader = struct { // 16bytes
         doc_id: u96,
         is_deleted: u8,
         reserved: u24,
+        pub const byteSize = 16;
 
         pub fn init() DocHeader {
             return DocHeader{
@@ -320,22 +321,37 @@ pub const Bucket = struct {
             };
         }
 
-        pub fn fromMemory(memory: []const u8) error{InvalidDocId}!DocHeader {
-            const header = std.mem.bytesToValue(DocHeader, memory);
+        pub fn fromMemory(memory: []const u8) error{ InvalidDocId, InvalidHeader }!DocHeader {
+            const header = DocHeader{
+                .is_deleted = memory[12],
+                .doc_id = std.mem.readInt(u96, memory[0..12], .little),
+                .reserved = std.mem.readInt(u24, memory[13..16], .little),
+            };
             if (header.doc_id == 0) {
                 return error.InvalidDocId;
+            }
+            if (header.reserved != 0) {
+                std.debug.print("Header is correpted: {any} \n", .{header});
+                @breakpoint();
+                return error.InvalidHeader;
             }
             return header;
         }
 
         pub fn write(self: DocHeader, writer: anytype) !void {
             // Write the header to the writer
-            try writer.writeStruct(self);
+            try writer.writeInt(u96, self.doc_id, .little);
+            try writer.writeInt(u8, self.is_deleted, .little);
+            try writer.writeInt(u24, self.reserved, .little);
         }
 
         pub fn read(reader: anytype) !DocHeader {
             // Read the header from the reader
-            const header = try reader.readStruct(DocHeader);
+            const header = DocHeader{
+                .doc_id = reader.readInt(u96, .little),
+                .is_deleted = reader.readInt(u8, .little),
+                .reserved = reader.readInt(u24, .little),
+            };
             if (header.doc_id == 0) {
                 return error.InvalidDocId;
             }
@@ -381,7 +397,7 @@ pub const Bucket = struct {
         }
 
         // Check if the page has enough space for header and doc size
-        if ((page.data.len - page.header.used_size) < (4 + @sizeOf(DocHeader))) { // 20 bytes
+        if ((page.data.len - page.header.used_size) < (4 + DocHeader.byteSize)) { // 20 bytes
             // Not enough space, create a new page
             page = try self.createNewPage(.Data);
         }
@@ -402,7 +418,7 @@ pub const Bucket = struct {
         var stream = std.io.fixedBufferStream(page.data);
         try stream.seekTo(page.header.used_size);
         _ = try doc_header.write(stream.writer());
-        page.header.used_size += @intCast(@sizeOf(DocHeader));
+        page.header.used_size += @intCast(DocHeader.byteSize);
 
         var bytes_written: usize = 0;
         const bytes_to_write: usize = doc_size;
@@ -481,7 +497,7 @@ pub const Bucket = struct {
                 // std.debug.print("List iterator initialized, page {d} loaded\n", .{self.page.header.page_id});
             }
 
-            if (self.offset >= self.page.data.len - 20) {
+            if (self.offset >= (@as(u16, @truncate(self.page.data.len)) - 20)) {
                 // Check if we need to load a new page
                 self.page = try self.pageIterator.next() orelse return null;
                 self.offset = 0;
@@ -493,18 +509,18 @@ pub const Bucket = struct {
                 }
                 return err;
             };
-            std.debug.print("Doc header: {any}\n", .{header});
+            if (header.reserved != 0 or header.is_deleted > 1) @breakpoint();
 
             // std.debug.print("Page approved, header {x}\n", .{header.reserved});
 
             if (header.doc_id == 0) {
                 return null; // No more documents
             }
-            self.offset += @intCast(@sizeOf(DocHeader));
+            self.offset += DocHeader.byteSize;
 
             return .{
                 .page_id = self.page.header.page_id,
-                .offset = self.offset - @sizeOf(DocHeader),
+                .offset = self.offset - DocHeader.byteSize,
                 .header = header,
             };
         }
@@ -513,7 +529,9 @@ pub const Bucket = struct {
 
             var location = try self.step() orelse return null;
             // var header = location.header;
+
             while (location.header.is_deleted == 1 and !self.readDeleted) {
+
                 // Skip deleted documents
                 const docOffset = self.page.data[self.offset..];
                 const doc_len = mem.readInt(u32, docOffset[0..4], .little);
@@ -522,18 +540,17 @@ pub const Bucket = struct {
                     self.offset += @as(u16, @truncate(doc_len)); // No more documents
                 } else {
                     const pageDataLen = self.page.data.len;
-                    const pagesToSkip = @divFloor((doc_len + pageDataLen), pageDataLen);
-                    const newOffset = @mod((doc_len + pageDataLen), pageDataLen);
-                    self.offset = @as(u16, @truncate(newOffset));
+                    const pagesToSkip = @divFloor((doc_len - availableToSkip + pageDataLen), pageDataLen);
+                    const newOffset = @mod((doc_len - availableToSkip + pageDataLen), pageDataLen);
                     for (0..pagesToSkip) |_| {
                         self.page = try self.pageIterator.next() orelse return null;
-                        self.offset = 0;
                     }
+                    self.offset = @as(u16, @truncate(newOffset));
                 }
-                // TODO: HANDLE DOCUMENTS SPANNING PAGES
                 location = try self.step() orelse return null;
+                if (location.header.is_deleted == 7) @breakpoint();
                 // header = location.header;
-                std.debug.print("location header: {any}\n", .{location.header});
+                // std.debug.print("location header: {any}\n", .{location.header});
             }
 
             const doc_len = mem.readInt(u32, self.page.data[self.offset..][0..4], .little);
@@ -552,6 +569,7 @@ pub const Bucket = struct {
                 // Check if we need to load a new page
                 self.page = try self.pageIterator.next() orelse return null;
                 availableToCopy = @truncate(@min(leftToCopy, self.page.data.len));
+
                 @memcpy(writableBuffer, self.page.data[0..availableToCopy]);
                 self.offset = availableToCopy;
                 leftToCopy -= availableToCopy;
@@ -611,14 +629,9 @@ pub const Bucket = struct {
         var iterator = try ScanIterator.init(self, allocator);
         var docsAdded: u64 = 0;
         var docsSkipped: u64 = 0;
-        std.debug.print("iterator state: {any}\n", .{iterator.offset});
+        // std.debug.print("iterator state: {any}\n", .{iterator.offset});
         while (try iterator.next()) |doc| {
             const matched = q.match(.{ .buffer = doc.data });
-            std.debug.print("Matched {any}, at:  {any}\n", .{ matched, DocumentLocation{
-                .header = doc.header,
-                .page_id = doc.page_id,
-                .offset = doc.offset,
-            } });
             if (!matched) continue;
             if (q.sector) |sector| if (sector.offset) |offset| {
                 if (docsSkipped < offset) {
@@ -631,11 +644,11 @@ pub const Bucket = struct {
                 .page_id = doc.page_id,
                 .offset = doc.offset,
             });
-            std.debug.print("mark deleted at: {any}\n", .{DocumentLocation{
-                .header = doc.header,
-                .page_id = doc.page_id,
-                .offset = doc.offset,
-            }});
+            // std.debug.print("mark deleted at: {any}\n", .{DocumentLocation{
+            //     .header = doc.header,
+            //     .page_id = doc.page_id,
+            //     .offset = doc.offset,
+            // }});
             docsAdded += 1;
             if (q.sector) |sector| if (sector.limit) |limit| {
                 if (docsAdded >= limit) {
@@ -643,7 +656,7 @@ pub const Bucket = struct {
                 }
             };
         }
-        std.debug.print("iterator state: {any}\n", .{iterator.offset});
+        // std.debug.print("iterator state: {any}\n", .{iterator.offset});
         const writer = self.file.writer();
         self.rwlock.lock();
         for (locations.items) |*location| {
@@ -652,7 +665,7 @@ pub const Bucket = struct {
             var file = self.file;
             const offset = @sizeOf(BucketHeader) + @sizeOf(PageHeader) + (location.page_id * DEFAULT_PAGE_SIZE);
             try file.seekTo(offset + location.offset);
-            try writer.writeStruct(location.header);
+            try location.header.write(writer);
         }
         self.rwlock.unlock();
     }
@@ -743,7 +756,7 @@ test "Bucket.delete" {
 
     const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
         \\{
-        \\  "query": {"age": "delete me"}
+        \\  "query": {"name": "Alice"}
         \\}
     ));
     // Delete the document from the bucket
@@ -761,4 +774,5 @@ test "Bucket.delete" {
     const docCountAfterInsert = docs.len;
     std.debug.print("Doc len after insert {d}\n", .{docCountAfterInsert});
     try std.testing.expect(docCountAfterInsert == docCount);
+    _ = try bucket.delete(listQ);
 }
