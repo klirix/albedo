@@ -122,11 +122,13 @@ class Bucket {
     } = {}
   ) {
     console.time("serialize");
-    const queryBuf = BSON.serialize({
+    const finalQuery = {
       query,
       ...(options.sort ? { sort: options.sort } : {}),
       ...(options.sector ? { sector: options.sector } : {}),
-    });
+    };
+    console.log("query", finalQuery);
+    const queryBuf = BSON.serialize(finalQuery);
     console.timeEnd("serialize");
 
     const queryPtr = ptr(queryBuf);

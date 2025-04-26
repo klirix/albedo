@@ -475,7 +475,7 @@ pub const BSONValue = union(BSONValueType) {
             .binary => .eq,
             .boolean => .eq,
             .null => .eq,
-            .objectId => std.math.order(self.objectId.value.toInt(), other.objectId.value.toInt()),
+            .objectId => std.mem.order(u8, &self.objectId.value.buffer, &other.objectId.value.buffer),
         };
     }
 

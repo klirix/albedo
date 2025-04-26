@@ -3,13 +3,22 @@ import albedo from "./albedo";
 
 const bucket = albedo.Bucket.open("./test.bucket");
 
-console.time("list outer");
-let i = 0;
-for (const albedo_clos of bucket.list({}, { sector: { limit: 1 } })) {
-}
-bucket.insert({ data: "hello" });
-console.timeEnd("list outer");
-const afterDelete = Array.from(bucket.list({}));
-console.log("i", afterDelete.length);
+// for (let i = 0; i < 10000; i++) {
+//   bucket.insert({
+//     _id: new ObjectId(),
+//     name: "new",
+//     age: 10,
+//     i: i,
+//   });
+// }
+
+console.time("find");
+const res = Array.from(
+  bucket.list(
+    { name: "new" },
+    { sort: { asc: "_id" }, sector: { offset: 9000, limit: 1 } }
+  )
+);
+console.timeEnd("find");
 
 bucket.close();

@@ -112,7 +112,7 @@ const PageError = error{
     PageNotFound,
 };
 
-const Page = struct {
+pub const Page = struct {
     header: PageHeader,
     data: []u8,
     bucket: *Bucket,
@@ -599,8 +599,8 @@ pub const Bucket = struct {
         if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(limit);
         var iterator = try ScanIterator.init(self, allocator);
         var docsSkipped: u64 = 0;
-        var iterRes = try iterator.next();
-        while (iterRes) |docRaw| {
+        // var iterRes = try iterator.next();
+        while (try iterator.next()) |docRaw| {
             const doc = BSONDocument.init(docRaw.data);
             if (!q.match(doc)) continue;
             if (q.sector) |sector| if (sector.offset) |offset| {
@@ -616,7 +616,7 @@ pub const Bucket = struct {
                     break;
                 }
             };
-            iterRes = try iterator.next();
+            // iterRes = try iterator.next();
         }
 
         const resultSlice = try docList.toOwnedSlice();
@@ -688,37 +688,57 @@ pub const Bucket = struct {
     }
 };
 
-// test "Bucket.insert" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//     const allocator = arena.allocator();
-//     var bucket = try Bucket.init(allocator, "test.bucket");
-//     defer bucket.deinit();
+const testing = std.testing;
 
-//     // Create a new BSON document
-//     var doc = try bson.BSONDocument.fromJSON(allocator,
-//         \\{
-//         \\  "name": "Alice",
-//         \\  "age": 37
-//         \\}
-//     );
+test "Bucket.insert" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var bucket = try Bucket.init(allocator, "test.bucket");
+    defer bucket.deinit();
 
-//     // Insert the document into the bucket
-//     _ = try bucket.insert(&doc);
+    // Create a new BSON document
+    var doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "name": "Alice",
+        \\  "age": 37
+        \\}
+    );
 
-//     const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-//         \\{
-//         \\  "sector": {}
-//         \\}
-//     ));
+    // Insert the document into the bucket
+    _ = try bucket.insert(&doc);
 
-//     _ = try bucket.list(allocator, q);
+    const q1 = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "sector": {}
+        \\}
+    ));
 
-//     // for (qResult) |item| {
-//     //     // const oId = item.get("_id").?.objectId.value;
-//     //     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
-//     // }
-// }
+    const res1 = try bucket.list(allocator, q1);
+
+    try testing.expect(res1.len == 1);
+    try testing.expectEqualStrings(res1[0].get("name").?.string.value, "Alice");
+
+    const q2 = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {"name": "Alice"}
+        \\}
+    ));
+
+    const res2 = try bucket.list(allocator, q2);
+
+    try testing.expect(res1.len == res2.len);
+    try testing.expectEqualStrings(res1[0].get("name").?.string.value, "Alice");
+
+    // for (qResult) |item| {
+    //     // const oId = item.get("_id").?.objectId.value;
+    //     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
+    // }
+
+    std.fs.cwd().deleteFile("test.bucket") catch |err| {
+        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    };
+}
 
 // test "DocHeader.write" {
 //     var fixedBuffer: [64]u8 = [_]u8{0} ** 64;

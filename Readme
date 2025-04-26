@@ -1,2 +1,3 @@
 Build and copy stuff:
 zig build && cp ./zig-out/lib/libalbedo.so ./bun/libalbedo.so
+zig build && cp ./zig-out/lib/libalbedo.node ./bun/libalbedo.node
