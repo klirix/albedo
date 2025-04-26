@@ -16,9 +16,11 @@ console.time("find");
 const res = Array.from(
   bucket.list(
     { name: "new" },
-    { sort: { asc: "_id" }, sector: { offset: 9000, limit: 1 } }
+    { sort: { asc: "i" }, sector: { offset: 10, limit: 10 } }
   )
 );
 console.timeEnd("find");
+
+console.log(res);
 
 bucket.close();

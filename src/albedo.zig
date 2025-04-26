@@ -598,24 +598,12 @@ pub const Bucket = struct {
         var docList = std.ArrayList(BSONDocument).init(allocator);
         if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(limit);
         var iterator = try ScanIterator.init(self, allocator);
-        var docsSkipped: u64 = 0;
+
         // var iterRes = try iterator.next();
         while (try iterator.next()) |docRaw| {
             const doc = BSONDocument.init(docRaw.data);
             if (!q.match(doc)) continue;
-            if (q.sector) |sector| if (sector.offset) |offset| {
-                if (docsSkipped < offset) {
-                    docsSkipped += 1;
-                    continue;
-                }
-            };
             try docList.append(doc);
-            if (q.sector) |sector| if (sector.limit) |limit| {
-                // std.debug.print("LIMIT: {d}/{d}", .{ limit, docList.items.len });
-                if (docList.items.len >= limit) {
-                    break;
-                }
-            };
             // iterRes = try iterator.next();
         }
 
@@ -625,7 +613,10 @@ pub const Bucket = struct {
             std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
         }
 
-        return resultSlice;
+        const offset = q.sector.?.offset orelse 0;
+        const limit = q.sector.?.limit orelse resultSlice.len;
+
+        return resultSlice[offset..@min(offset + limit, resultSlice.len)];
         // std.debug.print("DOCS GOOD", .{});
     }
 
