@@ -18,7 +18,9 @@ const BucketHeader = struct {
     flags: u8,
     page_size: u32 = DEFAULT_PAGE_SIZE,
     page_count: u64,
-    reserved: [44]u8, // Padding to make the struct 64 bytes
+    doc_count: u64,
+    deleted_count: u64,
+    reserved: [28]u8, // Padding to make the struct 64 bytes
 
     pub fn init() BucketHeader {
         var header = BucketHeader{
@@ -27,11 +29,13 @@ const BucketHeader = struct {
             .flags = ALBEDO_FLAGS,
             .page_size = DEFAULT_PAGE_SIZE,
             .page_count = 0,
-            .reserved = [_]u8{0} ** 44,
+            .doc_count = 0,
+            .deleted_count = 0,
+            .reserved = [_]u8{0} ** 28,
         };
 
         std.mem.copyForwards(u8, &header.magic, ALBEDO_MAGIC);
-        // std.mem.copyForwards(u8, &header.reserved, [_]u8{0} ** 44);
+        // std.mem.copyForwards(u8, &header.reserved, [_]u8{0} ** 28);
 
         return header;
     }
@@ -43,11 +47,13 @@ const BucketHeader = struct {
             .flags = memory[7],
             .page_size = std.mem.readInt(u32, memory[8..12], .little),
             .page_count = std.mem.readInt(u64, memory[12..20], .little),
+            .doc_count = std.mem.readInt(u64, memory[20..28], .little),
+            .deleted_count = std.mem.readInt(u64, memory[28..36], .little),
             .reserved = undefined,
         };
 
         std.mem.copyForwards(u8, header.magic[0..], ALBEDO_MAGIC);
-        std.mem.copyForwards(u8, header.reserved[0..], &[_]u8{0} ** 44);
+        std.mem.copyForwards(u8, header.reserved[0..], &[_]u8{0} ** 28);
 
         return header;
     }
@@ -59,7 +65,9 @@ const BucketHeader = struct {
         buffer[7] = self.flags;
         std.mem.writeInt(u32, buffer[8..12], self.page_size, .little);
         std.mem.writeInt(u64, buffer[12..20], self.page_count, .little);
-        std.mem.copyForwards(u8, buffer[20..64], &self.reserved);
+        std.mem.writeInt(u64, buffer[20..28], self.doc_count, .little);
+        std.mem.writeInt(u64, buffer[28..36], self.deleted_count, .little);
+        std.mem.copyForwards(u8, buffer[36..64], &self.reserved);
         return buffer;
     }
 };
@@ -146,6 +154,7 @@ const BucketInitErrors = error{
 
 pub const Bucket = struct {
     file: std.fs.File,
+    path: []const u8,
     allocator: std.mem.Allocator,
     header: BucketHeader,
     page_cache: std.AutoArrayHashMap(u64, Page),
@@ -203,6 +212,7 @@ pub const Bucket = struct {
             const header_bytes = file.reader().readBytesNoEof(@sizeOf(BucketHeader)) catch return BucketInitErrors.FileReadError;
             return .{
                 .file = file,
+                .path = path,
                 .header = BucketHeader.read(header_bytes[0..@sizeOf(BucketHeader)]),
                 .allocator = ally,
                 .page_cache = std.AutoArrayHashMap(u64, Page).init(ally),
@@ -222,6 +232,7 @@ pub const Bucket = struct {
             // std.debug.print("{d}", .{bytes_written});
             return .{
                 .file = file,
+                .path = path,
                 .header = BucketHeader.init(),
                 .allocator = ally,
                 .page_cache = std.AutoArrayHashMap(u64, Page).init(ally),
@@ -448,6 +459,10 @@ pub const Bucket = struct {
             }
         }
 
+        self.header.doc_count += 1;
+        try self.file.seekTo(0);
+        _ = try self.file.write(self.header.write()[0..@sizeOf(BucketHeader)]);
+
         // After writing is done, free the page resources
         return result;
     }
@@ -595,12 +610,12 @@ pub const Bucket = struct {
 
     pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]BSONDocument {
         // For now, we'll just print the document
-        const begining = try std.time.Instant.now();
+        // const begining = try std.time.Instant.now();
         var docList = std.ArrayList(BSONDocument).init(allocator);
         if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(limit);
         var iterator = try ScanIterator.init(self, allocator);
-        const inited = try std.time.Instant.now();
-        std.debug.print("Inited at {d}ms\n", .{@divFloor(inited.since(begining), 1_000_000)});
+        // const inited = try std.time.Instant.now();
+        // std.debug.print("Inited at {d}ms\n", .{@divFloor(inited.since(begining), 1_000_000)});
 
         // var iterRes = try iterator.next();
         var i: usize = 0;
@@ -609,24 +624,24 @@ pub const Bucket = struct {
             if (q.filters.len == 0 or q.match(doc)) {
                 try docList.append(doc);
             }
-            if (@rem(i, 1000) == 0) {
-                std.debug.print("List iterator processed {d}k {d}ms\n", .{
-                    i,
-                    @divFloor((try std.time.Instant.now()).since(inited), 1_000_000),
-                });
-            }
+            // if (@rem(i, 1000) == 0) {
+            //     std.debug.print("List iterator processed {d}k {d}ms\n", .{
+            //         i,
+            //         @divFloor((try std.time.Instant.now()).since(inited), 1_000_000),
+            //     });
+            // }
             // iterRes = try iterator.next();
         }
-        const finished = try std.time.Instant.now();
-        std.debug.print("List iterator finished at {d}ms\n", .{@divFloor(finished.since(inited), 1_000_000)});
+        // const finished = try std.time.Instant.now();
+        // std.debug.print("List iterator finished at {d}ms\n", .{@divFloor(finished.since(inited), 1_000_000)});
 
         const resultSlice = try docList.toOwnedSlice();
 
         if (q.sortConfig) |sortConfig| {
             std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
         }
-        const sorted = try std.time.Instant.now();
-        std.debug.print("List iterator sorted at {d}ms\n", .{@divFloor(sorted.since(finished), 1_000_000)});
+        // const sorted = try std.time.Instant.now();
+        // std.debug.print("List iterator sorted at {d}ms\n", .{@divFloor(sorted.since(finished), 1_000_000)});
 
         const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
         const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
@@ -664,7 +679,52 @@ pub const Bucket = struct {
             try file.seekTo(offset + location.offset);
             try location.header.write(writer);
         }
+
+        self.header.doc_count -= 1;
+        self.header.deleted_count += 1;
+        try self.file.seekTo(0);
+        _ = try self.file.write(self.header.write()[0..@sizeOf(BucketHeader)]);
+
+        if (self.header.deleted_count == self.header.doc_count) {
+            // If all documents are deleted, reset the deleted count
+            // TODO: Vacuum the file
+            try self.vacuum();
+        }
+
         self.rwlock.unlock();
+    }
+
+    pub fn vacuum(self: *Bucket) !void {
+        const tempFileName = try std.fmt.allocPrint(self.allocator, "{s}-temp", .{self.path});
+        defer self.allocator.free(tempFileName);
+        var newBucket = try Bucket.openFile(self.allocator, tempFileName);
+        const cwd = std.fs.cwd();
+        defer newBucket.deinit();
+        // defer cwd.deleteFile(tempFileName) catch |err| {
+        //     std.debug.print("Failed to delete temp file: {any}\n", .{err});
+        // };
+        var iterator = try ScanIterator.init(self, self.allocator);
+        while (try iterator.next()) |doc| {
+            var newDoc = bson.BSONDocument.init(doc.data);
+            _ = try newBucket.insert(&newDoc);
+        }
+        iterator.deinit();
+        self.deinit();
+        cwd.deleteFile(self.path) catch |err| {
+            std.debug.print("Failed to delete old file: {any}\n", .{err});
+            return err;
+        };
+        cwd.rename(tempFileName, self.path) catch |err| {
+            std.debug.print("Failed to rename temp file: {any}\n", .{err});
+            return err;
+        };
+
+        self.file = try cwd.openFile(self.path, .{ .mode = .read_write });
+
+        try self.file.seekTo(0);
+        var header_bytes = try self.file.reader().readBytesNoEof(64);
+        self.header = BucketHeader.read(header_bytes[0..]);
+        self.page_cache = std.AutoArrayHashMap(u64, Page).init(self.allocator);
     }
 
     pub fn deinit(self: *Bucket) void {
@@ -769,7 +829,8 @@ test "Bucket.delete" {
     var docs = try bucket.list(allocator, listQ);
     const docCount = docs.len;
 
-    std.debug.print("Doc len before delete {d}\n", .{docCount});
+    std.debug.print("Doc len before vacuum {d}\n", .{docCount});
+    try std.testing.expect(docCount == 1);
 
     const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
         \\{
@@ -792,4 +853,54 @@ test "Bucket.delete" {
     std.debug.print("Doc len after insert {d}\n", .{docCountAfterInsert});
     try std.testing.expect(docCountAfterInsert == docCount);
     _ = try bucket.delete(listQ);
+}
+
+test "Deleted docs disappear after vacuum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var bucket = try Bucket.init(allocator, "VACUUM.bucket");
+    defer bucket.deinit();
+
+    // Create a new BSON document
+    var doc = try bson.BSONDocument.fromJSON(allocator,
+        \\ {
+        \\  "name": "Alice",
+        \\  "age": "delete me"
+        \\ }
+    );
+
+    // Insert the document into the bucket
+    _ = try bucket.insert(&doc);
+
+    const listQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {}
+        \\}
+    ));
+
+    const docs = try bucket.list(allocator, listQ);
+    const docCount = docs.len;
+
+    std.debug.print("Doc len before delete {d}\n", .{docCount});
+
+    const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {"name": "Alice"}
+        \\}
+    ));
+
+    bucket.delete(deleteQ) catch |err| {
+        std.debug.print("Failed to delete document: {any}\n", .{err});
+    };
+
+    bucket.vacuum() catch |err| {
+        std.debug.print("Failed to vacuum bucket: {any}\n", .{err});
+        return err;
+    };
+
+    const afterVacuumDocs = try bucket.list(allocator, listQ);
+    const afterVacuumDocCount = afterVacuumDocs.len;
+
+    try std.testing.expect(afterVacuumDocCount == 0);
 }

@@ -65,6 +65,9 @@ pub const Filter = union(FilterType) {
             .in => |*inFilter| {
                 ally.free(inFilter.path);
             },
+            .between => |*betweenFilter| {
+                ally.free(betweenFilter.path);
+            },
             .eq, .ne, .lt, .gt => |*filter| {
                 ally.free(filter.path);
             },
@@ -190,7 +193,7 @@ test "Filter.parse" {
     };
     const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
     defer filterDoc.deinit(ally);
-    const filters = try Filter.parse(ally, &bson.BSONValue{ .document = filterDoc });
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
         ally.free(filters);
     }
