@@ -397,7 +397,8 @@ pub const Bucket = struct {
         var page: Page = undefined;
 
         // Get the size of the document to be inserted
-
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
         // If no pages exist yet, create one
         if (self.header.page_count == 0) {
             page = try self.createNewPage(.Data);
@@ -680,12 +681,12 @@ pub const Bucket = struct {
             try location.header.write(writer);
         }
 
-        self.header.doc_count -= 1;
-        self.header.deleted_count += 1;
+        self.header.doc_count -= locations.items.len;
+        self.header.deleted_count += locations.items.len;
         try self.file.seekTo(0);
         _ = try self.file.write(self.header.write()[0..@sizeOf(BucketHeader)]);
 
-        if (self.header.deleted_count == self.header.doc_count) {
+        if (self.header.deleted_count > self.header.doc_count) {
             // If all documents are deleted, reset the deleted count
             // TODO: Vacuum the file
             try self.vacuum();
@@ -697,6 +698,7 @@ pub const Bucket = struct {
     pub fn vacuum(self: *Bucket) !void {
         const tempFileName = try std.fmt.allocPrint(self.allocator, "{s}-temp", .{self.path});
         defer self.allocator.free(tempFileName);
+
         var newBucket = try Bucket.openFile(self.allocator, tempFileName);
         const cwd = std.fs.cwd();
         defer newBucket.deinit();
