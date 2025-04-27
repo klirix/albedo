@@ -9,7 +9,7 @@ const bucket = albedo.Bucket.open("./test.bucket");
 //     _id: new ObjectId(),
 //     name: "new",
 //     age: 10,
-//     i: i + 10000,
+//     i: i,
 //   });
 //   if (i % 1000 === 0) {
 //     console.log("inserted", i);
@@ -17,16 +17,11 @@ const bucket = albedo.Bucket.open("./test.bucket");
 // }
 // console.timeEnd("insert");
 
-console.time("find");
-const res = Array.from(bucket.list({ i: { $between: [1000, 3000] } }));
-console.timeEnd("find");
+// bucket.update({ i: { $gt: 14000 } }, (doc) => ({
+//   ...doc,
+//   i: doc.i + 1000,
+// }));
 
-console.log(res[0], res.length);
-
-console.time("find");
-const res2 = Array.from(bucket.list({ i: { $between: [1000, 3000] } }));
-console.timeEnd("find");
-
-console.log(res2[0], res2.length);
+console.log(bucket.get({ _id: new ObjectId("680ea5c38cf7360383bd2b7a") }));
 
 bucket.close();

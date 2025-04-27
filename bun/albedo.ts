@@ -9,7 +9,7 @@ import {
 } from "bun:ffi";
 import { BSON, ObjectId } from "bson";
 
-const { symbols: albedo } = dlopen(`libalbedo.${suffix}`, {
+const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
   albedo_version: {
     args: [],
     returns: "u32",
@@ -52,7 +52,7 @@ const { symbols: albedo } = dlopen(`libalbedo.${suffix}`, {
   },
 });
 
-type Scalar = string | number | boolean | null | ObjectId;
+type Scalar = string | number | Date | boolean | null | ObjectId;
 type Filter =
   | Scalar
   | { $eq: Scalar }
@@ -162,6 +162,29 @@ class Bucket {
       );
     }
     albedo.albedo_close_iterator(iterHandle);
+  }
+
+  all(query: Query["query"] = {}, options: Query = {}) {
+    const result: BSON.Document[] = [];
+    for (const doc of this.list(query, options)) {
+      result.push(doc);
+    }
+    return result;
+  }
+
+  get(query: Query["query"], options: Query = {}) {
+    const result = this.list(query, options).next();
+    return;
+  }
+
+  update(
+    query: Query["query"],
+    updateFunc: (doc: BSON.Document) => BSON.Document
+  ) {
+    for (const doc of this.list(query, {})) {
+      this.delete({ _id: doc._id });
+      this.insert(updateFunc(doc));
+    }
   }
 }
 
