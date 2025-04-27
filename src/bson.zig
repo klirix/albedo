@@ -122,7 +122,7 @@ pub const BSONInt32 = struct {
         return 4;
     }
 
-    pub fn read(memory: []const u8) BSONInt32 {
+    pub inline fn read(memory: []const u8) BSONInt32 {
         return BSONInt32{
             .value = std.mem.bytesToValue(i32, memory),
         };
@@ -549,11 +549,11 @@ pub const BSONValue = union(BSONValueType) {
         }
     }
 
-    pub fn read(memory: []const u8, pairType: BSONValueType) BSONValue {
+    pub inline fn read(memory: []const u8, pairType: BSONValueType) BSONValue {
         return switch (pairType) {
             .string => BSONValue{ .string = BSONString.read(memory) },
             .double => BSONValue{ .double = BSONDouble.read(memory) },
-            .int32 => BSONValue{ .int32 = BSONInt32.read(memory) },
+            .int32 => BSONValue{ .int32 = .{ .value = std.mem.bytesToValue(i32, memory[0..4]) } },
             .array => BSONValue{ .array = blk: {
                 const length = std.mem.bytesToValue(u32, memory[0..4]);
                 break :blk BSONDocument.init(memory[0..length]);
@@ -633,16 +633,14 @@ const TypeNamePair = struct {
 };
 
 pub const BSONObjectId = struct {
-    value: ObjectId,
+    value: *ObjectId,
 
     pub fn write(self: BSONObjectId, memory: []u8) void {
         @memcpy(memory[0..12], &self.value.buffer);
     }
 
     pub fn read(memory: []const u8) BSONObjectId {
-        var buffer: [12:0]u8 = undefined;
-        @memcpy(buffer[0..], memory[0..12]);
-        return BSONObjectId{ .value = ObjectId{ .buffer = buffer } };
+        return BSONObjectId{ .value = ObjectId{ .buffer = memory[0..12] } };
     }
 };
 
@@ -849,16 +847,42 @@ pub const BSONDocument = struct {
         return count;
     }
 
+    fn fastMemEql(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+
+        // Process 16 bytes at a time using vectors
+        const Vec = @Vector(16, u8);
+        var i: usize = 0;
+        while (i + 16 <= a.len) : (i += 16) {
+            const va = @as(Vec, @bitCast(a[i..][0..16].*));
+            const vb = @as(Vec, @bitCast(b[i..][0..16].*));
+            if (!@reduce(.And, va == vb)) return false;
+        }
+
+        // Handle remaining bytes
+        while (i < a.len) : (i += 1) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+
     /// Returns the value at the key in the document.
     /// Returns null if the key is not found.
-    pub fn get(self: BSONDocument, key: []const u8) ?BSONValue {
+    pub inline fn get(self: BSONDocument, key: []const u8) ?BSONValue {
         var idx: usize = 4;
+        const key_len = key.len;
+
         while (TypeNamePair.read(self.buffer[idx..])) |pair| {
-            idx += pair.len;
-            if (std.mem.eql(u8, pair.name, key)) {
-                return BSONValue.read(self.buffer[idx..], pair.type);
+            // Quick length check before any other operations
+            if (pair.name.len == key_len and pair.name[0] == key[0]) {
+                // First char check before full comparison
+                if (fastMemEql(pair.name, key)) {
+                    idx += pair.len;
+                    return BSONValue.read(self.buffer[idx..], pair.type);
+                }
             }
-            idx += BSONValue.asessSize(self.buffer[idx..], pair.type);
+
+            idx += pair.len + BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
         }
         return null;
     }
@@ -871,29 +895,25 @@ pub const BSONDocument = struct {
         var currentDoc: BSONDocument = self;
         var remainingPath = path;
 
+        // Optimize common case of no dots
+        if (std.mem.indexOfScalar(u8, remainingPath, '.') == null) {
+            return currentDoc.get(remainingPath);
+        }
+
         while (true) {
-            const nextKeyAt = blk: {
-                const i: usize = 0;
-                for (remainingPath) |c| {
-                    if (c == '.') break :blk i;
-                }
-                break :blk null;
-            };
-            const currentKey = if (nextKeyAt) |dotIdx| remainingPath[0..dotIdx] else remainingPath;
+            const dotIdx = std.mem.indexOfScalar(u8, remainingPath, '.');
+            const currentKey = if (dotIdx) |idx| remainingPath[0..idx] else remainingPath;
+
             const value = currentDoc.get(currentKey) orelse return null;
 
-            if (nextKeyAt == null) {
-                return value;
-            }
+            if (dotIdx == null) return value;
 
             switch (value) {
-                .document, .array => |pathable| {
-                    currentDoc = pathable;
-                    remainingPath = remainingPath[nextKeyAt.? + 1 ..];
+                .document, .array => |doc| {
+                    currentDoc = doc;
+                    remainingPath = remainingPath[dotIdx.? + 1 ..];
                 },
-                else => {
-                    return null;
-                },
+                else => return null,
             }
         }
     }

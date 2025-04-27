@@ -79,7 +79,7 @@ pub const Filter = union(FilterType) {
         OutOfMemory,
     };
 
-    fn parseDoc(ally: Allocator, doc: *const bson.BSONDocument) FilterParsingErrors![]Filter {
+    fn parseDoc(ally: Allocator, doc: bson.BSONDocument) FilterParsingErrors![]Filter {
         var filters = try ally.alloc(Filter, doc.keyNumber());
         var iter = doc.iter();
         var i: usize = 0;
@@ -130,13 +130,10 @@ pub const Filter = union(FilterType) {
         return filters;
     }
 
-    pub fn parse(ally: Allocator, doc: *const bson.BSONValue) FilterParsingErrors![]Filter {
-        switch (doc.*) {
-            .document => |*document| {
-                return try parseDoc(ally, document);
-            },
-            else => return FilterParsingErrors.InvalidQueryRoot,
-        }
+    pub fn parse(ally: Allocator, doc: bson.BSONValue) FilterParsingErrors![]Filter {
+        if (doc != bson.BSONValueType.document) return FilterParsingErrors.InvalidQueryRoot;
+        if (doc.document.keyNumber() == 0) return FilterParsingErrors.InvalidQueryRoot;
+        return try parseDoc(ally, doc.document);
     }
 
     pub fn match(self: Filter, doc: bson.BSONDocument) bool {
@@ -339,7 +336,7 @@ pub const Query = struct {
 
     pub fn parse(ally: Allocator, queryDoc: bson.BSONDocument) QueryParsingErrors!Query {
         const filterDoc = queryDoc.get("query");
-        const filters = if (filterDoc) |*doc| try Filter.parse(ally, doc) else @constCast(defaultFilters[0..]);
+        const filters = if (filterDoc) |doc| try Filter.parse(ally, doc) else @constCast(defaultFilters[0..]);
         const sortDoc = queryDoc.get("sort");
         const sortConfig = if (sortDoc) |doc| try SortConfig.parse(doc) else null;
         const sectorDoc = queryDoc.get("sector");
