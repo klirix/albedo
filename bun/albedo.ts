@@ -121,7 +121,7 @@ class Bucket {
       sort?: Query["sort"];
       sector?: Query["sector"];
     } = {}
-  ) {
+  ): Generator<BSON.Document, void, boolean | undefined> {
     console.time("serialize");
     const finalQuery = {
       query,
@@ -157,9 +157,13 @@ class Bucket {
       if (res !== 0) {
         throw new Error("Failed to get data from Albedo database");
       }
-      yield BSON.deserialize(
+      const shouldQuit = yield BSON.deserialize(
         toBuffer(read.ptr(dataPtrPtr) as Pointer, 0, size)
       );
+
+      if (shouldQuit) {
+        break;
+      }
     }
     albedo.albedo_close_iterator(iterHandle);
   }
@@ -173,8 +177,11 @@ class Bucket {
   }
 
   get(query: Query["query"], options: Query = {}) {
-    const result = this.list(query, options).next();
-    return;
+    const result = this.list(query, options).next(true);
+    if (result.done) {
+      return null;
+    }
+    return result.value;
   }
 
   update(
