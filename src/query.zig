@@ -25,6 +25,7 @@ pub const FilterType = enum {
     lt,
     gt,
     in,
+    between,
 };
 
 pub const PathValuePair = struct {
@@ -57,6 +58,7 @@ pub const Filter = union(FilterType) {
     lt: PathValuePair,
     gt: PathValuePair,
     in: PathValuePair,
+    between: PathValuePair,
 
     pub fn deinit(self: *Filter, ally: Allocator) void {
         switch (self.*) {
@@ -76,6 +78,8 @@ pub const Filter = union(FilterType) {
         InvalidQueryOperatorSize,
         InvalidInOperatorValue,
         InvalidQueryRoot,
+        InvalidQueryOperatorParameter,
+        InvalidQueryOperatorBetweenSize,
         OutOfMemory,
     };
 
@@ -114,6 +118,12 @@ pub const Filter = union(FilterType) {
                             .gt = .{ .path = path, .value = operand },
                         };
                         continue;
+                    } else if (operatorDoc.get("$between")) |operand| {
+                        if (operand != .array) return FilterParsingErrors.InvalidQueryOperatorParameter;
+                        if (operand.array.keyNumber() != 2) return FilterParsingErrors.InvalidQueryOperatorBetweenSize;
+                        filters[i] = Filter{
+                            .between = .{ .path = path, .value = operand },
+                        };
                     } else {
                         return FilterParsingErrors.InvalidQueryOperator;
                     }
@@ -132,13 +142,12 @@ pub const Filter = union(FilterType) {
 
     pub fn parse(ally: Allocator, doc: bson.BSONValue) FilterParsingErrors![]Filter {
         if (doc != bson.BSONValueType.document) return FilterParsingErrors.InvalidQueryRoot;
-        if (doc.document.keyNumber() == 0) return FilterParsingErrors.InvalidQueryRoot;
         return try parseDoc(ally, doc.document);
     }
 
     pub fn match(self: Filter, doc: bson.BSONDocument) bool {
         const valueToMatch = switch (self) {
-            .eq, .ne, .lt, .gt, .in => |eqFilter| doc.getPath(eqFilter.path) orelse return false,
+            .eq, .ne, .lt, .gt, .in, .between => |eqFilter| doc.getPath(eqFilter.path) orelse return false,
         };
         switch (self) {
             .eq => |eqFilter| {
@@ -159,6 +168,11 @@ pub const Filter = union(FilterType) {
                     if (valueToMatch.eql(pair.value)) return true;
                 }
                 return false;
+            },
+            .between => |betweenFilter| {
+                const lowerBound = betweenFilter.value.array.get("0") orelse unreachable;
+                const upperBound = betweenFilter.value.array.get("1") orelse unreachable;
+                return valueToMatch.order(lowerBound) == .gt and valueToMatch.order(upperBound) == .lt;
             },
         }
     }

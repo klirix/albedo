@@ -633,14 +633,16 @@ const TypeNamePair = struct {
 };
 
 pub const BSONObjectId = struct {
-    value: *ObjectId,
+    value: ObjectId,
 
     pub fn write(self: BSONObjectId, memory: []u8) void {
         @memcpy(memory[0..12], &self.value.buffer);
     }
 
     pub fn read(memory: []const u8) BSONObjectId {
-        return BSONObjectId{ .value = ObjectId{ .buffer = memory[0..12] } };
+        var buffer: [12:0]u8 = undefined;
+        @memcpy(buffer[0..], memory[0..12]);
+        return BSONObjectId{ .value = ObjectId{ .buffer = buffer } };
     }
 };
 

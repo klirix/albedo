@@ -606,7 +606,7 @@ pub const Bucket = struct {
         var i: usize = 0;
         while (try iterator.next()) |docRaw| : (i += 1) {
             const doc = BSONDocument.init(docRaw.data);
-            if (q.match(doc)) {
+            if (q.filters.len == 0 or q.match(doc)) {
                 try docList.append(doc);
             }
             if (@rem(i, 1000) == 0) {

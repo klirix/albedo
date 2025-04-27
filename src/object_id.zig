@@ -8,7 +8,7 @@ const crypto = std.crypto;
 // };
 
 pub const ObjectId = struct {
-    buffer: []u8, // 12
+    buffer: [12]u8, // 12
 
     pub fn init() ObjectId {
         const time = @as(i32, @truncate(std.time.timestamp()));
