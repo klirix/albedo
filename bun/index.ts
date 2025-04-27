@@ -1,27 +1,21 @@
-import { ObjectId } from "bson";
-import albedo from "./albedo";
+import { Bucket } from "./albedo";
 
-const bucket = albedo.Bucket.open("./test.bucket");
+const bucket = Bucket.open("./test.bucket");
 
-// console.time("insert");
-// for (let i = 0; i < 40000; i++) {
-//   bucket.insert({
-//     _id: new ObjectId(),
-//     name: "new",
-//     age: 10,
-//     i: i,
-//   });
-//   if (i % 1000 === 0) {
-//     console.log("inserted", i);
-//   }
-// }
-// console.timeEnd("insert");
+bucket.insert({
+  name: "new",
+  age: 10,
+});
 
-// bucket.update({ i: { $gt: 14000 } }, (doc) => ({
-//   ...doc,
-//   i: doc.i + 1000,
-// }));
+bucket.update({ i: { $gt: 14000 } }, (doc) => {
+  doc.name = "updated";
+  return doc;
+});
 
-console.log(bucket.get({ _id: new ObjectId("680ea5c38cf7360383bd2b7a") }));
+console.log(bucket.get({ i: 1000 }));
+
+bucket.delete({ i: 1000 });
+
+console.log(bucket.all().length);
 
 bucket.close();

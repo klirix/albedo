@@ -75,7 +75,7 @@ export type Query = {
 ///  "projection": {"omit": ["path"] } | {"pick": ["path"]} // Projection of fields wither
 /// }
 
-class Bucket {
+export class Bucket {
   constructor(private pointer: Pointer) {}
 
   insert(data: BSON.Document) {

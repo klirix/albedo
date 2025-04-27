@@ -150,15 +150,19 @@ const BucketInitErrors = error{
     InvalidDocId,
     FileOpenError,
     FileReadError,
+    OutOfMemory,
 };
+
+const tree = @import("btree.zig");
 
 pub const Bucket = struct {
     file: std.fs.File,
     path: []const u8,
     allocator: std.mem.Allocator,
     header: BucketHeader,
-    page_cache: std.AutoArrayHashMap(u64, Page),
+    pageCache: std.AutoArrayHashMap(u64, Page),
     rwlock: std.Thread.RwLock = .{},
+    indexes: std.StringArrayHashMap(tree.BPlusTree),
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -183,7 +187,7 @@ pub const Bucket = struct {
     // Update init to include allocator
     pub fn init(allocator: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
         var bucket = try Bucket.openFile(allocator, path);
-        bucket.page_cache = std.AutoArrayHashMap(u64, Page).init(allocator);
+        bucket.pageCache = std.AutoArrayHashMap(u64, Page).init(allocator);
         return bucket;
     }
 
@@ -210,13 +214,18 @@ pub const Bucket = struct {
                 .{ .mode = .read_write },
             ) catch return BucketInitErrors.FileOpenError;
             const header_bytes = file.reader().readBytesNoEof(@sizeOf(BucketHeader)) catch return BucketInitErrors.FileReadError;
-            return .{
+            const bucket = Bucket{
                 .file = file,
                 .path = path,
                 .header = BucketHeader.read(header_bytes[0..@sizeOf(BucketHeader)]),
                 .allocator = ally,
-                .page_cache = std.AutoArrayHashMap(u64, Page).init(ally),
+                .pageCache = std.AutoArrayHashMap(u64, Page).init(ally),
+                .indexes = std.StringArrayHashMap(tree.BPlusTree).init(ally),
             };
+
+            bucket.buildIndex("_id");
+
+            return bucket;
         } else {
             // std.debug.print("\nFile doesnt exists, creating...\n ", .{});
             // If the file doesn't exist, create it
@@ -230,14 +239,70 @@ pub const Bucket = struct {
             _ = file.write(BucketHeader.init().write()[0..64]) catch return BucketInitErrors.FileReadError;
 
             // std.debug.print("{d}", .{bytes_written});
-            return .{
+            var bucket = Bucket{
                 .file = file,
                 .path = path,
                 .header = BucketHeader.init(),
                 .allocator = ally,
-                .page_cache = std.AutoArrayHashMap(u64, Page).init(ally),
+                .pageCache = std.AutoArrayHashMap(u64, Page).init(ally),
+                .indexes = std.StringArrayHashMap(tree.BPlusTree).init(ally),
             };
+
+            try bucket.indexes.put("_id", tree.BPlusTree.init(bucket.allocator));
+
+            return bucket;
         }
+    }
+
+    pub fn buildIndex(self: *Bucket, path: []const u8) !void {
+        // Check if the index already exists
+        if (self.indexes.get(path)) {
+            return null; // Index already exists
+        }
+        const newTree = tree.BPlusTree.init(self.allocator);
+
+        var iterator = try ScanIterator.init(self, self.allocator);
+        defer iterator.deinit();
+        // const inited = try std.time.Instant.now();
+        // std.debug.print("Inited at {d}ms\n", .{@divFloor(inited.since(begining), 1_000_000)});
+
+        // var iterRes = try iterator.next();
+        while (try iterator.next()) |docRaw| {
+            const doc = bson.BSONDocument.init(docRaw.data);
+            var value = doc.get(path);
+
+            // Documents and binaries are not supported
+            if (value == null or value.? == .binary or value.? == .document) {
+                newTree.insert(
+                    .{ .null = .{} },
+                    .{ .offset = docRaw.offset, .pageId = docRaw.page_id },
+                );
+                continue;
+                // This is obly for sparse indexes
+                //continue;
+            }
+
+            if (value.?.string and value.?.string.len > 1024) {
+                return error.StringIndexTooLong;
+            } else {
+                // copy the string to a new buffer
+                const newBuffer = try self.allocator.alloc(u8, value.?.string.len);
+                @memcpy(newBuffer, value.?.string);
+                value = .{ .string = .{ .value = newBuffer } };
+            }
+
+            newTree.insert(value.?, .{ .offset = docRaw.offset, .pageId = docRaw.page_id });
+
+            // if (@rem(i, 1000) == 0) {
+            //     std.debug.print("List iterator processed {d}k {d}ms\n", .{
+            //         i,
+            //         @divFloor((try std.time.Instant.now()).since(inited), 1_000_000),
+            //     });
+            // }
+            // iterRes = try iterator.next();
+        }
+
+        try self.indexes.put(path, newTree);
     }
 
     // Previous openFile implementation remains the same...
@@ -245,7 +310,7 @@ pub const Bucket = struct {
     pub fn loadPage(self: *Bucket, page_id: u64) !Page {
         // Check if the page is already in the cache
 
-        if (self.page_cache.get(page_id)) |page| {
+        if (self.pageCache.get(page_id)) |page| {
             return page;
         }
 
@@ -277,7 +342,7 @@ pub const Bucket = struct {
             return PageError.PageNotFound;
         }
 
-        try self.page_cache.put(page_id, page);
+        try self.pageCache.put(page_id, page);
 
         return page;
     }
@@ -308,7 +373,7 @@ pub const Bucket = struct {
         _ = try self.file.write(self.header.write()[0..@sizeOf(BucketHeader)]); // Update the header
         try self.file.sync(); // Ensure the header is flushed to disk
         const page = try Page.init(self.allocator, self, PageHeader.init(page_type, new_page_id));
-        try self.page_cache.put(new_page_id, page);
+        try self.pageCache.put(new_page_id, page);
         return page;
     }
 
@@ -448,7 +513,7 @@ pub const Bucket = struct {
             bytes_written += to_write;
 
             // Write updated page back to disk
-            self.page_cache.put(page.header.page_id, page) catch |err| {
+            self.pageCache.put(page.header.page_id, page) catch |err| {
                 std.debug.print("Failed to cache page: {any}", .{err});
             };
             try self.writePage(&page);
@@ -463,6 +528,31 @@ pub const Bucket = struct {
         self.header.doc_count += 1;
         try self.file.seekTo(0);
         _ = try self.file.write(self.header.write()[0..@sizeOf(BucketHeader)]);
+
+        for (self.indexes.keys()) |indexPath| {
+            const index = self.indexes.get(indexPath) catch unreachable;
+            const value = doc.get(indexPath);
+            if (value == null or value.? == .binary or value.? == .document) {
+                index.insert(
+                    .{ .null = .{} },
+                    .{ .offset = result.offset, .pageId = result.page_id },
+                );
+                continue;
+                // This is obly for sparse indexes
+                //continue;
+            }
+
+            if (value.?.string and value.?.string.len > 1024) {
+                return error.StringIndexTooLong;
+            } else {
+                // copy the string to a new buffer
+                const newBuffer = try self.allocator.alloc(u8, value.?.string.len);
+                @memcpy(newBuffer, value.?.string);
+                value = .{ .string = .{ .value = newBuffer } };
+            }
+            // std.debug.print("Inserting into index {s}\n", .{indexPath});
+            index.insert(value.?, .{ .offset = result.offset, .pageId = result.page_id });
+        }
 
         // After writing is done, free the page resources
         return result;
@@ -673,7 +763,7 @@ pub const Bucket = struct {
         const writer = self.file.writer();
         self.rwlock.lock();
         for (locations.items) |*location| {
-            _ = self.page_cache.swapRemove(location.page_id);
+            _ = self.pageCache.swapRemove(location.page_id);
             location.header.is_deleted = 1;
             var file = self.file;
             const offset = @sizeOf(BucketHeader) + @sizeOf(PageHeader) + (location.page_id * DEFAULT_PAGE_SIZE);
@@ -726,13 +816,13 @@ pub const Bucket = struct {
         try self.file.seekTo(0);
         var header_bytes = try self.file.reader().readBytesNoEof(64);
         self.header = BucketHeader.read(header_bytes[0..]);
-        self.page_cache = std.AutoArrayHashMap(u64, Page).init(self.allocator);
+        self.pageCache = std.AutoArrayHashMap(u64, Page).init(self.allocator);
     }
 
     pub fn deinit(self: *Bucket) void {
         self.file.close();
-        defer self.page_cache.deinit();
-        for (self.page_cache.values()) |*page| {
+        defer self.pageCache.deinit();
+        for (self.pageCache.values()) |*page| {
             page.deinit(self.allocator);
         }
     }
