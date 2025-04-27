@@ -139,48 +139,29 @@ pub const Filter = union(FilterType) {
         }
     }
 
-    pub fn match(self: *Filter, doc: bson.BSONDocument) bool {
-        switch (self.*) {
+    pub fn match(self: Filter, doc: bson.BSONDocument) bool {
+        const valueToMatch = switch (self) {
+            .eq, .ne, .lt, .gt, .in => |eqFilter| doc.getPath(eqFilter.path) orelse return false,
+        };
+        switch (self) {
             .eq => |eqFilter| {
-                const pathResult = doc.getPath(eqFilter.path);
-                if (pathResult) |value| {
-                    return value.eql(eqFilter.value);
-                } else {
-                    return false;
-                }
+                return valueToMatch.eql(eqFilter.value);
             },
             .ne => |neFilter| {
-                const pathResult = doc.getPath(neFilter.path);
-                if (pathResult) |value| {
-                    return !value.eql(neFilter.value);
-                } else {
-                    return false;
-                }
+                return !valueToMatch.eql(neFilter.value);
             },
             .lt => |ltFilter| {
-                if (doc.getPath(ltFilter.path)) |value| {
-                    return value.order(ltFilter.value) == .lt;
-                } else {
-                    return false;
-                }
+                return valueToMatch.order(ltFilter.value) == .lt;
             },
             .gt => |gtFilter| {
-                if (doc.getPath(gtFilter.path)) |value| {
-                    return value.order(gtFilter.value) == .gt;
-                } else {
-                    return false;
-                }
+                return valueToMatch.order(gtFilter.value) == .gt;
             },
             .in => |inFilter| {
-                if (doc.getPath(inFilter.path)) |value| {
-                    var inIter = inFilter.value.array.iter();
-                    while (inIter.next()) |pair| {
-                        if (value.eql(pair.value)) return true;
-                    }
-                    return false;
-                } else {
-                    return false;
+                var inIter = inFilter.value.array.iter();
+                while (inIter.next()) |pair| {
+                    if (valueToMatch.eql(pair.value)) return true;
                 }
+                return false;
             },
         }
     }
@@ -385,8 +366,8 @@ pub const Query = struct {
         }
     }
 
-    pub fn match(self: *const Query, doc: bson.BSONDocument) bool {
-        for (self.filters) |*filter| {
+    pub fn match(self: Query, doc: bson.BSONDocument) bool {
+        for (self.filters) |filter| {
             if (!filter.match(doc)) return false;
         }
         return true;

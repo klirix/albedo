@@ -127,7 +127,6 @@ class Bucket {
       ...(options.sort ? { sort: options.sort } : {}),
       ...(options.sector ? { sector: options.sector } : {}),
     };
-    console.log("query", finalQuery);
     const queryBuf = BSON.serialize(finalQuery);
     console.timeEnd("serialize");
 

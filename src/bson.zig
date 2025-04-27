@@ -352,7 +352,7 @@ pub const BSONValue = union(BSONValueType) {
 
     pub fn toString() [:0]u8 {}
 
-    pub fn size(self: *const BSONValue) u32 {
+    pub inline fn size(self: *const BSONValue) u32 {
         return switch (self.*) {
             .string => self.string.size(),
             .double => 8,
@@ -367,7 +367,7 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn valueType(self: *const BSONValue) BSONValueType {
+    pub inline fn valueType(self: *const BSONValue) BSONValueType {
         return switch (self.*) {
             .string => .string,
             .double => .double,
@@ -383,7 +383,7 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn valueOrder(self: *const BSONValue) u8 {
+    pub inline fn valueOrder(self: *const BSONValue) u8 {
         return switch (self.*) {
             .null => 1,
             .double, .int32, .int64 => 2,
@@ -397,7 +397,7 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn asessSize(memory: []const u8, pairType: BSONValueType) u32 {
+    pub inline fn asessSize(memory: []const u8, pairType: BSONValueType) u32 {
         return switch (pairType) {
             .document, .array => std.mem.bytesToValue(u32, memory[0..4]),
             .string => 4 + std.mem.bytesToValue(u32, memory[0..4]),
@@ -412,6 +412,7 @@ pub const BSONValue = union(BSONValueType) {
 
     pub fn eql(self: BSONValue, other: BSONValue) bool {
         if (self == BSONValueType.array) {
+            @branchHint(.unlikely);
             if (other == BSONValueType.array) {
                 if (self.array.buffer.len != other.array.buffer.len) return false;
 
@@ -459,16 +460,16 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn order(self: *const BSONValue, other: BSONValue) std.math.Order {
+    pub fn order(self: BSONValue, other: BSONValue) std.math.Order {
         const a_val = self.valueOrder();
         const b_val = other.valueOrder();
         if (a_val != b_val) {
             return std.math.order(a_val, b_val);
         }
 
-        return switch (self.*) {
+        return switch (self) {
             .string => std.mem.order(u8, self.string.value, other.string.value),
-            .int32, .int64, .double => orderNums(self, &other),
+            .int32, .int64, .double => orderNums(self, other),
             .document => .eq,
             .array => .eq,
             .datetime => std.math.order(self.datetime.value, other.datetime.value),
@@ -479,10 +480,10 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    fn orderNums(a: *const BSONValue, b: *const BSONValue) std.math.Order {
-        return switch (a.*) {
+    fn orderNums(a: BSONValue, b: BSONValue) std.math.Order {
+        return switch (a) {
             .double => {
-                return switch (b.*) {
+                return switch (b) {
                     .double => std.math.order(a.double.value, b.double.value),
                     .int32 => std.math.order(a.double.value, @as(f64, @floatFromInt(b.int32.value))),
                     .int64 => std.math.order(a.double.value, @as(f64, @floatFromInt(b.int64.value))),
@@ -490,7 +491,7 @@ pub const BSONValue = union(BSONValueType) {
                 };
             },
             .int32 => {
-                return switch (b.*) {
+                return switch (b) {
                     .double => std.math.order(@as(f64, @floatFromInt(a.int32.value)), b.double.value),
                     .int32 => std.math.order(a.int32.value, b.int32.value),
                     .int64 => std.math.order(@as(i64, a.int32.value), b.int64.value),
@@ -498,7 +499,7 @@ pub const BSONValue = union(BSONValueType) {
                 };
             },
             .int64 => {
-                return switch (b.*) {
+                return switch (b) {
                     .double => std.math.order(@as(f64, @floatFromInt(a.int64.value)), b.double.value),
                     .int32 => std.math.order(a.int64.value, @as(i64, b.int32.value)),
                     .int64 => std.math.order(a.int64.value, b.int64.value),
@@ -850,7 +851,7 @@ pub const BSONDocument = struct {
 
     /// Returns the value at the key in the document.
     /// Returns null if the key is not found.
-    pub fn get(self: *const @This(), key: []const u8) ?BSONValue {
+    pub fn get(self: BSONDocument, key: []const u8) ?BSONValue {
         var idx: usize = 4;
         while (TypeNamePair.read(self.buffer[idx..])) |pair| {
             idx += pair.len;
@@ -867,20 +868,33 @@ pub const BSONDocument = struct {
     /// Path is a string of keys separated by dots.
     /// Example: "key1.key2.key3"
     pub fn getPath(self: BSONDocument, path: []const u8) ?BSONValue {
-        const nextKeyAt = std.mem.indexOfScalar(u8, path, '.');
-        const currentKey = if (nextKeyAt) |dotIdx| path[0..dotIdx] else path;
-        const value = self.get(currentKey) orelse return null;
-        switch (value) {
-            .document, .array => |pathable| {
-                if (nextKeyAt) |dotIdx| {
-                    return pathable.getPath(path[dotIdx + 1 ..]);
-                } else {
-                    return value;
+        var currentDoc: BSONDocument = self;
+        var remainingPath = path;
+
+        while (true) {
+            const nextKeyAt = blk: {
+                const i: usize = 0;
+                for (remainingPath) |c| {
+                    if (c == '.') break :blk i;
                 }
-            },
-            else => {
+                break :blk null;
+            };
+            const currentKey = if (nextKeyAt) |dotIdx| remainingPath[0..dotIdx] else remainingPath;
+            const value = currentDoc.get(currentKey) orelse return null;
+
+            if (nextKeyAt == null) {
                 return value;
-            },
+            }
+
+            switch (value) {
+                .document, .array => |pathable| {
+                    currentDoc = pathable;
+                    remainingPath = remainingPath[nextKeyAt.? + 1 ..];
+                },
+                else => {
+                    return null;
+                },
+            }
         }
     }
 
@@ -1077,8 +1091,8 @@ test "BSONDoc embedded documents" {
 
     var doc = BSONDocument.init(obj);
 
-    var embedded = doc.get("1") orelse unreachable;
-    const text = embedded.document.get("a").?.string.value;
+    const embedded = doc.getPath("1.a") orelse unreachable;
+    const text = embedded.string.value;
 
     try std.testing.expectEqualStrings("\x62", text);
 

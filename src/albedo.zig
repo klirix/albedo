@@ -551,7 +551,6 @@ pub const Bucket = struct {
                     self.offset = @as(u16, @truncate(newOffset));
                 }
                 location = try self.step() orelse return null;
-                if (location.header.is_deleted == 7) @breakpoint();
                 // header = location.header;
                 // std.debug.print("location header: {any}\n", .{location.header});
             }
@@ -560,6 +559,7 @@ pub const Bucket = struct {
             var leftToCopy: u32 = doc_len;
 
             if (self.resBufferIdx + doc_len > self.resultBuffer.len) {
+                @branchHint(.unlikely);
                 // Resize the buffer if needed
                 const newSize = @max(self.resBufferIdx + doc_len, self.resultBuffer.len * 2);
                 self.resultBuffer = try self.allocator.alloc(u8, newSize);
@@ -595,28 +595,43 @@ pub const Bucket = struct {
 
     pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]BSONDocument {
         // For now, we'll just print the document
+        const begining = try std.time.Instant.now();
         var docList = std.ArrayList(BSONDocument).init(allocator);
         if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(limit);
         var iterator = try ScanIterator.init(self, allocator);
+        const inited = try std.time.Instant.now();
+        std.debug.print("Inited at {d}ms\n", .{@divFloor(inited.since(begining), 1_000_000)});
 
         // var iterRes = try iterator.next();
-        while (try iterator.next()) |docRaw| {
+        var i: usize = 0;
+        while (try iterator.next()) |docRaw| : (i += 1) {
             const doc = BSONDocument.init(docRaw.data);
-            if (!q.match(doc)) continue;
-            try docList.append(doc);
+            if (q.match(doc)) {
+                try docList.append(doc);
+            }
+            if (@rem(i, 1000) == 0) {
+                std.debug.print("List iterator processed {d}k {d}ms\n", .{
+                    i,
+                    @divFloor((try std.time.Instant.now()).since(inited), 1_000_000),
+                });
+            }
             // iterRes = try iterator.next();
         }
+        const finished = try std.time.Instant.now();
+        std.debug.print("List iterator finished at {d}ms\n", .{@divFloor(finished.since(inited), 1_000_000)});
 
         const resultSlice = try docList.toOwnedSlice();
 
         if (q.sortConfig) |sortConfig| {
             std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
         }
+        const sorted = try std.time.Instant.now();
+        std.debug.print("List iterator sorted at {d}ms\n", .{@divFloor(sorted.since(finished), 1_000_000)});
 
-        const offset = q.sector.?.offset orelse 0;
-        const limit = q.sector.?.limit orelse resultSlice.len;
+        const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
+        const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
-        return resultSlice[offset..@min(offset + limit, resultSlice.len)];
+        return resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
         // std.debug.print("DOCS GOOD", .{});
     }
 
@@ -627,34 +642,16 @@ pub const Bucket = struct {
         const allocator = arena.allocator();
         var locations = std.ArrayList(DocumentLocation).init(allocator);
         var iterator = try ScanIterator.init(self, allocator);
-        var docsAdded: u64 = 0;
-        var docsSkipped: u64 = 0;
+
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
         while (try iterator.next()) |doc| {
             const matched = q.match(.{ .buffer = doc.data });
             if (!matched) continue;
-            if (q.sector) |sector| if (sector.offset) |offset| {
-                if (docsSkipped < offset) {
-                    docsSkipped += 1;
-                    continue;
-                }
-            };
             try locations.append(.{
                 .header = doc.header,
                 .page_id = doc.page_id,
                 .offset = doc.offset,
             });
-            // std.debug.print("mark deleted at: {any}\n", .{DocumentLocation{
-            //     .header = doc.header,
-            //     .page_id = doc.page_id,
-            //     .offset = doc.offset,
-            // }});
-            docsAdded += 1;
-            if (q.sector) |sector| if (sector.limit) |limit| {
-                if (docsAdded >= limit) {
-                    break;
-                }
-            };
         }
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
         const writer = self.file.writer();
