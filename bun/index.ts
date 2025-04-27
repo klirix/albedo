@@ -18,13 +18,15 @@ const bucket = albedo.Bucket.open("./test.bucket");
 // console.timeEnd("insert");
 
 console.time("find");
-const res = Array.from(bucket.list({ i: { $gt: 0 } }));
+const res = Array.from(bucket.list({ i: { $between: [1000, 3000] } }));
 console.timeEnd("find");
 
 console.log(res[0], res.length);
 
 console.time("find");
-const res2 = Array.from(bucket.list({ i: { $gt: 0 } }));
+const res2 = Array.from(bucket.list({ i: { $between: [1000, 3000] } }));
 console.timeEnd("find");
+
+console.log(res2[0], res2.length);
 
 bucket.close();

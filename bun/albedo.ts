@@ -59,7 +59,8 @@ type Filter =
   | { $gt: Scalar }
   | { $lt: Scalar }
   | { $ne: Scalar }
-  | { $in: Scalar[] };
+  | { $in: Scalar[] }
+  | { $between: Scalar[] };
 
 export type Query = {
   query?: Record<string, Filter>;
