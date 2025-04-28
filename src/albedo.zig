@@ -185,13 +185,13 @@ pub const Bucket = struct {
     };
 
     // Update init to include allocator
-    pub fn init(allocator: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
+    pub fn init(allocator: std.mem.Allocator, path: []const u8) !Bucket {
         var bucket = try Bucket.openFile(allocator, path);
         bucket.pageCache = std.AutoArrayHashMap(u64, Page).init(allocator);
         return bucket;
     }
 
-    pub fn openFile(ally: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
+    pub fn openFile(ally: std.mem.Allocator, path: []const u8) !Bucket {
         const stat: ?File.Stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
             error.FileNotFound => null, // If the file doesn't exist, return null
             // error.InvalidPath => return error.InvalidPath, // Return an error if the path is invalid
@@ -214,7 +214,7 @@ pub const Bucket = struct {
                 .{ .mode = .read_write },
             ) catch return BucketInitErrors.FileOpenError;
             const header_bytes = file.reader().readBytesNoEof(@sizeOf(BucketHeader)) catch return BucketInitErrors.FileReadError;
-            const bucket = Bucket{
+            var bucket = Bucket{
                 .file = file,
                 .path = path,
                 .header = BucketHeader.read(header_bytes[0..@sizeOf(BucketHeader)]),
@@ -223,7 +223,7 @@ pub const Bucket = struct {
                 .indexes = std.StringArrayHashMap(tree.BPlusTree).init(ally),
             };
 
-            bucket.buildIndex("_id");
+            try bucket.buildIndex("_id");
 
             return bucket;
         } else {
@@ -256,10 +256,10 @@ pub const Bucket = struct {
 
     pub fn buildIndex(self: *Bucket, path: []const u8) !void {
         // Check if the index already exists
-        if (self.indexes.get(path)) {
-            return null; // Index already exists
+        if (self.indexes.get(path) != null) {
+            return; // Index already exists
         }
-        const newTree = tree.BPlusTree.init(self.allocator);
+        var newTree = tree.BPlusTree.init(self.allocator);
 
         var iterator = try ScanIterator.init(self, self.allocator);
         defer iterator.deinit();
@@ -273,7 +273,7 @@ pub const Bucket = struct {
 
             // Documents and binaries are not supported
             if (value == null or value.? == .binary or value.? == .document) {
-                newTree.insert(
+                try newTree.insert(
                     .{ .null = .{} },
                     .{ .offset = docRaw.offset, .pageId = docRaw.page_id },
                 );
@@ -282,16 +282,18 @@ pub const Bucket = struct {
                 //continue;
             }
 
-            if (value.?.string and value.?.string.len > 1024) {
-                return error.StringIndexTooLong;
-            } else {
-                // copy the string to a new buffer
-                const newBuffer = try self.allocator.alloc(u8, value.?.string.len);
-                @memcpy(newBuffer, value.?.string);
-                value = .{ .string = .{ .value = newBuffer } };
+            if (value.? == .string) {
+                if (value.?.string.value.len > 1024) {
+                    return error.StringIndexTooLong;
+                } else {
+                    // copy the string to a new buffer
+                    const newBuffer = try self.allocator.alloc(u8, value.?.string.value.len);
+                    @memcpy(newBuffer, value.?.string.value);
+                    value = .{ .string = .{ .value = newBuffer } };
+                }
             }
 
-            newTree.insert(value.?, .{ .offset = docRaw.offset, .pageId = docRaw.page_id });
+            try newTree.insert(value.?, .{ .offset = docRaw.offset, .pageId = docRaw.page_id });
 
             // if (@rem(i, 1000) == 0) {
             //     std.debug.print("List iterator processed {d}k {d}ms\n", .{
@@ -530,10 +532,10 @@ pub const Bucket = struct {
         _ = try self.file.write(self.header.write()[0..@sizeOf(BucketHeader)]);
 
         for (self.indexes.keys()) |indexPath| {
-            const index = self.indexes.get(indexPath) catch unreachable;
-            const value = doc.get(indexPath);
+            var index = self.indexes.get(indexPath) orelse unreachable;
+            var value = doc.get(indexPath);
             if (value == null or value.? == .binary or value.? == .document) {
-                index.insert(
+                try index.insert(
                     .{ .null = .{} },
                     .{ .offset = result.offset, .pageId = result.page_id },
                 );
@@ -542,16 +544,18 @@ pub const Bucket = struct {
                 //continue;
             }
 
-            if (value.?.string and value.?.string.len > 1024) {
-                return error.StringIndexTooLong;
-            } else {
-                // copy the string to a new buffer
-                const newBuffer = try self.allocator.alloc(u8, value.?.string.len);
-                @memcpy(newBuffer, value.?.string);
-                value = .{ .string = .{ .value = newBuffer } };
+            if (value.? == .string) {
+                if (value.?.string.value.len > 1024) {
+                    return error.StringIndexTooLong;
+                } else {
+                    // copy the string to a new buffer
+                    const newBuffer = try self.allocator.alloc(u8, value.?.string.value.len);
+                    @memcpy(newBuffer, value.?.string.value);
+                    value = .{ .string = .{ .value = newBuffer } };
+                }
             }
             // std.debug.print("Inserting into index {s}\n", .{indexPath});
-            index.insert(value.?, .{ .offset = result.offset, .pageId = result.page_id });
+            try index.insert(value.?, .{ .offset = result.offset, .pageId = result.page_id });
         }
 
         // After writing is done, free the page resources
@@ -700,31 +704,16 @@ pub const Bucket = struct {
     };
 
     pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]BSONDocument {
-        // For now, we'll just print the document
-        // const begining = try std.time.Instant.now();
         var docList = std.ArrayList(BSONDocument).init(allocator);
         if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(limit);
         var iterator = try ScanIterator.init(self, allocator);
-        // const inited = try std.time.Instant.now();
-        // std.debug.print("Inited at {d}ms\n", .{@divFloor(inited.since(begining), 1_000_000)});
 
-        // var iterRes = try iterator.next();
-        var i: usize = 0;
-        while (try iterator.next()) |docRaw| : (i += 1) {
+        while (try iterator.next()) |docRaw| {
             const doc = BSONDocument.init(docRaw.data);
             if (q.filters.len == 0 or q.match(doc)) {
                 try docList.append(doc);
             }
-            // if (@rem(i, 1000) == 0) {
-            //     std.debug.print("List iterator processed {d}k {d}ms\n", .{
-            //         i,
-            //         @divFloor((try std.time.Instant.now()).since(inited), 1_000_000),
-            //     });
-            // }
-            // iterRes = try iterator.next();
         }
-        // const finished = try std.time.Instant.now();
-        // std.debug.print("List iterator finished at {d}ms\n", .{@divFloor(finished.since(inited), 1_000_000)});
 
         const resultSlice = try docList.toOwnedSlice();
 
