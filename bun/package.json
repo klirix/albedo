@@ -1,6 +1,6 @@
 {
   "name": "albedo-bun",
-  "module": "index.ts",
+  "module": "albedo.ts",
   "type": "module",
   "devDependencies": {
     "@types/bun": "latest"

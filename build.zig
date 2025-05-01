@@ -73,8 +73,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.linkLibC();
-
     const simple_module = b.dependency("napigen", .{
         .target = target,
         .optimize = optimize,

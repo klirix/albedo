@@ -1,24 +1,41 @@
 import { Bucket } from "./albedo";
+import * as sql from "bun:sqlite";
 
-const bucket = Bucket.open("./test.bucket");
+const db = new sql.Database("./test.db");
 
-console.log("Opned bucket");
+db.exec(`
+CREATE TABLE IF NOT EXISTS test (
+  id INTEGER PRIMARY KEY,
+  name TEXT,
+  age INTEGER
+);`);
 
-bucket.insert({
-  name: "new",
-  age: 10,
-});
+db.exec(`
+CREATE TABLE IF NOT EXISTS test2 (
+  id INTEGER PRIMARY KEY,
+  name TEXT,
+  age INTEGER
+);`);
 
-// bucket.update({ i: { $gt: 14000 } }, (doc) => {
-//   doc.name = "updated";
-//   return doc;
-// });
+db.exec(`create index if not exists idx_name on test2(name);`);
+db.exec(`create index if not exists idx_name2 on test(name);`);
 
-console.log(bucket.get({ i: 1000 }));
+// const bucket = Bucket.open("./test.bucket");
 
-// bucket.delete({ i: 1000 });
-console.time("all");
-console.log(bucket.all().length);
-console.timeEnd("all");
+// // bucket.insert({
+// //   name: "new",
+// //   age: 10,
+// // });
 
-bucket.close();
+// // bucket.update({ i: { $gt: 14000 } }, (doc) => {
+// //   doc.name = "updated";
+// //   return doc;
+// // });
+
+// // console.log(bucket.get({ i: 1000 }));
+
+// // bucket.delete({ i: 1000 });
+
+// console.log(bucket.all({ i: { $gt: 14003 } }));
+
+// bucket.close();
