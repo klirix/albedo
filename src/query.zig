@@ -226,10 +226,14 @@ const SortConfig = union(SortType) {
 
     pub fn parse(doc: bson.BSONValue) SortParsingErrors!SortConfig {
         if (doc != bson.BSONValueType.document) return error.InvalidQuerySort;
+
         if (doc.document.keyNumber() != 1) return error.InvalidQuerySortParamLength;
+
         var iter = doc.document.iter();
         const pair = iter.next() orelse return error.InvalidQuerySort;
+
         if (pair.value != bson.BSONValueType.string) return error.InvalidQuerySortParamType;
+
         const path = pair.value.string.value;
         if (path.len == 0) return error.InvalidQueryPath;
         if (std.mem.eql(u8, pair.key, "asc")) {
@@ -244,13 +248,10 @@ const SortConfig = union(SortType) {
 
 test "Sort.parse" {
     const ally = std.testing.allocator;
-    const sortDoc = try bson.BSONDocument.fromJSON(ally,
-        \\ {
-        \\   "asc": "field"
-        \\ }
-    );
+    const sortDoc = try bson.BSONDocument.fromTuple(ally, .{
+        .asc = bson.BSONValue{ .string = bson.BSONString{ .value = "field" } },
+    });
     defer sortDoc.deinit(ally);
-    std.debug.print("SORT DOC:{any}\n", .{sortDoc.buffer});
     const sort = try SortConfig.parse(bson.BSONValue{ .document = sortDoc });
 
     switch (sort) {
@@ -322,11 +323,10 @@ const Sector = struct {
 
 test "Sector.parse" {
     const ally = std.testing.allocator;
-    var sectorPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "offset", .value = .{ .int32 = .{ .value = 10 } } },
-        .{ .key = "limit", .value = .{ .int32 = .{ .value = 10 } } },
-    };
-    const sectorDoc = try bson.BSONDocument.fromPairs(ally, &sectorPairs);
+    const sectorDoc = try bson.BSONDocument.fromTuple(ally, .{
+        .offset = bson.BSONValue{ .int32 = .{ .value = 10 } },
+        .limit = bson.BSONValue{ .int32 = .{ .value = 10 } },
+    });
     defer sectorDoc.deinit(ally);
     const sector = try Sector.parse(&bson.BSONValue{ .document = sectorDoc });
     try std.testing.expectEqual(sector.offset, 10);

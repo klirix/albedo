@@ -573,11 +573,10 @@ pub const BSONValue = union(BSONValueType) {
 };
 
 test "BSONValue.eql array -> int32" {
-    var arrayPairs = [_]BSONKeyValuePair{
-        BSONKeyValuePair.init("0", .{ .int32 = .{ .value = 123 } }),
-        BSONKeyValuePair.init("1", .{ .int32 = .{ .value = 123 } }),
-    };
-    const array = try BSONDocument.fromPairs(std.testing.allocator, &arrayPairs);
+    const array = try BSONDocument.fromTuple(std.testing.allocator, .{
+        .@"0" = BSONValue{ .int32 = .{ .value = 123 } },
+        .@"1" = BSONValue{ .int32 = .{ .value = 123 } },
+    });
     const doc = BSONValue{ .array = array };
     defer array.deinit(std.testing.allocator);
     const other = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
@@ -707,6 +706,47 @@ pub const BSONDocument = struct {
         defer jsonStream.deinit();
 
         return .{ .buffer = try jsonToDoc(&jsonStream, ally) };
+    }
+
+    pub fn fromTuple(ally: mem.Allocator, comptime tuple: anytype) !BSONDocument {
+        // asses doc size
+        const T = @TypeOf(tuple);
+        const fields = @typeInfo(T).@"struct".fields;
+        comptime var size: u32 = 4; // Placeholder for length
+        inline for (fields) |field| {
+            const value: BSONValue = @field(tuple, field.name);
+            size += comptime value.size() + field.name.len + 2;
+        }
+        size += 1; // Null terminator for the document
+        const buffer = try ally.alloc(u8, size);
+        std.mem.writeInt(u32, buffer[0..4], size, .little);
+        var idx: u32 = 4;
+        inline for (fields) |field| {
+            const value: BSONValue = @field(tuple, field.name);
+            buffer[idx] = @intFromEnum(value.valueType());
+            idx += 1;
+            std.mem.copyForwards(u8, buffer[idx..], field.name);
+            idx += field.name.len;
+            buffer[idx] = 0x00;
+            idx += 1;
+            // std.mem.copyForwards(u8, buffer[idx..], &value);
+            switch (value) {
+                .string => |s| s.write(buffer[idx..]),
+                .double => |s| s.write(buffer[idx..]),
+                .int32 => |s| s.write(buffer[idx..]),
+                .int64 => |s| s.write(buffer[idx..]),
+                .datetime => |s| s.write(buffer[idx..]),
+                .binary => |s| s.write(buffer[idx..]),
+                .boolean => buffer[idx] = if (value.boolean.value) 0x01 else 0x00,
+                .null => {},
+                else => unreachable,
+            }
+            idx += value.size();
+        }
+        buffer[idx] = 0x00; // Null terminator for the document
+
+        // std.debug.print("{any}", .{buffer});
+        return BSONDocument{ .buffer = buffer };
     }
 
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
@@ -870,7 +910,7 @@ pub const BSONDocument = struct {
 
     /// Returns the value at the key in the document.
     /// Returns null if the key is not found.
-    pub inline fn get(self: BSONDocument, key: []const u8) ?BSONValue {
+    pub fn get(self: BSONDocument, key: []const u8) ?BSONValue {
         var idx: usize = 4;
         const key_len = key.len;
 
@@ -921,18 +961,14 @@ pub const BSONDocument = struct {
     }
 
     test "Document.getPath single value" {
-        const allocator = std.testing.allocator;
-        var pairs = [_]BSONKeyValuePair{
-            BSONKeyValuePair{
-                .key = "test",
-                .value = BSONValue{ .string = BSONString{ .value = "test" } },
-            },
-        };
-        const pairs_slice = pairs[0..];
-        var doc = try BSONDocument.fromPairs(allocator, pairs_slice);
-        defer doc.deinit(allocator);
+        const ally = std.testing.allocator;
+        var doc = try BSONDocument.fromTuple(ally, .{
+            .key = BSONValue{ .string = .{ .value = "test" } },
+        });
 
-        const value = doc.getPath("test") orelse unreachable;
+        defer doc.deinit(ally);
+
+        const value = doc.getPath("key") orelse unreachable;
         try std.testing.expectEqualStrings("test", value.string.value);
     }
 
@@ -1079,21 +1115,16 @@ test "BSONDocument write" {
 
 test "BSONDocument serializeToMemory" {
     var allocator = std.testing.allocator;
-    var pairs = [_]BSONKeyValuePair{
-        BSONKeyValuePair{
-            .key = "test",
-            .value = BSONValue{ .string = BSONString{ .value = "test" } },
-        },
-    };
-    const pairs_slice = pairs[0..];
-    var doc = try BSONDocument.fromPairs(allocator, pairs_slice);
+    var doc = try BSONDocument.fromTuple(allocator, .{
+        .key = BSONValue{ .string = .{ .value = "test" } },
+    });
     defer doc.deinit(allocator);
     // std.debug.print("doc len: {d}", .{doc.buffer.len});
     const actual = allocator.alloc(u8, 100) catch unreachable;
 
     doc.serializeToMemory(actual);
     defer allocator.free(actual);
-    const expected_string = ("\x14\x00\x00\x00\x02test\x00\x05\x00\x00\x00test\x00\x00");
+    const expected_string = ("\x13\x00\x00\x00\x02key\x00\x05\x00\x00\x00test\x00\x00");
     try std.testing.expectEqualSlices(u8, expected_string, actual[0..doc.buffer.len]);
 }
 
