@@ -23,6 +23,7 @@ fn initModule(js: *napigen.JsContext, exports: napigen.napi_value) anyerror!napi
     try js.setNamedProperty(exports, "iter_next", try js.createFunction(iter_next));
     try js.setNamedProperty(exports, "iter_close", try js.createFunction(iter_close));
     try js.setNamedProperty(exports, "delete", try js.createFunction(delete));
+    try js.setNamedProperty(exports, "vacuum", try js.createFunction(vacuum));
 
     return exports;
 }
@@ -36,6 +37,10 @@ fn open(name: []const u8) !*Bucket {
 fn close(db: *Bucket) !void {
     db.deinit();
     allocator.destroy(db);
+}
+
+fn vacuum(db: *Bucket) !void {
+    db.vacuum();
 }
 
 fn insert(js: *napigen.JsContext, bucket: *Bucket, object: napigen.napi_value) !void {

@@ -193,6 +193,7 @@ pub const Bucket = struct {
     pageCache: std.AutoHashMap(u64, Page),
     rwlock: std.Thread.RwLock = .{},
     indexes: std.StringHashMap(u64),
+    autoVaccuum: bool = true,
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -229,9 +230,14 @@ pub const Bucket = struct {
     const OpenBucketOptions = struct {
         buildIdIndex: bool = false,
         mode: BucketFileMode = BucketFileMode.ReadWrite,
+        autoVaccuum: bool = true,
     };
 
     pub fn openFile(ally: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
+        return Bucket.openFileWithOptions(ally, path, .{});
+    }
+
+    pub fn openFileWithOptions(ally: std.mem.Allocator, path: []const u8, options: OpenBucketOptions) BucketInitErrors!Bucket {
         const stat: ?File.Stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
             error.FileNotFound => null, // If the file doesn't exist, return null
             // error.InvalidPath => return error.InvalidPath, // Return an error if the path is invalid
@@ -251,7 +257,7 @@ pub const Bucket = struct {
             // Open the file for reading and writing
             file = std.fs.cwd().openFile(
                 path,
-                .{ .mode = .read_write },
+                .{ .mode = if (options.mode == .ReadWrite) .read_write else .read_only },
             ) catch return BucketInitErrors.FileOpenError;
             const header_bytes = file.reader().readBytesNoEof(BucketHeader.byteSize) catch return BucketInitErrors.FileReadError;
             var bucket = Bucket{
@@ -267,7 +273,9 @@ pub const Bucket = struct {
 
             meta.loadIndices(&bucket.indexes) catch return BucketInitErrors.LoadIndexError;
 
-            // bucket.buildIndex("_id");
+            if (options.buildIdIndex) {
+                // bucket.buildIndex("_id");
+            }
 
             return bucket;
         } else {
@@ -276,7 +284,7 @@ pub const Bucket = struct {
             _ = std.fs.cwd().createFile(path, .{}) catch return BucketInitErrors.FileOpenError;
 
             // Reopen the file for reading and writing
-            file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch {
+            file = std.fs.cwd().openFile(path, .{ .mode = if (options.mode == .ReadWrite) .read_write else .read_only }) catch {
                 return BucketInitErrors.FileOpenError;
             };
 

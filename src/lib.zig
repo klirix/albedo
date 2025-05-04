@@ -169,6 +169,16 @@ pub export fn albedo_close_iterator(iterator: *RequestIterator) Result {
     return Result.OK;
 }
 
+pub export fn albedo_vacuum(bucket: *Bucket) !Result {
+    bucket.vacuum() catch |err| switch (err) {
+        else => |vacuumErr| {
+            std.debug.print("Failed to vacuum bucket, {any}", .{vacuumErr});
+            return Result.Error;
+        },
+    };
+    return Result.OK;
+}
+
 pub export fn albedo_version() u32 {
     return 1;
 }
