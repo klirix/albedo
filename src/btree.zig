@@ -150,6 +150,17 @@ pub const BPlusTree = struct {
             if (node.keys.items.len < DEFAULT_ORDER) {
                 return null;
             }
+
+            // If this is the root node that needs splitting, create a new root
+            if (node == self.root) {
+                const splitResult = try self.splitInternal(node);
+                const newRoot = try Node.init(self.allocator, false);
+                try newRoot.keys.append(splitResult.promoKey);
+                try newRoot.children.append(node);
+                try newRoot.children.append(splitResult.rightNode);
+                return newRoot;
+            }
+
             return try self.splitInternal(node);
         }
         return null;
@@ -183,17 +194,31 @@ pub const BPlusTree = struct {
         return newNode;
     }
 
-    fn splitInternal(self: *BPlusTree, node: *Node) !*Node {
+    const SplitResult = struct {
+        rightNode: *Node,
+        promoKey: BSONValue,
+    };
+
+    fn splitInternal(self: *BPlusTree, node: *Node) !SplitResult {
         const midPoint = DEFAULT_ORDER / 2;
         const newNode = try Node.init(self.allocator, false);
 
+        // Save the middle key that will be promoted
+        const promoKey = node.keys.items[midPoint];
+
+        // Copy keys after midPoint+1 to new node
         try newNode.keys.appendSlice(node.keys.items[midPoint + 1 ..]);
+        // Copy children after midPoint+1 to new node
         try newNode.children.appendSlice(node.children.items[midPoint + 1 ..]);
 
+        // Truncate the original node
         node.keys.shrinkRetainingCapacity(midPoint);
         node.children.shrinkRetainingCapacity(midPoint + 1);
 
-        return newNode;
+        return SplitResult{
+            .rightNode = newNode,
+            .promoKey = promoKey,
+        };
     }
 
     pub fn find(self: *const BPlusTree, key: BSONValue) ?[]const DocumentLocation {
