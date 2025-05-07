@@ -23,7 +23,9 @@ pub const FilterType = enum {
     eq,
     ne,
     lt,
+    lte,
     gt,
+    gte,
     in,
     between,
 };
@@ -56,7 +58,9 @@ pub const Filter = union(FilterType) {
     eq: PathValuePair,
     ne: PathValuePair,
     lt: PathValuePair,
+    lte: PathValuePair,
     gt: PathValuePair,
+    gte: PathValuePair,
     in: PathValuePair,
     between: PathValuePair,
 
@@ -68,7 +72,7 @@ pub const Filter = union(FilterType) {
             .between => |*betweenFilter| {
                 ally.free(betweenFilter.path);
             },
-            .eq, .ne, .lt, .gt => |*filter| {
+            .eq, .ne, .lt, .gt, .lte, .gte => |*filter| {
                 ally.free(filter.path);
             },
         }
@@ -148,10 +152,7 @@ pub const Filter = union(FilterType) {
         return try parseDoc(ally, doc.document);
     }
 
-    pub fn match(self: Filter, doc: bson.BSONDocument) bool {
-        const valueToMatch = switch (self) {
-            .eq, .ne, .lt, .gt, .in, .between => |eqFilter| doc.getPath(eqFilter.path) orelse return false,
-        };
+    pub fn matchValue(self: Filter, valueToMatch: bson.BSONValue) bool {
         switch (self) {
             .eq => |eqFilter| {
                 return valueToMatch.eql(eqFilter.value);
@@ -164,6 +165,12 @@ pub const Filter = union(FilterType) {
             },
             .gt => |gtFilter| {
                 return valueToMatch.order(gtFilter.value) == .gt;
+            },
+            .lte => |lteFilter| {
+                return valueToMatch.order(lteFilter.value) != .gt;
+            },
+            .gte => |lteFilter| {
+                return valueToMatch.order(lteFilter.value) != .lt;
             },
             .in => |inFilter| {
                 var inIter = inFilter.value.array.iter();
@@ -178,6 +185,13 @@ pub const Filter = union(FilterType) {
                 return valueToMatch.order(lowerBound) == .gt and valueToMatch.order(upperBound) == .lt;
             },
         }
+    }
+
+    pub fn match(self: Filter, doc: bson.BSONDocument) bool {
+        const valueToMatch = switch (self) {
+            .eq, .ne, .lt, .lte, .gte, .gt, .in, .between => |eqFilter| doc.getPath(eqFilter.path) orelse return false,
+        };
+        return matchValue(self, valueToMatch);
     }
 };
 

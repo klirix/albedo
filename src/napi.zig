@@ -40,13 +40,13 @@ fn close(db: *Bucket) !void {
 }
 
 fn vacuum(db: *Bucket) !void {
-    db.vacuum();
+    try db.vacuum();
 }
 
 fn insert(js: *napigen.JsContext, bucket: *Bucket, object: napigen.napi_value) !void {
     var insertee = try jsObjectToBSON(js, object);
     defer insertee.deinit(allocator);
-    _ = try bucket.insert(&insertee);
+    _ = try bucket.insert(insertee);
 }
 
 const RequestIterator = struct {

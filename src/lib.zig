@@ -44,9 +44,9 @@ pub export fn albedo_insert(bucket: *albedo.Bucket, docBuffer: [*]u8) Result {
     const docSize = std.mem.readInt(u32, docBuffer[0..4], .little);
     const docBufferProper = docBuffer[0..docSize];
 
-    var doc = bson.BSONDocument.init(docBufferProper);
+    const doc = bson.BSONDocument.init(docBufferProper);
 
-    _ = bucket.insert(&doc) catch |err| switch (err) {
+    _ = bucket.insert(doc) catch |err| switch (err) {
         else => {
             return Result.Error;
         },
@@ -169,12 +169,10 @@ pub export fn albedo_close_iterator(iterator: *RequestIterator) Result {
     return Result.OK;
 }
 
-pub export fn albedo_vacuum(bucket: *Bucket) !Result {
-    bucket.vacuum() catch |err| switch (err) {
-        else => |vacuumErr| {
-            std.debug.print("Failed to vacuum bucket, {any}", .{vacuumErr});
-            return Result.Error;
-        },
+pub export fn albedo_vacuum(bucket: *Bucket) Result {
+    bucket.vacuum() catch |err| {
+        std.debug.print("Failed to vacuum bucket, {any}", .{err});
+        return Result.Error;
     };
     return Result.OK;
 }

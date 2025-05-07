@@ -341,6 +341,7 @@ pub const BSONValue = union(BSONValueType) {
 
     pub fn init(value: anytype) BSONValue {
         return switch (@TypeOf(value)) {
+            i32 => BSONValue{ .int32 = BSONInt32{ .value = value } },
             f64 => BSONValue{ .double = BSONDouble{ .value = value } },
             []u8 => BSONValue{ .string = BSONString{ .value = value } },
             BSONDocument => BSONValue{ .document = value },
