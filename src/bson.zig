@@ -582,15 +582,15 @@ test "BSONValue.eql array -> int32" {
     defer array.deinit(std.testing.allocator);
     const other = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
     const otherfalse = BSONValue{ .int32 = BSONInt32{ .value = 321 } };
-    try std.testing.expectEqual(true, doc.eql(other));
+    try std.testing.expectEqual(true, doc.eql(&other));
 
-    try std.testing.expectEqual(false, doc.eql(otherfalse));
+    try std.testing.expectEqual(false, doc.eql(&otherfalse));
 }
 
 test "BSONValue.eql int32" {
     const double = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
     const other = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
-    try std.testing.expectEqual(true, double.eql(other));
+    try std.testing.expectEqual(true, double.eql(&other));
 }
 
 pub const BSONValueType = enum(u8) {
@@ -915,19 +915,22 @@ pub const BSONDocument = struct {
     pub fn get(self: BSONDocument, key: []const u8) ?BSONValue {
         var idx: usize = 4;
         const key_len = key.len;
-
-        while (TypeNamePair.read(self.buffer[idx..])) |pair| {
+        const buffer = self.buffer;
+        while (buffer[idx] != 0) {
+            const typeByte: BSONValueType = @enumFromInt(buffer[idx]);
+            const namePtr: [*:0]const u8 = @ptrCast(buffer.ptr + idx + 1);
+            const name = std.mem.span(namePtr);
+            idx += 1 + name.len + 1; // Move past type, name, and null terminator
             // Quick length check before any other operations
-            const size = BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
-            if (pair.name.len == key_len and pair.name[0] == key[0]) {
+
+            if (name.len == key_len and name[0] == key[0]) {
                 // First char check before full comparison
-                if (fastMemEql(pair.name, key)) {
-                    idx += pair.len;
-                    return BSONValue.read(self.buffer[idx .. idx + size], pair.type);
+                if (fastMemEql(name, key)) {
+                    return BSONValue.read(self.buffer[idx..], typeByte);
                 }
             }
-
-            idx += pair.len + size;
+            const size = BSONValue.asessSize(self.buffer[idx..], typeByte);
+            idx += size;
         }
         return null;
     }
@@ -937,30 +940,21 @@ pub const BSONDocument = struct {
     /// Path is a string of keys separated by dots.
     /// Example: "key1.key2.key3"
     pub fn getPath(self: *const BSONDocument, path: []const u8) ?BSONValue {
-        var currentDoc: *const BSONDocument = self;
-        var remainingPath = path;
+        return self.getPathRecursive(path);
+    }
 
-        // Optimize common case of no dots
-        if (std.mem.indexOfScalar(u8, remainingPath, '.') == null) {
-            return currentDoc.get(remainingPath);
-        }
+    fn getPathRecursive(self: BSONDocument, path: []const u8) ?BSONValue {
+        const dotIdx = std.mem.indexOfScalar(u8, path, '.');
+        const currentKey = if (dotIdx) |idx| path[0..idx] else path;
 
-        while (true) {
-            const dotIdx = std.mem.indexOfScalar(u8, remainingPath, '.');
-            const currentKey = if (dotIdx) |idx| remainingPath[0..idx] else remainingPath;
+        const value = self.get(currentKey) orelse return null;
 
-            const value = currentDoc.get(currentKey) orelse return null;
+        if (dotIdx == null) return value;
 
-            if (dotIdx == null) return value;
-
-            switch (value) {
-                .document, .array => |doc| {
-                    currentDoc = &doc;
-                    remainingPath = remainingPath[dotIdx.? + 1 ..];
-                },
-                else => return null,
-            }
-        }
+        return switch (value) {
+            .document, .array => |doc| doc.getPathRecursive(path[dotIdx.? + 1 ..]),
+            else => null,
+        };
     }
 
     test "Document.getPath single value" {

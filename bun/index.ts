@@ -1,5 +1,4 @@
 import { Bucket } from "./albedo";
-import * as sql from "bun:sqlite";
 
 const bucket = Bucket.open("./test.bucket");
 
@@ -13,14 +12,14 @@ const bucket = Bucket.open("./test.bucket");
 // }
 // console.timeEnd("insert");
 
-bucket.get({ age: 10, name: "test-1000" });
+// bucket.get({});
 
-bucket.get({ age: 10, name: "test-1000" });
+// bucket.list({});
 
-bucket.get({ age: 10, name: "test-1000" });
+bucket.all({ age: 10 }, { sort: { asc: "age" } });
 
-console.time("all");
-bucket.all({ age: 10 }, { sector: { limit: 500 } });
-console.timeEnd("all");
+console.time("all + serialize");
+bucket.all({});
+console.timeEnd("all + serialize");
 
 bucket.close();
