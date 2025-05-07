@@ -122,14 +122,14 @@ export class Bucket {
       sector?: Query["sector"];
     } = {}
   ): Generator<BSON.Document, void, boolean | undefined> {
-    console.time("serialize");
+    // console.time("serialize");
     const finalQuery = {
       query,
       ...(options.sort ? { sort: options.sort } : {}),
       ...(options.sector ? { sector: options.sector } : {}),
     };
     const queryBuf = BSON.serialize(finalQuery);
-    console.timeEnd("serialize");
+    // console.timeEnd("serialize");
 
     const queryPtr = ptr(queryBuf);
     const iterPtr = new BigInt64Array(1); // 8 bytes for a pointer

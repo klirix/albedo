@@ -233,7 +233,9 @@ fn scalarToJS(js: *napigen.JsContext, scalar: bson.BSONValue) !napigen.napi_valu
             try napigen.check(napigen.napi_create_date(js.env, @as(f64, @floatFromInt(dt.value)), &data));
             break :b data;
         },
-        .objectId => |oid| try js.createString(&oid.value.toString()),
+        .objectId => |oid| b: {
+            break :b js.createObjectFrom(oid.value);
+        },
         else => unreachable,
     };
 }

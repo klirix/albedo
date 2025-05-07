@@ -59,7 +59,16 @@ export class Bucket {
 const bucket = new Bucket("./test.bucket");
 
 console.time("list");
-const allItems = bucket.all({ query: {}, sector: { limit: 1 } });
+bucket.all({ query: {} });
+console.timeEnd("list");
+console.time("list");
+bucket.all({ query: {} });
+console.timeEnd("list");
+console.time("list");
+bucket.all({ query: {} });
+console.timeEnd("list");
+console.time("list");
+bucket.all({ query: {} });
 console.timeEnd("list");
 
 bucket.close();

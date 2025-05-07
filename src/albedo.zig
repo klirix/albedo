@@ -504,7 +504,7 @@ pub const Bucket = struct {
         }
 
         // Check if the page has enough space for header and doc size
-        if ((page.data.len - page.header.used_size) < (4 + DocHeader.byteSize)) { // 20 bytes
+        if ((page.data.len - page.header.used_size) <= (4 + DocHeader.byteSize)) { // 20 bytes
             // Not enough space, create a new page
             page = try self.createNewPage(.Data);
             try self.writePage(page);
@@ -645,18 +645,23 @@ pub const Bucket = struct {
             }
 
             const header = std.mem.bytesToValue(DocHeader, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)]);
-            if (header.reserved != 0 or header.is_deleted > 1) @breakpoint();
+            if (header.reserved != 0 or header.is_deleted > 1) {
+                std.log.err("Doc {d} header is corrupted:\nAt page: {d} position: {x} header looks like: {any}", .{ @sizeOf(DocHeader), self.page.header.page_id, self.offset, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)] });
+                // @panic("Header is corrupted");
+
+                return error.InvalidHeader;
+            }
 
             // std.debug.print("Page approved, header {x}\n", .{header.reserved});
 
             if (header.doc_id == 0) {
                 return null; // No more documents
             }
-            self.offset += DocHeader.byteSize;
+            self.offset += @sizeOf(DocHeader);
 
             return .{
                 .page_id = self.page.header.page_id,
-                .offset = self.offset - DocHeader.byteSize,
+                .offset = self.offset - @sizeOf(DocHeader),
                 .header = header,
             };
         }
@@ -692,7 +697,7 @@ pub const Bucket = struct {
             var leftToCopy: u32 = doc_len;
 
             if (self.resBufferIdx + doc_len > self.resultBuffer.len) {
-                @branchHint(.unlikely);
+                // @branchHint(.unlikely);
                 // Resize the buffer if needed
                 const newSize = @max(self.resBufferIdx + doc_len, self.resultBuffer.len * 2);
                 self.resultBuffer = try self.allocator.alloc(u8, newSize);
@@ -732,8 +737,9 @@ pub const Bucket = struct {
         var iterator = try ScanIterator.init(self, allocator);
 
         while (try iterator.next()) |docRaw| {
-            const doc = BSONDocument.init(docRaw.data);
-            if (q.filters.len == 0 or q.match(doc)) {
+            const doc = BSONDocument{ .buffer = docRaw.data };
+            if (q.filters.len == 0 or q.match(&doc)) {
+                @branchHint(.likely);
                 try docList.append(doc);
             }
         }
@@ -743,14 +749,10 @@ pub const Bucket = struct {
         if (q.sortConfig) |sortConfig| {
             std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
         }
-        // const sorted = try std.time.Instant.now();
-        // std.debug.print("List iterator sorted at {d}ms\n", .{@divFloor(sorted.since(finished), 1_000_000)});
-
         const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
         const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
         return resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
-        // std.debug.print("DOCS GOOD", .{});
     }
 
     pub fn delete(self: *Bucket, q: query.Query) !void {
@@ -764,7 +766,8 @@ pub const Bucket = struct {
 
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
         while (try iterator.next()) |doc| {
-            const matched = q.match(.{ .buffer = doc.data });
+            const deletable: BSONDocument = .{ .buffer = doc.data };
+            const matched = q.match(&deletable);
             if (!matched) continue;
             try locations.append(.{
                 .header = doc.header,
@@ -891,22 +894,39 @@ test "Bucket.insert" {
     //     // const oId = item.get("_id").?.objectId.value;
     //     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
     // }
+}
 
-    for (0..300) |_| {
-        const docMany = try bson.BSONDocument.fromJSON(allocator,
-            \\{
-            \\  "name": "Alice",
+test "Page overflow" {
+    const allocator = std.testing.allocator;
+    var bucket = try Bucket.openFile(allocator, "overflow.bucket");
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("overflow.bucket") catch |err| {
+        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    };
+    const jsonBuf = try testing.allocator.alloc(u8, 300);
+    defer testing.allocator.free(jsonBuf);
+    for (0..900) |i| {
+        const docMany = try bson.BSONDocument.fromJSON(allocator, try std.fmt.bufPrint(jsonBuf,
+            \\{{
+            \\  "name": "test-{d}",
             \\  "age": 10
-            \\}
-        );
+            \\}}
+        , .{i}));
+
         _ = try bucket.insert(docMany);
+        @memset(jsonBuf, 0);
+        allocator.free(docMany.buffer);
     }
 
-    try testing.expect(bucket.header.page_count == 4);
+    const q1 = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "sector": {}
+        \\}
+    ));
 
     const res3 = try bucket.list(allocator, q1);
 
-    try testing.expect(res3.len == 301);
+    try testing.expect(res3.len == 900);
 }
 
 // test "DocHeader.write" {

@@ -411,14 +411,14 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn eql(self: BSONValue, other: BSONValue) bool {
-        if (self == BSONValueType.array) {
+    pub fn eql(self: *const BSONValue, other: *const BSONValue) bool {
+        if (self.* == BSONValueType.array) {
             @branchHint(.unlikely);
-            if (other == BSONValueType.array) {
+            if (other.* == BSONValueType.array) {
                 if (self.array.buffer.len != other.array.buffer.len) return false;
 
                 return std.mem.eql(u8, self.array.buffer, other.array.buffer);
-            } else switch (other) {
+            } else switch (other.*) {
                 .document, .array => {
                     return false;
                 },
@@ -433,7 +433,7 @@ pub const BSONValue = union(BSONValueType) {
                         }
                         const innerValue = BSONValue.read(self.array.buffer[idx..], pair.type);
                         idx += BSONValue.asessSize(self.array.buffer[idx..], pair.type);
-                        if (eql(innerValue, other)) {
+                        if (eql(&innerValue, other)) {
                             return true;
                         }
                     }
@@ -442,13 +442,13 @@ pub const BSONValue = union(BSONValueType) {
             }
         }
 
-        if (self.valueType() != other.valueType()) {
+        if (std.meta.activeTag(self.*) != std.meta.activeTag(other.*)) {
             return false;
         }
 
-        return switch (self) {
+        return switch (self.*) {
             .string => std.mem.eql(u8, self.string.value, other.string.value),
-            .int32 => self.int32.value == other.int32.value,
+            .int32 => |int| int.value == other.int32.value,
             .int64 => self.int64.value == other.int64.value,
             .double => self.double.value == other.double.value,
             .document => false,
@@ -648,7 +648,7 @@ pub const BSONObjectId = struct {
 
 test "encodes BSONObjectId" {
     var allocator = std.testing.allocator;
-    const test_object_id = ObjectId.parseString(("507c7f79bcf86cd7994f6c0e"));
+    const test_object_id = try ObjectId.parseString(("507c7f79bcf86cd7994f6c0e"));
     var object_id = BSONObjectId{ .value = test_object_id };
     const actual = allocator.alloc(u8, 12) catch unreachable;
     object_id.write(actual);
@@ -660,7 +660,7 @@ test "encodes BSONObjectId" {
 
 test "decodes BSONObjectId" {
     const test_memory = (&[_]u8{ 0x50, 0x7c, 0x7f, 0x79, 0xbc, 0xf8, 0x6c, 0xd7, 0x99, 0x4f, 0x6c, 0x0e });
-    const expected_object_id = ObjectId.parseString(("507c7f79bcf86cd7994f6c0e"));
+    const expected_object_id = try ObjectId.parseString(("507c7f79bcf86cd7994f6c0e"));
     const object_id = BSONObjectId.read(test_memory[0..]);
     try std.testing.expectEqualSlices(u8, expected_object_id.buffer[0..], object_id.value.buffer[0..]);
 }
@@ -777,12 +777,14 @@ pub const BSONDocument = struct {
                         try writer.writeAll(key);
                         try writer.writeByte(0);
                         try writer.writeAll(&mem.toBytes(value));
+                        allocator.free(token.allocated_number);
                     } else {
                         const value = try std.fmt.parseInt(i32, token.allocated_number, 10);
                         try writer.writeByte(@intFromEnum(BSONValueType.int32));
                         try writer.writeAll(key);
                         try writer.writeByte(0);
                         try writer.writeInt(i32, value, .little);
+                        allocator.free(token.allocated_number);
                     }
                 },
                 .string => {
@@ -891,7 +893,6 @@ pub const BSONDocument = struct {
     }
 
     fn fastMemEql(a: []const u8, b: []const u8) bool {
-        if (a.len != b.len) return false;
 
         // Process 16 bytes at a time using vectors
         const Vec = @Vector(16, u8);
@@ -917,15 +918,16 @@ pub const BSONDocument = struct {
 
         while (TypeNamePair.read(self.buffer[idx..])) |pair| {
             // Quick length check before any other operations
+            const size = BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
             if (pair.name.len == key_len and pair.name[0] == key[0]) {
                 // First char check before full comparison
                 if (fastMemEql(pair.name, key)) {
                     idx += pair.len;
-                    return BSONValue.read(self.buffer[idx..], pair.type);
+                    return BSONValue.read(self.buffer[idx .. idx + size], pair.type);
                 }
             }
 
-            idx += pair.len + BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
+            idx += pair.len + size;
         }
         return null;
     }
@@ -934,8 +936,8 @@ pub const BSONDocument = struct {
     /// Returns null if the path is not found.
     /// Path is a string of keys separated by dots.
     /// Example: "key1.key2.key3"
-    pub fn getPath(self: BSONDocument, path: []const u8) ?BSONValue {
-        var currentDoc: BSONDocument = self;
+    pub fn getPath(self: *const BSONDocument, path: []const u8) ?BSONValue {
+        var currentDoc: *const BSONDocument = self;
         var remainingPath = path;
 
         // Optimize common case of no dots
@@ -953,7 +955,7 @@ pub const BSONDocument = struct {
 
             switch (value) {
                 .document, .array => |doc| {
-                    currentDoc = doc;
+                    currentDoc = &doc;
                     remainingPath = remainingPath[dotIdx.? + 1 ..];
                 },
                 else => return null,

@@ -152,13 +152,13 @@ pub const Filter = union(FilterType) {
         return try parseDoc(ally, doc.document);
     }
 
-    pub fn matchValue(self: Filter, valueToMatch: bson.BSONValue) bool {
-        switch (self) {
+    pub fn matchValue(self: *const Filter, valueToMatch: bson.BSONValue) bool {
+        switch (self.*) {
             .eq => |eqFilter| {
-                return valueToMatch.eql(eqFilter.value);
+                return valueToMatch.eql(&eqFilter.value);
             },
             .ne => |neFilter| {
-                return !valueToMatch.eql(neFilter.value);
+                return !valueToMatch.eql(&neFilter.value);
             },
             .lt => |ltFilter| {
                 return valueToMatch.order(ltFilter.value) == .lt;
@@ -175,7 +175,7 @@ pub const Filter = union(FilterType) {
             .in => |inFilter| {
                 var inIter = inFilter.value.array.iter();
                 while (inIter.next()) |pair| {
-                    if (valueToMatch.eql(pair.value)) return true;
+                    if (valueToMatch.eql(&pair.value)) return true;
                 }
                 return false;
             },
@@ -187,9 +187,9 @@ pub const Filter = union(FilterType) {
         }
     }
 
-    pub fn match(self: Filter, doc: bson.BSONDocument) bool {
-        const valueToMatch = switch (self) {
-            .eq, .ne, .lt, .lte, .gte, .gt, .in, .between => |eqFilter| doc.getPath(eqFilter.path) orelse return false,
+    pub fn match(self: *const Filter, doc: *const bson.BSONDocument) bool {
+        const valueToMatch = switch (self.*) {
+            inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between => |e| doc.getPath(e.path) orelse return false,
         };
         return matchValue(self, valueToMatch);
     }
@@ -394,7 +394,7 @@ pub const Query = struct {
         }
     }
 
-    pub fn match(self: Query, doc: bson.BSONDocument) bool {
+    pub fn match(self: Query, doc: *const bson.BSONDocument) bool {
         for (self.filters) |filter| {
             if (!filter.match(doc)) return false;
         }
@@ -467,7 +467,7 @@ test "Query.match matches objectId correctly" {
     // queryDoc.serializeToMemory(buffer);
     var query = try Query.parse(ally, queryDoc);
 
-    try std.testing.expect(query.match(doc));
-    try std.testing.expect(!query.match(doc2));
+    try std.testing.expect(query.match(&doc));
+    try std.testing.expect(!query.match(&doc2));
     defer query.deinit(ally);
 }
