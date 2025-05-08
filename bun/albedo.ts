@@ -143,7 +143,6 @@ export class Bucket {
     }
     const iterHandle = read.ptr(iterPtrPtr) as Pointer;
 
-    var i = 0;
     const dataPtrPtr = ptr(new BigInt64Array(1));
     while (true) {
       const res = albedo.albedo_data(iterHandle, dataPtrPtr);
@@ -159,7 +158,6 @@ export class Bucket {
       const size = read.u32(ptr);
       // console.log("res", dataPtrPtr.toString(16), sizeArr[0], i);
       const shouldQuit = yield BSON.deserialize(toBuffer(ptr, 0, size));
-      i++;
 
       if (shouldQuit) {
         break;
