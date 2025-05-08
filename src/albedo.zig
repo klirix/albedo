@@ -700,7 +700,7 @@ pub const Bucket = struct {
                 // @branchHint(.unlikely);
                 // Resize the buffer if needed
                 const newSize = @max(self.resBufferIdx + doc_len, self.resultBuffer.len * 2);
-                self.resultBuffer = try self.allocator.alloc(u8, newSize);
+                self.resultBuffer = try self.allocator.realloc(self.resultBuffer, newSize);
             }
             var docBuffer = self.resultBuffer[self.resBufferIdx .. self.resBufferIdx + doc_len];
             self.resBufferIdx += doc_len;
@@ -731,28 +731,112 @@ pub const Bucket = struct {
         }
     };
 
-    pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]BSONDocument {
-        var docList = std.ArrayList(BSONDocument).init(allocator);
-        if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(limit);
-        var iterator = try ScanIterator.init(self, allocator);
+    pub const ListIterator = struct {
+        docList: std.ArrayList(BSONDocument),
+        allocator: std.mem.Allocator,
+        bucket: *Bucket,
+        query: query.Query,
+        index: usize = 0,
+        scanner: ScanIterator,
+        limitLeft: ?u64 = null,
+        offsetLeft: ?u64 = null,
+        next: *const fn (*ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument = nextUnfetched,
 
-        while (try iterator.next()) |docRaw| {
-            const doc = BSONDocument{ .buffer = docRaw.data };
-            if (q.filters.len == 0 or q.match(&doc)) {
-                @branchHint(.likely);
-                try docList.append(doc);
+        pub fn prequery(self: *ListIterator) !void {
+            // Preload the documents into the list
+            while (try self.scanner.next()) |scanRes| {
+                const bsonDoc = BSONDocument{ .buffer = scanRes.data };
+                if (self.query.filters.len == 0 or self.query.match(&bsonDoc)) {
+                    try self.docList.append(bsonDoc);
+                }
+            }
+            const resultSlice = self.docList.items;
+            if (self.query.sortConfig) |sortConfig| {
+                std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
+            }
+
+            if (self.query.sector) |sector| {
+                // std.debug.print("Sector: {any}\n", .{sector});
+                // std.debug.print("Result slice: {any}\n", .{resultSlice});
+                if (sector.offset) |offset| {
+                    std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[offset..]);
+                }
+            }
+
+            if (self.query.sector) |sector| {
+                self.index = sector.offset orelse 0;
+                if (sector.limit != null and self.docList.items.len > (self.index + sector.limit.?)) {
+                    self.docList.shrinkRetainingCapacity(self.index + sector.limit.?);
+                }
             }
         }
 
-        const resultSlice = docList.items;
-
-        if (q.sortConfig) |sortConfig| {
-            std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
+        fn nextPrefetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
+            if (self.index >= self.docList.items.len) {
+                return null;
+            }
+            const doc = self.docList.items[self.index];
+            self.index += 1;
+            return doc;
         }
-        const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
-        const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
-        return resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
+        pub fn nextUnfetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
+            if (self.limitLeft != null and self.limitLeft.? == 0) {
+                return null;
+            }
+            const doc = self.scanner.next() catch |err| {
+                if (err == error.OutOfMemory) {
+                    return error.OutOfMemory;
+                } else {
+                    return error.ScanError;
+                }
+            } orelse return null;
+            const bsonDoc = BSONDocument{ .buffer = doc.data };
+            if (self.query.match(&bsonDoc) and self.offsetLeft != 0) {
+                // std.debug.print("Found document: {any}\n", .{bsonDoc});
+                if (self.limitLeft) |*limit| limit.* -= 1;
+                return bsonDoc;
+            } else if (self.offsetLeft) |*offset| {
+                if (offset.* != 0) {
+                    offset.* -= 1;
+                }
+            }
+            return nextUnfetched(self);
+        }
+
+        fn deinit(self: *ListIterator) !void {
+            // Deinitialize the list iterator
+            self.scanner.deinit();
+            self.docList.deinit();
+            self.allocator.free(self);
+        }
+    };
+
+    pub fn listIterate(self: *Bucket, allocator: mem.Allocator, q: query.Query) !*ListIterator {
+        const rc = try allocator.create(ListIterator);
+        rc.* = ListIterator{
+            .bucket = self,
+            .allocator = allocator,
+            .query = q,
+            .docList = .init(allocator),
+            .scanner = try .init(self, allocator),
+        };
+        if (q.sortConfig != null) {
+            try rc.prequery();
+            rc.next = ListIterator.nextPrefetched;
+        } else {
+            if (q.sector) |sector| {
+                rc.limitLeft = sector.limit;
+                rc.offsetLeft = sector.offset;
+            }
+        }
+        return rc;
+    }
+
+    pub fn list(self: *Bucket, ally: std.mem.Allocator, q: query.Query) ![]BSONDocument {
+        const li = try self.listIterate(ally, q);
+        try li.prequery();
+        return li.docList.items;
     }
 
     pub fn delete(self: *Bucket, q: query.Query) !void {

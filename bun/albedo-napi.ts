@@ -59,16 +59,34 @@ export class Bucket {
 const bucket = new Bucket("./test.bucket");
 
 console.time("list");
-bucket.all({ query: {} });
+Array.from(
+  bucket.list(
+    { name: { $eq: "test-1000" } },
+    { sector: { limit: 2 }, sort: { asc: "name" } }
+  )
+);
 console.timeEnd("list");
+
 console.time("list");
-bucket.all({ query: {} });
+Array.from(
+  bucket.list({ name: { $eq: "test-1000" } }, { sector: { limit: 100 } })
+);
 console.timeEnd("list");
+
 console.time("list");
-bucket.all({ query: {} });
+let res = Array.from(
+  bucket.list({ name: { $eq: "test-1000" } }, { sector: { limit: 100 } })
+);
+console.log("res", res.slice(0, 10), res.length);
 console.timeEnd("list");
-console.time("list");
-bucket.all({ query: {} });
-console.timeEnd("list");
+// console.time("list");
+// bucket.all({ query: {} });
+// console.timeEnd("list");
+// console.time("list");
+// bucket.all({ query: {} });
+// console.timeEnd("list");
+// console.time("list");
+// bucket.all({ query: {} });
+// console.timeEnd("list");
 
 bucket.close();

@@ -1,3 +1,4 @@
+import { ObjectId } from "bson";
 import { Bucket } from "./albedo";
 
 const bucket = Bucket.open("./test.bucket");
@@ -16,10 +17,23 @@ const bucket = Bucket.open("./test.bucket");
 
 // bucket.list({});
 
-bucket.all({ age: 10 }, { sort: { asc: "age" } });
+console.time("list");
+let res = bucket.all(
+  { name: { $gt: "test-1000" } },
+  { sector: { limit: 100 } }
+);
+console.timeEnd("list");
 
-console.time("all + serialize");
-bucket.all({});
-console.timeEnd("all + serialize");
+console.time("list");
+res = bucket.all(
+  { id: new ObjectId("681c5275e5b72f6b6aa53eb2") },
+  { sector: { limit: 1 } }
+);
+console.timeEnd("list");
+console.log("res", res.slice(0, 10), res.length);
+
+// console.time("all + serialize");
+// bucket.all({});
+// console.timeEnd("all + serialize");
 
 bucket.close();

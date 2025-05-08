@@ -30,12 +30,12 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
     args: [FFIType.pointer, FFIType.pointer],
     returns: "u8",
   },
-  albedo_data_size: {
-    args: [FFIType.pointer],
-    returns: "u32",
-  },
+  // albedo_data_size: {
+  //   args: [FFIType.pointer],
+  //   returns: "u32",
+  // },
   albedo_data: {
-    args: [FFIType.pointer, FFIType.pointer],
+    args: [FFIType.pointer, FFIType.pointer, FFIType.pointer],
     returns: "u8",
   },
   albedo_next: {
@@ -134,32 +134,34 @@ export class Bucket {
     const queryPtr = ptr(queryBuf);
     const iterPtr = new BigInt64Array(1); // 8 bytes for a pointer
     const iterPtrPtr = ptr(iterPtr);
-    console.time("list");
+    // console.time("list");
     const res = albedo.albedo_list(this.pointer, queryPtr, iterPtrPtr);
-    console.timeEnd("list");
+    // console.timeEnd("list");
     // console.log("res", res);
     if (res !== 0) {
       throw new Error("Failed to list Albedo database");
     }
     const iterHandle = read.ptr(iterPtrPtr) as Pointer;
 
-    while (albedo.albedo_next(iterHandle) === 2) {
-      const size = albedo.albedo_data_size(iterHandle);
-      if (size === 0) {
-        console.error(
-          new Error("Failed to get data size from Albedo database")
-        );
-        continue;
-      }
-      const dataPtrPtr = ptr(new BigInt64Array(1));
-      const res = albedo.albedo_data(iterHandle, dataPtrPtr);
+    var i = 0;
+    const sizeArr = new Uint32Array(1);
+    const sizePtr = ptr(sizeArr);
+    const dataPtrPtr = ptr(new BigInt64Array(1));
+    while (true) {
+      const res = albedo.albedo_data(iterHandle, sizePtr, dataPtrPtr);
+      // console.log("rex", i);
 
-      if (res !== 0) {
+      if (res === 1) {
         throw new Error("Failed to get data from Albedo database");
       }
+      if (res === 3) {
+        break;
+      }
+      // console.log("res", dataPtrPtr.toString(16), sizeArr[0], i);
       const shouldQuit = yield BSON.deserialize(
-        toBuffer(read.ptr(dataPtrPtr) as Pointer, 0, size)
+        toBuffer(read.ptr(dataPtrPtr) as Pointer, 0, sizeArr[0])
       );
+      i++;
 
       if (shouldQuit) {
         break;
