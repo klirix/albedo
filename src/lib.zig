@@ -80,15 +80,14 @@ pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen
     // This is a placeholder for actual insertion logic
 }
 
-const RequestIterator = struct {
-    idx: usize = 0,
-    bucket: *albedo.Bucket,
-    results: []bson.BSONDocument,
+const ListIterator = albedo.Bucket.ListIterator;
+
+const ListHandle = struct {
+    iterator: *ListIterator,
     arena: std.heap.ArenaAllocator,
-    new: bool = true,
 };
 
-pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterator: **RequestIterator) Result {
+pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterator: **ListHandle) Result {
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
     const queryBufferProper = queryBuffer[0..queryLen];
 
@@ -102,36 +101,33 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
         },
     };
 
-    const results = bucket.list(queryArenaAllocator, query) catch |err| switch (err) {
+    const iterator = bucket.listIterate(queryArena, query) catch |err| switch (err) {
         else => |rErr| {
             std.debug.print("Failed to list documents, {any}", .{rErr});
             return Result.Error;
         },
     };
-
-    const iterator = queryArenaAllocator.create(RequestIterator) catch return Result.OutOfMemory;
-    iterator.* = RequestIterator{
-        .idx = 0,
-        .bucket = bucket,
-        .results = results,
+    const listHandle = allocator.create(ListHandle) catch return Result.OutOfMemory;
+    listHandle.* = ListHandle{
+        .iterator = iterator,
         .arena = queryArena,
     };
-    outIterator.* = iterator;
+    outIterator.* = listHandle;
 
     return Result.OK;
 }
 
-pub export fn albedo_data(iterator: *RequestIterator, outDoc: *[*]u8) Result {
-    if (iterator.idx >= iterator.results.len) {
-        return Result.Error;
-    }
-    const doc = iterator.results[iterator.idx];
-    const buff = doc.buffer;
+pub export fn albedo_data(handle: *ListHandle, outDoc: *[*]u8) Result {
+    const doc = handle.iterator.next(handle.iterator) catch |err| switch (err) {
+        else => |iterErr| {
+            std.debug.print("Failed to iterate, {any}", .{iterErr});
+            return Result.Error;
+        },
+    } orelse {
+        return Result.EOS;
+    };
 
-    // Transform the outDoc pointer into a slice of the size of the current document
-    // const outDocSlice = outDoc[0..doc.len];
-    // Serialize the BSON document into memory
-    outDoc.* = @constCast(buff.ptr);
+    outDoc.* = @constCast(doc.buffer.ptr);
 
     return Result.OK;
 }
@@ -139,24 +135,14 @@ pub export fn albedo_data(iterator: *RequestIterator, outDoc: *[*]u8) Result {
 /// Advances the iterator to the next result and returns the current state.
 /// If the iterator is at the end of the results, it returns `Result.EOS`.
 /// Otherwise, it returns `Result.Data` to indicate more data is available.
-pub export fn albedo_next(iterator: *RequestIterator) Result {
-    if (iterator.results.len == 0) {
+pub export fn albedo_next(handle: *ListHandle) Result {
+    if (handle.iterator.index == 0) {
         return Result.EOS;
     }
-
-    if (iterator.new) {
-        iterator.new = false;
-    } else {
-        if (iterator.idx + 1 >= iterator.results.len) {
-            return Result.EOS;
-        }
-        iterator.idx += 1;
-    }
-
     return Result.HasData;
 }
 
-pub export fn albedo_close_iterator(iterator: *RequestIterator) Result {
+pub export fn albedo_close_iterator(iterator: *ListHandle) Result {
     iterator.arena.deinit();
     return Result.OK;
 }

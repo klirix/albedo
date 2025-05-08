@@ -406,6 +406,7 @@ pub const Query = struct {
             .asc => |ascSort| ascSort,
             .desc => |descSort| descSort,
         };
+
         const aValue = a.getPath(path);
         const bValue = b.getPath(path);
         if (aValue) |aVal| {

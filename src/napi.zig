@@ -49,12 +49,9 @@ fn insert(js: *napigen.JsContext, bucket: *Bucket, object: napigen.napi_value) !
     _ = try bucket.insert(insertee);
 }
 
-const RequestIterator = struct {
-    idx: usize = 0,
-    bucket: *albedo.Bucket,
-    results: []bson.BSONDocument,
+const RequestHandle = struct {
+    iter: *albedo.Bucket.ListIterator,
     arena: std.heap.ArenaAllocator,
-    new: bool = true,
 };
 
 fn all(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) !napigen.napi_value {
@@ -65,7 +62,7 @@ fn all(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) !na
     const query = try Query.parse(queryArenaAllocator, queryDoc);
 
     const initial = try std.time.Instant.now();
-    const result = try bucket.list(queryArenaAllocator, query);
+    const result = try bucket.list(queryArena, query);
     if (result.len > std.math.maxInt(u32)) {
         return error.TooManyResults;
     }
@@ -83,26 +80,23 @@ fn all(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) !na
     return resultArray;
 }
 
-fn list(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) !*RequestIterator {
+fn list(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) !*RequestHandle {
     var queryArena = std.heap.ArenaAllocator.init(allocator);
     const queryArenaAllocator = queryArena.allocator();
 
     const queryDoc = try jsObjectToBSON(js, queryJS);
     const query = try Query.parse(queryArenaAllocator, queryDoc);
 
-    const iter = try queryArenaAllocator.create(RequestIterator);
-    iter.* = RequestIterator{
-        .idx = 0,
-        .bucket = bucket,
-        .results = try bucket.list(queryArenaAllocator, query),
+    const iter = try queryArenaAllocator.create(RequestHandle);
+    iter.* = RequestHandle{
+        .iter = try bucket.listIterate(queryArena, query),
         .arena = queryArena,
-        .new = true,
     };
 
     return iter;
 }
 
-fn iter_close(iter: *RequestIterator) !void {
+fn iter_close(iter: *RequestHandle) !void {
     iter.arena.deinit();
 }
 
@@ -116,14 +110,13 @@ fn delete(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) 
     try bucket.delete(query);
 }
 
-fn iter_next(js: *napigen.JsContext, iter: *RequestIterator) !napigen.napi_value {
-    if (iter.idx >= iter.results.len) {
+fn iter_next(js: *napigen.JsContext, handle: *RequestHandle) !napigen.napi_value {
+    const docRes = try handle.iter.next(handle.iter);
+    if (docRes) |doc| {
+        return try bsonDocToJS(js, handle.arena.allocator(), doc);
+    } else {
         return try js.null();
     }
-    const doc = iter.results[iter.idx];
-
-    defer iter.idx += 1;
-    return try bsonDocToJS(js, iter.arena.allocator(), doc);
 }
 
 fn jsObjectToBSON(js: *napigen.JsContext, object: napigen.napi_value) !bson.BSONDocument {

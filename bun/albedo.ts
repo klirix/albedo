@@ -31,7 +31,7 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
     returns: "u8",
   },
   albedo_data: {
-    args: [FFIType.pointer, FFIType.pointer],
+    args: [FFIType.pointer, FFIType.pointer, FFIType.pointer],
     returns: "u8",
   },
   albedo_next: {
@@ -130,9 +130,9 @@ export class Bucket {
     const queryPtr = ptr(queryBuf);
     const iterPtr = new BigInt64Array(1); // 8 bytes for a pointer
     const iterPtrPtr = ptr(iterPtr);
-    console.time("list");
+    // console.time("list");
     const res = albedo.albedo_list(this.pointer, queryPtr, iterPtrPtr);
-    console.timeEnd("list");
+    // console.timeEnd("list");
     // console.log("res", res);
     if (res !== 0) {
       throw new Error("Failed to list Albedo database");
@@ -140,15 +140,20 @@ export class Bucket {
     const iterHandle = read.ptr(iterPtrPtr) as Pointer;
     const dataPtrPtr = ptr(new BigInt64Array(1));
 
-    while (albedo.albedo_next(iterHandle) === 2) {
+    while (true) {
       const res = albedo.albedo_data(iterHandle, dataPtrPtr);
-      const dataPtr = read.ptr(dataPtrPtr) as Pointer;
-      const size = read.u32(dataPtr);
 
-      if (res !== 0) {
+      if (res === 3) {
+        break;
+      }
+      if (res > 1) {
+        console.log("res", res);
         throw new Error("Failed to get data from Albedo database");
       }
-      const shouldQuit = yield BSON.deserialize(toBuffer(dataPtr, 0, size));
+      const ptr = read.ptr(dataPtrPtr) as Pointer;
+      const size = read.u32(ptr);
+      // console.log("res", dataPtrPtr.toString(16), sizeArr[0], i);
+      const shouldQuit = yield BSON.deserialize(toBuffer(ptr, 0, size));
 
       if (shouldQuit) {
         break;
