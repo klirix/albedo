@@ -144,23 +144,21 @@ export class Bucket {
     const iterHandle = read.ptr(iterPtrPtr) as Pointer;
 
     var i = 0;
-    const sizeArr = new Uint32Array(1);
-    const sizePtr = ptr(sizeArr);
     const dataPtrPtr = ptr(new BigInt64Array(1));
     while (true) {
-      const res = albedo.albedo_data(iterHandle, sizePtr, dataPtrPtr);
-      // console.log("rex", i);
+      const res = albedo.albedo_data(iterHandle, dataPtrPtr);
 
-      if (res === 1) {
-        throw new Error("Failed to get data from Albedo database");
-      }
       if (res === 3) {
         break;
       }
+      if (res > 1) {
+        console.log("res", res);
+        throw new Error("Failed to get data from Albedo database");
+      }
+      const ptr = read.ptr(dataPtrPtr) as Pointer;
+      const size = read.u32(ptr);
       // console.log("res", dataPtrPtr.toString(16), sizeArr[0], i);
-      const shouldQuit = yield BSON.deserialize(
-        toBuffer(read.ptr(dataPtrPtr) as Pointer, 0, sizeArr[0])
-      );
+      const shouldQuit = yield BSON.deserialize(toBuffer(ptr, 0, size));
       i++;
 
       if (shouldQuit) {

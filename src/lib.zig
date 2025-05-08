@@ -101,7 +101,7 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
         },
     };
 
-    const iterator = bucket.listIterate(queryArenaAllocator, query) catch |err| switch (err) {
+    const iterator = bucket.listIterate(queryArena, query) catch |err| switch (err) {
         else => |rErr| {
             std.debug.print("Failed to list documents, {any}", .{rErr});
             return Result.Error;
@@ -117,7 +117,7 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
     return Result.OK;
 }
 
-pub export fn albedo_data(handle: *ListHandle, outSize: *u32, outDoc: *[*]u8) Result {
+pub export fn albedo_data(handle: *ListHandle, outDoc: *[*]u8) Result {
     const doc = handle.iterator.next(handle.iterator) catch |err| switch (err) {
         else => |iterErr| {
             std.debug.print("Failed to iterate, {any}", .{iterErr});
@@ -127,10 +127,6 @@ pub export fn albedo_data(handle: *ListHandle, outSize: *u32, outDoc: *[*]u8) Re
         return Result.EOS;
     };
 
-    // Transform the outDoc pointer into a slice of the size of the current document
-    // const outDocSlice = outDoc[0..doc.len];
-    // Serialize the BSON document into memory
-    outSize.* = @truncate(doc.buffer.len);
     outDoc.* = @constCast(doc.buffer.ptr);
 
     return Result.OK;

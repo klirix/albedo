@@ -611,8 +611,6 @@ pub const Bucket = struct {
         offset: u16 = 0,
         pageIterator: PageIterator,
         readDeleted: bool = false,
-        resultBuffer: []u8 = undefined,
-        resBufferIdx: usize = 0,
 
         fn init(bucket: *Bucket, allocator: std.mem.Allocator) !ScanIterator {
             return .{
@@ -623,7 +621,6 @@ pub const Bucket = struct {
                     .bucket = bucket,
                     .type = .Data,
                 },
-                .resultBuffer = try allocator.alloc(u8, 512 * 1024),
             };
         }
 
@@ -696,14 +693,13 @@ pub const Bucket = struct {
             const doc_len = mem.readInt(u32, self.page.data[self.offset..][0..4], .little);
             var leftToCopy: u32 = doc_len;
 
-            if (self.resBufferIdx + doc_len > self.resultBuffer.len) {
-                // @branchHint(.unlikely);
-                // Resize the buffer if needed
-                const newSize = @max(self.resBufferIdx + doc_len, self.resultBuffer.len * 2);
-                self.resultBuffer = try self.allocator.realloc(self.resultBuffer, newSize);
-            }
-            var docBuffer = self.resultBuffer[self.resBufferIdx .. self.resBufferIdx + doc_len];
-            self.resBufferIdx += doc_len;
+            // if (self.resBufferIdx + doc_len > self.resultBuffer.len) {
+            //     // @branchHint(.unlikely);
+            //     // Resize the buffer if needed
+            //     const newSize = @max(self.resBufferIdx + doc_len, self.resultBuffer.len * 2);
+            //     self.resultBuffer = try self.allocator.alloc(self.resultBuffer, newSize);
+            // }
+            var docBuffer = try self.allocator.alloc(u8, doc_len);
 
             var writableBuffer = docBuffer[0..doc_len];
             var availableToCopy: u16 = @truncate(@min(doc_len, self.page.data.len - self.offset));
@@ -717,7 +713,7 @@ pub const Bucket = struct {
                 self.page = try self.pageIterator.next() orelse return null;
                 availableToCopy = @truncate(@min(leftToCopy, self.page.data.len));
 
-                @memcpy(writableBuffer, self.page.data[0..availableToCopy]);
+                @memcpy(writableBuffer[0..availableToCopy], self.page.data[0..availableToCopy]);
                 self.offset = availableToCopy;
                 leftToCopy -= availableToCopy;
             }
@@ -732,25 +728,26 @@ pub const Bucket = struct {
     };
 
     pub const ListIterator = struct {
-        docList: std.ArrayList(BSONDocument),
-        allocator: std.mem.Allocator,
+        docList: []BSONDocument,
+        arena: std.heap.ArenaAllocator,
         bucket: *Bucket,
         query: query.Query,
         index: usize = 0,
         scanner: ScanIterator,
         limitLeft: ?u64 = null,
-        offsetLeft: ?u64 = null,
+        offsetLeft: u64 = 0,
         next: *const fn (*ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument = nextUnfetched,
 
         pub fn prequery(self: *ListIterator) !void {
             // Preload the documents into the list
+            var docList = std.ArrayList(BSONDocument).init(self.arena.allocator());
             while (try self.scanner.next()) |scanRes| {
                 const bsonDoc = BSONDocument{ .buffer = scanRes.data };
                 if (self.query.filters.len == 0 or self.query.match(&bsonDoc)) {
-                    try self.docList.append(bsonDoc);
+                    try docList.append(bsonDoc);
                 }
             }
-            const resultSlice = self.docList.items;
+            const resultSlice = docList.items;
             if (self.query.sortConfig) |sortConfig| {
                 std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
             }
@@ -762,20 +759,17 @@ pub const Bucket = struct {
                     std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[offset..]);
                 }
             }
+            const offset = if (self.query.sector) |sector| sector.offset orelse 0 else 0;
+            const limit = if (self.query.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
-            if (self.query.sector) |sector| {
-                self.index = sector.offset orelse 0;
-                if (sector.limit != null and self.docList.items.len > (self.index + sector.limit.?)) {
-                    self.docList.shrinkRetainingCapacity(self.index + sector.limit.?);
-                }
-            }
+            self.docList = resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
         }
 
         fn nextPrefetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
-            if (self.index >= self.docList.items.len) {
+            if (self.index >= self.docList.len) {
                 return null;
             }
-            const doc = self.docList.items[self.index];
+            const doc = self.docList[self.index];
             self.index += 1;
             return doc;
         }
@@ -792,14 +786,11 @@ pub const Bucket = struct {
                 }
             } orelse return null;
             const bsonDoc = BSONDocument{ .buffer = doc.data };
-            if (self.query.match(&bsonDoc) and self.offsetLeft != 0) {
-                // std.debug.print("Found document: {any}\n", .{bsonDoc});
-                if (self.limitLeft) |*limit| limit.* -= 1;
+            if (self.query.match(&bsonDoc) and self.offsetLeft == 0) {
+                if (self.limitLeft != null) self.limitLeft = self.limitLeft.? - 1;
                 return bsonDoc;
-            } else if (self.offsetLeft) |*offset| {
-                if (offset.* != 0) {
-                    offset.* -= 1;
-                }
+            } else if (self.offsetLeft != 0) {
+                self.offsetLeft -= 1;
             }
             return nextUnfetched(self);
         }
@@ -807,36 +798,36 @@ pub const Bucket = struct {
         fn deinit(self: *ListIterator) !void {
             // Deinitialize the list iterator
             self.scanner.deinit();
-            self.docList.deinit();
-            self.allocator.free(self);
         }
     };
 
-    pub fn listIterate(self: *Bucket, allocator: mem.Allocator, q: query.Query) !*ListIterator {
-        const rc = try allocator.create(ListIterator);
-        rc.* = ListIterator{
+    pub fn listIterate(self: *Bucket, arena: std.heap.ArenaAllocator, q: query.Query) !*ListIterator {
+        var iter = ListIterator{
             .bucket = self,
-            .allocator = allocator,
+            .arena = arena,
             .query = q,
-            .docList = .init(allocator),
-            .scanner = try .init(self, allocator),
+            .docList = undefined,
+            .scanner = undefined,
         };
+        const rc = try iter.arena.allocator().create(ListIterator);
+        rc.* = iter;
+        rc.scanner = try ScanIterator.init(self, rc.*.arena.allocator());
         if (q.sortConfig != null) {
             try rc.prequery();
             rc.next = ListIterator.nextPrefetched;
         } else {
             if (q.sector) |sector| {
                 rc.limitLeft = sector.limit;
-                rc.offsetLeft = sector.offset;
+                if (sector.offset) |offset| rc.offsetLeft = offset;
             }
         }
         return rc;
     }
 
-    pub fn list(self: *Bucket, ally: std.mem.Allocator, q: query.Query) ![]BSONDocument {
-        const li = try self.listIterate(ally, q);
+    pub fn list(self: *Bucket, arena: std.heap.ArenaAllocator, q: query.Query) ![]BSONDocument {
+        const li = try self.listIterate(arena, q);
         try li.prequery();
-        return li.docList.items;
+        return li.docList;
     }
 
     pub fn delete(self: *Bucket, q: query.Query) !void {
@@ -958,7 +949,7 @@ test "Bucket.insert" {
         \\}
     ));
 
-    const res1 = try bucket.list(allocator, q1);
+    const res1 = try bucket.list(arena, q1);
 
     try testing.expect(res1.len == 1);
     try testing.expectEqualStrings(res1[0].get("name").?.string.value, "Alice");
@@ -969,7 +960,7 @@ test "Bucket.insert" {
         \\}
     ));
 
-    const res2 = try bucket.list(allocator, q2);
+    const res2 = try bucket.list(arena, q2);
 
     try testing.expect(res1.len == res2.len);
     try testing.expectEqualStrings(res1[0].get("name").?.string.value, "Alice");
@@ -981,7 +972,9 @@ test "Bucket.insert" {
 }
 
 test "Page overflow" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const allocator = arena.allocator();
+    defer arena.deinit();
     var bucket = try Bucket.openFile(allocator, "overflow.bucket");
     defer bucket.deinit();
     defer std.fs.cwd().deleteFile("overflow.bucket") catch |err| {
@@ -1002,13 +995,13 @@ test "Page overflow" {
         allocator.free(docMany.buffer);
     }
 
-    const q1 = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+    const q1 = try query.Query.parse(arena, try bson.BSONDocument.fromJSON(allocator,
         \\{
         \\  "sector": {}
         \\}
     ));
 
-    const res3 = try bucket.list(allocator, q1);
+    const res3 = try bucket.list(arena, q1);
 
     try testing.expect(res3.len == 900);
 }

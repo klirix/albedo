@@ -62,7 +62,7 @@ fn all(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) !na
     const query = try Query.parse(queryArenaAllocator, queryDoc);
 
     const initial = try std.time.Instant.now();
-    const result = try bucket.list(queryArenaAllocator, query);
+    const result = try bucket.list(queryArena, query);
     if (result.len > std.math.maxInt(u32)) {
         return error.TooManyResults;
     }
@@ -89,7 +89,7 @@ fn list(js: *napigen.JsContext, bucket: *Bucket, queryJS: napigen.napi_value) !*
 
     const iter = try queryArenaAllocator.create(RequestHandle);
     iter.* = RequestHandle{
-        .iter = try bucket.listIterate(queryArenaAllocator, query),
+        .iter = try bucket.listIterate(queryArena, query),
         .arena = queryArena,
     };
 
