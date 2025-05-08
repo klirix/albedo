@@ -30,10 +30,6 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
     args: [FFIType.pointer, FFIType.pointer],
     returns: "u8",
   },
-  albedo_data_size: {
-    args: [FFIType.pointer],
-    returns: "u32",
-  },
   albedo_data: {
     args: [FFIType.pointer, FFIType.pointer],
     returns: "u8",
@@ -142,24 +138,17 @@ export class Bucket {
       throw new Error("Failed to list Albedo database");
     }
     const iterHandle = read.ptr(iterPtrPtr) as Pointer;
+    const dataPtrPtr = ptr(new BigInt64Array(1));
 
     while (albedo.albedo_next(iterHandle) === 2) {
-      const size = albedo.albedo_data_size(iterHandle);
-      if (size === 0) {
-        console.error(
-          new Error("Failed to get data size from Albedo database")
-        );
-        continue;
-      }
-      const dataPtrPtr = ptr(new BigInt64Array(1));
       const res = albedo.albedo_data(iterHandle, dataPtrPtr);
+      const dataPtr = read.ptr(dataPtrPtr) as Pointer;
+      const size = read.u32(dataPtr);
 
       if (res !== 0) {
         throw new Error("Failed to get data from Albedo database");
       }
-      const shouldQuit = yield BSON.deserialize(
-        toBuffer(read.ptr(dataPtrPtr) as Pointer, 0, size)
-      );
+      const shouldQuit = yield BSON.deserialize(toBuffer(dataPtr, 0, size));
 
       if (shouldQuit) {
         break;

@@ -16,10 +16,10 @@ const bucket = Bucket.open("./test.bucket");
 
 // bucket.list({});
 
-bucket.all({ age: 10 }, { sort: { asc: "age" } });
+bucket.all({ name: "test-1000" });
 
 console.time("all + serialize");
-bucket.all({});
+bucket.all({ name: "test-1000" });
 console.timeEnd("all + serialize");
 
 bucket.close();

@@ -121,14 +121,6 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
     return Result.OK;
 }
 
-pub export fn albedo_data_size(iterator: *RequestIterator) u32 {
-    if (iterator.idx >= iterator.results.len) {
-        return 0;
-    }
-    const doc = iterator.results[iterator.idx];
-    return @truncate(doc.buffer.len);
-}
-
 pub export fn albedo_data(iterator: *RequestIterator, outDoc: *[*]u8) Result {
     if (iterator.idx >= iterator.results.len) {
         return Result.Error;
