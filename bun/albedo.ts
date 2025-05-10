@@ -48,6 +48,7 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
   },
 });
 
+type Path = string;
 type Scalar = string | number | Date | boolean | null | ObjectId;
 type Filter =
   | Scalar
@@ -56,13 +57,13 @@ type Filter =
   | { $lt: Scalar }
   | { $ne: Scalar }
   | { $in: Scalar[] }
-  | { $between: Scalar[] };
+  | { $between: [Scalar, Scalar] };
 
 export type Query = {
-  query?: Record<string, Filter>;
-  sort?: { asc: string } | { desc: string };
+  query?: Record<Path, Filter>;
+  sort?: { asc: Path } | { desc: Path };
   sector?: { offset?: number; limit?: number };
-  projection?: { omit?: string[] } | { pick?: string[] };
+  projection?: { omit?: Path[] } | { pick?: Path[] };
 };
 /// {
 ///  "query": {"field.path": {"$eq": "value"}}, // Flat field.path -> filter
@@ -119,11 +120,10 @@ export class Bucket {
     } = {}
   ): Generator<BSON.Document, void, boolean | undefined> {
     // console.time("serialize");
-    const finalQuery = {
-      query,
-      ...(options.sort ? { sort: options.sort } : {}),
-      ...(options.sector ? { sector: options.sector } : {}),
-    };
+    const finalQuery: Query = { query };
+    if (options.sort) finalQuery.sort = options.sort;
+    if (options.sector) finalQuery.sector = options.sector;
+
     const queryBuf = BSON.serialize(finalQuery);
     // console.timeEnd("serialize");
 
@@ -194,6 +194,4 @@ export default {
   version() {
     return albedo.albedo_version();
   },
-  albedo_open: albedo.albedo_open,
-  albedo_close: albedo.albedo_close,
 };
