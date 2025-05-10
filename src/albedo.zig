@@ -324,7 +324,7 @@ pub const Bucket = struct {
         try self.file.seekTo(0);
         const writer = self.file.writer();
         _ = try self.header.write(writer);
-        try self.file.sync(); // Ensure the write is flushed to disk
+        // try self.file.sync(); // Ensure the write is flushed to disk
     }
 
     pub fn buildIndex(self: *Bucket, _: []const u8) !void {
@@ -382,7 +382,7 @@ pub const Bucket = struct {
 
         // Write the data
         _ = try self.file.write(page.data);
-        try self.file.sync(); // Ensure the write is flushed to disk
+        // try self.file.sync(); // Ensure the write is flushed to disk
     }
 
     pub fn createNewPage(self: *Bucket, page_type: PageType) !*Page {
@@ -456,6 +456,7 @@ pub const Bucket = struct {
     };
 
     fn findLastDataPage(self: *Bucket) !?*Page {
+
         // Find the last data page
         var pageIter = PageIterator{
             .bucket = self,
@@ -693,12 +694,6 @@ pub const Bucket = struct {
             const doc_len = mem.readInt(u32, self.page.data[self.offset..][0..4], .little);
             var leftToCopy: u32 = doc_len;
 
-            // if (self.resBufferIdx + doc_len > self.resultBuffer.len) {
-            //     // @branchHint(.unlikely);
-            //     // Resize the buffer if needed
-            //     const newSize = @max(self.resBufferIdx + doc_len, self.resultBuffer.len * 2);
-            //     self.resultBuffer = try self.allocator.alloc(self.resultBuffer, newSize);
-            // }
             var docBuffer = try self.allocator.alloc(u8, doc_len);
 
             var writableBuffer = docBuffer[0..doc_len];
@@ -740,11 +735,12 @@ pub const Bucket = struct {
 
         pub fn prequery(self: *ListIterator) !void {
             // Preload the documents into the list
-            var docList = std.ArrayList(BSONDocument).init(self.arena.allocator());
+            var docList = std.ArrayListUnmanaged(BSONDocument).empty;
+            const ally = self.arena.allocator();
             while (try self.scanner.next()) |scanRes| {
                 const bsonDoc = BSONDocument{ .buffer = scanRes.data };
                 if (self.query.filters.len == 0 or self.query.match(&bsonDoc)) {
-                    try docList.append(bsonDoc);
+                    try docList.append(bsonDoc, ally);
                 }
             }
             const resultSlice = docList.items;
@@ -868,7 +864,7 @@ pub const Bucket = struct {
         self.header.deleted_count += locations.items.len;
         try self.flushHeader();
 
-        if (self.header.deleted_count > self.header.doc_count) {
+        if (self.header.deleted_count > self.header.doc_count and self.autoVaccuum) {
             // If all documents are deleted, reset the deleted count
             try self.vacuum();
         }
