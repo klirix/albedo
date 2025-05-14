@@ -4,6 +4,38 @@ const napigen = @import("napigen");
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
+
+const ndkBase = "/Users/askhat/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr";
+const include_dir = ndkBase ++ "/include";
+const lib_dir = ndkBase ++ "/lib";
+
+fn createLibCFile(b: *std.Build, arch: []const u8) ![]const u8 {
+    const fname = b.fmt("android-{s}.conf", .{arch});
+
+    var contents = std.ArrayList(u8).init(b.allocator);
+    errdefer contents.deinit();
+
+    var writer = contents.writer();
+
+    //  The directory that contains `stdlib.h`.
+    //  On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null
+    try writer.print("include_dir={s}\n", .{include_dir});
+
+    // The system-specific include directory. May be the same as `include_dir`.
+    // On Windows it's the directory that includes `vcruntime.h`.
+    // On POSIX it's the directory that includes `sys/errno.h`.
+    try writer.print("sys_include_dir={s}/{s}\n", .{ include_dir, arch });
+
+    try writer.print("crt_dir={s}/{s}\n", .{ lib_dir, arch });
+    try writer.writeAll("msvc_lib_dir=\n");
+    try writer.writeAll("kernel32_lib_dir=\n");
+    try writer.writeAll("gcc_dir=\n");
+
+    const step = b.addWriteFile(fname, contents.items);
+    b.getInstallStep().dependOn(&step.step);
+    return step.files.items[0].sub_path;
+}
+
 pub fn build(b: *std.Build) void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -15,60 +47,69 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .Debug,
+        .preferred_optimize_mode = .ReleaseFast,
     });
 
-    const lib = b.addSharedLibrary(.{
-        .name = "albedo",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
+    const buildStatic = b.option(bool, "static", "Build static library");
+    const buildNode = b.option(bool, "node", "Build node extension");
+    // if (b.)
+
+    const libModule = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const node_lib = b.addSharedLibrary(.{
-        .name = "albedo_node",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
+    const isAndroid = b.option(bool, "android", "Build with android libc");
+
+    if (buildStatic != true and buildNode != true) {
+        // Build a shared library by default
+
+        const dynamic = b.addLibrary(.{
+            .name = "albedo",
+            .linkage = .dynamic,
+            .root_module = libModule,
+        });
+
+        const arch = switch (target.result.cpu.arch) {
+            .x86_64 => "x86_64-linux-android",
+            .aarch64 => "aarch64-linux-android",
+            .arm => "arm-linux-androideabi",
+            else => @panic("Unsupported architecture"),
+        };
+
+        if (isAndroid == true) {
+            dynamic.linkLibC();
+            dynamic.link_emit_relocs = true;
+            dynamic.link_eh_frame_hdr = true;
+            dynamic.link_function_sections = true;
+            dynamic.bundle_compiler_rt = true;
+            // dynamic.strip = (mode == .ReleaseSmall);
+            const libs = [_][]const u8{ "GLESv2", "EGL", "android", "log", "aaudio" };
+            for (libs) |lib| {
+                dynamic.linkSystemLibrary2(lib, .{ .weak = true });
+            }
+
+            dynamic.addIncludePath(.{ .cwd_relative = b.fmt("{s}", .{include_dir}) });
+            dynamic.addLibraryPath(.{
+                .cwd_relative = b.fmt("{s}/{s}/35", .{ lib_dir, arch }),
+            });
+            dynamic.export_table = true;
+            dynamic.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}", .{ lib_dir, arch }) });
+            dynamic.setLibCFile(.{ .cwd_relative = b.fmt("android-confs/{s}.conf", .{arch}) });
+
+            dynamic.libc_file.?.addStepDependencies(&dynamic.step);
+
+            if (target.result.cpu.arch == .x86) {
+                dynamic.link_z_notext = true;
+            }
+        }
+
+        b.installArtifact(dynamic);
+    }
+
+    const nodeModule = b.createModule(.{
         .root_source_file = b.path("src/napi.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // lib.linkLibC();
-
-    b.installArtifact(lib);
-
-    napigen.setup(node_lib);
-
-    b.installArtifact(node_lib);
-    const copy_node_step = b.addInstallLibFile(node_lib.getEmittedBin(), "libalbedo.node");
-    b.getInstallStep().dependOn(&copy_node_step.step);
-
-    const static = b.addStaticLibrary(.{
-        .name = "albedo",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
-
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    static.bundle_compiler_rt = true;
-
-    static.linkLibC();
-
-    b.installArtifact(static);
-
-    // This declares intent for the library to be installed into the standard
-    // location when the user invokes the "install" step (the default step when
-    // running `zig build`).
-
-    const exe = b.addExecutable(.{
-        .name = "albedo",
-        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -76,39 +117,39 @@ pub fn build(b: *std.Build) void {
     const simple_module = b.dependency("napigen", .{
         .target = target,
         .optimize = optimize,
-    }).module("napigen");
+    });
+    libModule.addImport("napigen", simple_module.module("napigen"));
 
-    exe.root_module.addImport("napigen", simple_module);
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
-    b.installArtifact(exe);
+    if (buildNode == true) {
+        const node_lib = b.addSharedLibrary(.{
+            .name = "albedo_node",
+            // .linkage = .dynamic,
+            .root_module = nodeModule,
+        });
 
-    // This *creates* a Run step in the build graph, to be executed when another
-    // step is evaluated that depends on it. The next line below will establish
-    // such a dependency.
-    const run_cmd = b.addRunArtifact(exe);
+        napigen.setup(node_lib);
 
-    // By making the run step depend on the install step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    // This is not necessary, however, if the application depends on other installed
-    // files, this ensures they will be present and in the expected location.
-    run_cmd.step.dependOn(b.getInstallStep());
+        b.installArtifact(node_lib);
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+        const copy_node_step = b.addInstallLibFile(node_lib.getEmittedBin(), "libalbedo.node");
+        b.getInstallStep().dependOn(&copy_node_step.step);
     }
 
-    // This creates a build step. It will be visible in the `zig build --help` menu,
-    // and can be selected like this: `zig build run`
-    // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
+    const d = b.option([]const u8, "output", "Output file name");
 
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
+    if (buildStatic == true) {
+        const static = b.addLibrary(.{
+            .name = d orelse "albedo",
+            .linkage = .static,
+
+            .root_module = libModule,
+        });
+
+        static.bundle_compiler_rt = true;
+
+        b.installArtifact(static);
+    }
+
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,

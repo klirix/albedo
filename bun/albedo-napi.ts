@@ -60,10 +60,7 @@ const bucket = new Bucket("./test.bucket");
 
 console.time("list");
 Array.from(
-  bucket.list(
-    { name: { $eq: "test-1000" } },
-    { sector: { limit: 2 }, sort: { asc: "name" } }
-  )
+  bucket.list({ name: { $eq: "test-1000" } }, { sector: { limit: 2 } })
 );
 console.timeEnd("list");
 
@@ -79,6 +76,9 @@ let res = Array.from(
 );
 console.log("res", res.slice(0, 10), res.length);
 console.timeEnd("list");
+
+const objid = new albedo.ObjectId();
+console.log("albedo objid", `${objid}`);
 // console.time("list");
 // bucket.all({ query: {} });
 // console.timeEnd("list");
