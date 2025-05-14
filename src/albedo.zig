@@ -735,12 +735,12 @@ pub const Bucket = struct {
 
         pub fn prequery(self: *ListIterator) !void {
             // Preload the documents into the list
-            var docList = std.ArrayListUnmanaged(BSONDocument).empty;
             const ally = self.arena.allocator();
+            var docList = std.ArrayList(BSONDocument).init(ally);
             while (try self.scanner.next()) |scanRes| {
                 const bsonDoc = BSONDocument{ .buffer = scanRes.data };
                 if (self.query.filters.len == 0 or self.query.match(&bsonDoc)) {
-                    try docList.append(bsonDoc, ally);
+                    try docList.append(bsonDoc);
                 }
             }
             const resultSlice = docList.items;
@@ -752,7 +752,7 @@ pub const Bucket = struct {
                 // std.debug.print("Sector: {any}\n", .{sector});
                 // std.debug.print("Result slice: {any}\n", .{resultSlice});
                 if (sector.offset) |offset| {
-                    std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[offset..]);
+                    std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[@truncate(offset)..]);
                 }
             }
             const offset = if (self.query.sector) |sector| sector.offset orelse 0 else 0;

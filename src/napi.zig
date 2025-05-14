@@ -13,7 +13,73 @@ comptime {
     napigen.defineModule(initModule);
 }
 
+fn oidConstructorFunction(env: napigen.napi_env, cb_info: napigen.napi_callback_info) callconv(.C) napigen.napi_value {
+    const js = napigen.JsContext.init(env) catch {
+        @panic("Failed to create JsContext");
+    };
+    js.arena.inc();
+    defer js.arena.dec();
+    var oid = bson.ObjectId.init();
+    var this: napigen.napi_value = undefined;
+    napigen.check(napigen.napi_get_cb_info(js.env, cb_info, null, null, &this, null)) catch |e| {
+        return js.throw(e);
+    };
+
+    js.setNamedProperty(this, "buffer", createArrayBuffer(js, oid.buffer[0..]) catch |e| {
+        return js.throw(e);
+    }) catch |e| {
+        return js.throw(e);
+    };
+
+    return this;
+}
+
+fn oidToStringInstanceMethod(env: napigen.napi_env, cb_info: napigen.napi_callback_info) callconv(.C) napigen.napi_value {
+    const js = napigen.JsContext.init(env) catch {
+        @panic("Failed to create JsContext");
+    };
+    js.arena.inc();
+    defer js.arena.dec();
+    var this: napigen.napi_value = undefined;
+    napigen.check(napigen.napi_get_cb_info(js.env, cb_info, null, null, &this, null)) catch |e| {
+        return js.throw(e);
+    };
+
+    const arraybuffer = js.getNamedProperty(this, "buffer") catch |e| {
+        return js.throw(e);
+    };
+    var objId = bson.ObjectId{ .buffer = @splat(0) };
+    napigen.check(napigen.napi_get_arraybuffer_info(js.env, arraybuffer, @alignCast(@ptrCast(&objId.buffer)), null)) catch |e| {
+        return js.throw(e);
+    };
+
+    return js.createString(objId.toString()[0..]) catch |e| {
+        return js.throw(e);
+    };
+}
+
+fn createBaseFunction(js: *napigen.JsContext, name: [*:0]const u8, fun: anytype) !napigen.napi_value {
+    var res: napigen.napi_value = undefined;
+    try napigen.check(napigen.napi_create_function(js.env, name, napigen.NAPI_AUTO_LENGTH, &fun, null, &res));
+    return res;
+}
+
+var objIdConstructor: napigen.napi_value = undefined;
+
+fn initObjectIdClass(js: *napigen.JsContext) !void {
+    // napigen.napi_new_instance(env: ?*struct_napi_env__, constructor: ?*struct_napi_value__, argc: usize, argv: [*c]const ?*struct_napi_value__, result: [*c]?*struct_napi_value__)
+    objIdConstructor = try createBaseFunction(js, "ObjectId", oidConstructorFunction);
+    const objectIdPrototype = try js.createObject();
+    const toStringMethod = try createBaseFunction(js, "anonymous", oidToStringInstanceMethod);
+    try js.setNamedProperty(objectIdPrototype, "toString", toStringMethod);
+    try js.setNamedProperty(objIdConstructor, "__proto__", objectIdPrototype);
+}
+
 fn initModule(js: *napigen.JsContext, exports: napigen.napi_value) anyerror!napigen.napi_value {
+    // napigen.napi_new_instance(env: ?*struct_napi_env__, constructor: ?*struct_napi_value__, argc: usize, argv: [*c]const ?*struct_napi_value__, result: [*c]?*struct_napi_value__)
+    try initObjectIdClass(js);
+    try js.setNamedProperty(exports, "ObjectId", objIdConstructor);
+
     // try js.setNamedProperty(exports, "add", try js.createFunction(bsonToNapi));
     try js.setNamedProperty(exports, "open", try js.createFunction(open));
     try js.setNamedProperty(exports, "close", try js.createFunction(close));
@@ -231,4 +297,10 @@ fn scalarToJS(js: *napigen.JsContext, scalar: bson.BSONValue) !napigen.napi_valu
         },
         else => unreachable,
     };
+}
+
+fn createArrayBuffer(js: *napigen.JsContext, slice: []u8) !napigen.napi_value {
+    var data: napigen.napi_value = undefined;
+    try napigen.check(napigen.napi_create_arraybuffer(js.env, slice.len, @alignCast(@ptrCast(slice.ptr)), &data));
+    return data;
 }

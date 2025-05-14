@@ -4,8 +4,6 @@ const albedo = @import("./albedo.zig");
 const bson = @import("./bson.zig");
 const Query = @import("./query.zig").Query;
 
-const allocator = std.heap.page_allocator;
-
 const Bucket = albedo.Bucket;
 
 const Result = enum(u8) {
@@ -23,8 +21,11 @@ const Result = enum(u8) {
 
 pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     const pathProper = std.mem.span(path);
-    const db = allocator.create(albedo.Bucket) catch return Result.OutOfMemory;
-    db.* = albedo.Bucket.init(allocator, pathProper) catch |err| switch (err) {
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    // defer _ = gpa.deinit();
+    const ally = std.heap.smp_allocator;
+    const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
+    db.* = albedo.Bucket.init(ally, pathProper) catch |err| switch (err) {
         else => |dbOpenErr| {
             std.debug.print("Failed to open db, {any}", .{dbOpenErr});
             return Result.Error;
@@ -36,7 +37,7 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
 
 pub export fn albedo_close(bucket: *albedo.Bucket) Result {
     bucket.deinit();
-    allocator.destroy(bucket);
+    bucket.allocator.destroy(bucket);
     return Result.OK;
 }
 
@@ -60,7 +61,7 @@ pub export fn albedo_insert(bucket: *albedo.Bucket, docBuffer: [*]u8) Result {
 pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen: u16) Result {
     const docBufferProper = queryBuffer[0..queryLen];
 
-    const query = Query.parseRaw(allocator, docBufferProper) catch |err| switch (err) {
+    const query = Query.parseRaw(bucket.allocator, docBufferProper) catch |err| switch (err) {
         Query.QueryParsingErrors.OutOfMemory => {
             return Result.OutOfMemory;
         },
@@ -91,7 +92,7 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
     const queryBufferProper = queryBuffer[0..queryLen];
 
-    var queryArena = std.heap.ArenaAllocator.init(allocator);
+    var queryArena = std.heap.ArenaAllocator.init(bucket.allocator);
     const queryArenaAllocator = queryArena.allocator();
 
     const query = Query.parseRaw(queryArenaAllocator, queryBufferProper) catch |err| switch (err) {
@@ -107,7 +108,7 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
             return Result.Error;
         },
     };
-    const listHandle = allocator.create(ListHandle) catch return Result.OutOfMemory;
+    const listHandle = bucket.allocator.create(ListHandle) catch return Result.OutOfMemory;
     listHandle.* = ListHandle{
         .iterator = iterator,
         .arena = queryArena,
