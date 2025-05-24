@@ -14,6 +14,9 @@ const Index = struct {
     const DocumentLocation = struct {
         pageId: u64,
         offset: u16,
+        inline fn equal(self: *const DocumentLocation, other: *const DocumentLocation) bool {
+            return self.pageId == other.pageId and self.offset == other.offset;
+        }
     };
 
     const Node = struct {
@@ -388,6 +391,33 @@ const Index = struct {
         }
     }
 
+    fn delete(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
+        // Delete a document location from the index
+        var current = self.root;
+        while (current.isLeaf != true) {
+            current = current.traverseChildren(value);
+        }
+        const index = current.findMatchIndex(value);
+        if (index == null) return;
+        while (true) {
+            const locPair = current.locationPairs.items[index.*];
+            if (locPair.location.equal(&loc)) {
+                current.locationPairs.orderedRemove(index);
+                break;
+            }
+            index += 1;
+            if (index >= current.locationPairs.items.len) {
+                current = current.next;
+                index = 0;
+                if (current == null) break;
+            }
+            if (current.locationPairs.items[index.*].bsonValue.order(value) != .eq) {
+                break;
+            }
+        }
+        try current.persist();
+    }
+
     fn splitInternalNode(self: *Index, node: *Node) !*Node {
         // Split the internal node into two nodes
         const page = try self.bucket.createNewPage(.Index);
@@ -454,4 +484,26 @@ test "Index inserts" {
     try index.insert(BSONValue{ .int32 = .{ .value = 10 } }, .{ .pageId = 1, .offset = 10 });
     try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
     try index.insert(BSONValue{ .int32 = .{ .value = 12 } }, .{ .pageId = 1, .offset = 30 });
+}
+
+test "Index range" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_test.bucket");
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("bplus_test.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(testing.allocator, &bucket);
+    defer index.deinit(testing.allocator);
+    try index.insert(BSONValue{ .int32 = .{ .value = 10 } }, .{ .pageId = 1, .offset = 10 });
+    try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
+    try index.insert(BSONValue{ .int32 = .{ .value = 12 } }, .{ .pageId = 1, .offset = 30 });
+
+    var iter = try index.range(null, null);
+    while (true) {
+        const maybeLoc = try iter.next();
+        if (maybeLoc) |loc| {
+            std.debug.print("Found location: pageId={}, offset={}\n", .{ loc.pageId, loc.offset });
+        }
+    }
 }
