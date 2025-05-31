@@ -202,8 +202,11 @@ const Index = struct {
         }
 
         fn findMatchIndex(self: *const Node, value: BSONValue) ?usize {
-            for (self.keys.items, 0..) |key, i| {
-                switch (key.order(value)) {
+            // Avoid shadowing self.index fields by not using 'pair' or 'i' as variable names
+            var i: usize = 0;
+            while (i < self.locationPairs.items.len) : (i += 1) {
+                const loc_pair = self.locationPairs.items[i];
+                switch (loc_pair.bsonValue.order(value)) {
                     .lt => continue,
                     .gt => break,
                     .eq => return i,
@@ -241,19 +244,21 @@ const Index = struct {
         // Deinitialize the index
         self.root.deinit(ally);
         ally.destroy(self.root);
+        ally.destroy(self);
     }
 
-    pub fn create(ally: mem.Allocator, bucket: *Bucket) !Index {
+    pub fn create(ally: mem.Allocator, bucket: *Bucket) !*Index {
         // Create a new index
         const page = try bucket.createNewPage(.Index);
         page.data[0] = 1; // Leaf node
         try bucket.writePage(page);
-        var index = Index{
+        const index = try ally.create(Index);
+        index.* = Index{
             .bucket = bucket,
             .root = undefined,
             .allocator = ally,
         };
-        const node = try Node.init(ally, &index, page);
+        const node = try Node.init(ally, index, page);
         try node.persist();
         index.root = node;
         return index;
@@ -340,7 +345,7 @@ const Index = struct {
                 switch (locPair.bsonValue.order(value)) {
                     .lt => continue,
                     .gt => {
-                        insertAt = @max(i - 1, 0);
+                        insertAt = if (i == 0) 0 else @max(i - 1, 0);
                     },
                     .eq => {
                         insertAt = i;
@@ -391,29 +396,28 @@ const Index = struct {
         }
     }
 
-    fn delete(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
+    pub fn delete(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
         // Delete a document location from the index
-        var current = self.root;
+        var current: *Node = self.root;
         while (current.isLeaf != true) {
             current = current.traverseChildren(value);
         }
-        const index = current.findMatchIndex(value);
-        if (index == null) return;
+        var index = current.findMatchIndex(value) orelse return;
         while (true) {
-            const locPair = current.locationPairs.items[index.*];
+            if (index >= current.locationPairs.items.len) {
+                current = current.next orelse return;
+                index = 0;
+                continue;
+            }
+            const locPair = current.locationPairs.items[index];
             if (locPair.location.equal(&loc)) {
-                current.locationPairs.orderedRemove(index);
+                _ = current.locationPairs.orderedRemove(index);
+                break;
+            }
+            if (locPair.bsonValue.order(value) != .eq) {
                 break;
             }
             index += 1;
-            if (index >= current.locationPairs.items.len) {
-                current = current.next;
-                index = 0;
-                if (current == null) break;
-            }
-            if (current.locationPairs.items[index.*].bsonValue.order(value) != .eq) {
-                break;
-            }
         }
         try current.persist();
     }
@@ -479,17 +483,26 @@ test "Index inserts" {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
+    var prng = std.Random.DefaultPrng.init(blk: {
+        var seed: u64 = undefined;
+        try std.posix.getrandom(std.mem.asBytes(&seed));
+        break :blk seed;
+    });
+    const rand = prng.random();
+
     var index = try Index.create(testing.allocator, &bucket);
     defer index.deinit(testing.allocator);
-    try index.insert(BSONValue{ .int32 = .{ .value = 10 } }, .{ .pageId = 1, .offset = 10 });
-    try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
-    try index.insert(BSONValue{ .int32 = .{ .value = 12 } }, .{ .pageId = 1, .offset = 30 });
+    for (0..10000) |_| {
+        const value = BSONValue{ .int32 = .{ .value = rand.int(i32) } };
+        const loc = Index.DocumentLocation{ .pageId = rand.int(u64), .offset = rand.int(u16) };
+        try index.insert(value, loc);
+    }
 }
 
 test "Index range" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_test.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_test1.bucket");
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile("bplus_test.bucket") catch |err| {
+    defer std.fs.cwd().deleteFile("bplus_test1.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -500,10 +513,27 @@ test "Index range" {
     try index.insert(BSONValue{ .int32 = .{ .value = 12 } }, .{ .pageId = 1, .offset = 30 });
 
     var iter = try index.range(null, null);
-    while (true) {
-        const maybeLoc = try iter.next();
-        if (maybeLoc) |loc| {
-            std.debug.print("Found location: pageId={}, offset={}\n", .{ loc.pageId, loc.offset });
-        }
+    while (try iter.next()) |_| {
+        // std.debug.print("Found location: pageId={}, offset={}\n", .{ loc.pageId, loc.offset });
+    }
+}
+
+test "Index delete" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_test2.bucket");
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("bplus_test2.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(testing.allocator, &bucket);
+    defer index.deinit(testing.allocator);
+    try index.insert(BSONValue{ .int32 = .{ .value = 10 } }, .{ .pageId = 1, .offset = 10 });
+    try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
+    try index.insert(BSONValue{ .int32 = .{ .value = 15 } }, .{ .pageId = 1, .offset = 30 });
+
+    try index.delete(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
+    var iter = try index.range(null, .{ .int32 = .{ .value = 12 } });
+    while (try iter.next()) |loc| {
+        std.debug.print("Found no deleted location: pageId={}, offset={}\n", .{ loc.pageId, loc.offset });
     }
 }

@@ -85,17 +85,19 @@ const ListIterator = albedo.Bucket.ListIterator;
 
 const ListHandle = struct {
     iterator: *ListIterator,
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
 };
 
 pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterator: **ListHandle) Result {
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
     const queryBufferProper = queryBuffer[0..queryLen];
 
-    var queryArena = std.heap.ArenaAllocator.init(bucket.allocator);
-    const queryArenaAllocator = queryArena.allocator();
+    var arena = std.heap.ArenaAllocator.init(bucket.allocator);
+    const queryArena = arena.allocator().create(std.heap.ArenaAllocator) catch return Result.OutOfMemory;
+    queryArena.* = arena;
+    // const queryArenaAllocator = queryArena.allocator();
 
-    const query = Query.parseRaw(queryArenaAllocator, queryBufferProper) catch |err| switch (err) {
+    const query = Query.parseRaw(queryArena.allocator(), queryBufferProper) catch |err| switch (err) {
         else => |qErr| {
             std.debug.print("Failed to parse query, {any}", .{qErr});
             return Result.Error;

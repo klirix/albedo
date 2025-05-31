@@ -351,6 +351,27 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
+    pub fn format(
+        self: @This(),
+        comptime fmt: []const u8,
+        opts: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        switch (self) {
+            .string => try std.fmt.format(writer, "\"{s}\"", .{self.string.value}),
+            .double => try std.fmt.format(writer, "{d}", .{self.double.value}),
+            .int32 => try std.fmt.format(writer, "{d}", .{self.int32.value}),
+            .document => try self.document.format(fmt, opts, writer),
+            .array => try self.array.format(fmt, opts, writer),
+            .datetime => try std.fmt.format(writer, "{d}", .{self.datetime.value}),
+            .int64 => try std.fmt.format(writer, "{d}", .{self.int64.value}),
+            .binary => try std.fmt.format(writer, "Binary{{{s}}}", .{self.binary.value}),
+            .boolean => try std.fmt.format(writer, "{s}", .{if (self.boolean.value) "true" else "false"}),
+            .null => try writer.writeAll("null"),
+            .objectId => try std.fmt.format(writer, "ObjectId(\"{s}\")", .{&self.objectId.value.toString()}),
+        }
+    }
+
     pub fn toString() [:0]u8 {}
 
     pub inline fn size(self: *const BSONValue) u32 {
@@ -943,6 +964,27 @@ pub const BSONDocument = struct {
         return self.getPathRecursive(path);
     }
 
+    pub fn format(
+        self: BSONDocument,
+        comptime fmt: []const u8,
+        opts: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        var pairIter = self.iter();
+        try writer.writeAll("{ ");
+        var first = true;
+        while (pairIter.next()) |pair| {
+            if (!first) {
+                try writer.writeAll(", ");
+            }
+            first = false;
+            try writer.writeAll(pair.key);
+            try writer.writeAll(": ");
+            try pair.value.format(fmt, opts, writer);
+        }
+        try writer.writeAll(" }");
+    }
+
     fn getPathRecursive(self: BSONDocument, path: []const u8) ?BSONValue {
         const dotIdx = std.mem.indexOfScalar(u8, path, '.');
         const currentKey = if (dotIdx) |idx| path[0..idx] else path;
@@ -1095,6 +1137,20 @@ pub const BSONDocument = struct {
         defer allocator.free(self.buffer);
     }
 };
+
+test "format" {
+    const allocator = std.testing.allocator;
+    var doc = try BSONDocument.fromTuple(allocator, .{
+        .key = BSONValue{ .string = .{ .value = "test" } },
+    });
+    defer doc.deinit(allocator);
+
+    var arrList = std.ArrayList(u8).init(allocator);
+    defer arrList.deinit();
+    try doc.format("{s}", .{}, arrList.writer());
+
+    try std.testing.expectEqualStrings("{ key: \"test\" }", arrList.items);
+}
 
 test "BSONDocument write" {
     const allocator = std.testing.allocator;
