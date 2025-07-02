@@ -382,7 +382,7 @@ pub const Bucket = struct {
 
         // Write the data
         _ = try self.file.write(page.data);
-        // try self.file.sync(); // Ensure the write is flushed to disk
+        try self.file.sync(); // Ensure the write is flushed to disk
     }
 
     pub fn createNewPage(self: *Bucket, page_type: PageType) !*Page {
@@ -832,7 +832,7 @@ pub const Bucket = struct {
         while (try iterator.next()) |docRaw| {
             const doc = BSONDocument{ .buffer = docRaw.data };
             if (q.filters.len == 0 or q.match(&doc)) {
-                @branchHint(.likely);
+                // @branchHint(.likely);
                 try docList.append(doc);
             }
         }

@@ -571,6 +571,23 @@ pub const BSONValue = union(BSONValueType) {
         }
     }
 
+    pub fn appendWrite(self: *BSONValue, memory: []u8) void {
+        switch (self.*) {
+            .string => |s| s.write(memory),
+            .double => |d| d.write(memory),
+            .int32 => |d| d.write(memory),
+            .array, .document => |doc| doc.serializeToMemory(memory),
+            .datetime => |d| d.write(memory),
+            .int64 => |d| d.write(memory),
+            .binary => |d| d.write(memory),
+            .boolean => |d| d.write(memory),
+            .null => {
+                // Null type does not need to write any data
+            },
+            .objectId => |d| d.write(memory),
+        }
+    }
+
     pub inline fn read(memory: []const u8, pairType: BSONValueType) BSONValue {
         return switch (pairType) {
             .string => BSONValue{ .string = BSONString.read(memory) },
