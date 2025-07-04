@@ -182,22 +182,30 @@ const Index = struct {
             return try self.index.loadNode(current, self);
         }
 
-        fn findMatchIndex(self: *const Node, value: BSONValue) ?usize {
-            var i: usize = 0;
-            while (i < self.locationPairs.items.len) : (i += 1) {
-                const loc_pair = self.locationPairs.items[i];
-                switch (loc_pair.bsonValue.order(value)) {
-                    .lt => continue,
-                    .gt => break,
-                    .eq => return i,
-                }
+        fn findMatchIndex(self: *const Node, value: BSONValue) ?u16 {
+            const page = try self.index.bucket.loadPage(self.id);
+            var data = page.data;
+            var offset: u16 = 1 + 8 + 8;
+
+            while (data[offset] != 0) {
+                const current = BSONValue.read(data[offset + 1 ..], @enumFromInt((data[offset])));
+                if (current.order(value) == .eq) return offset;
+                offset += current.size() + @sizeOf(u64) + @sizeOf(u16);
             }
+
             return null;
         }
 
         fn findMatch(self: *const Node, value: BSONValue) ?DocumentLocation {
-            if (findMatchIndex(self, value)) |index| {
-                return self.locationPairs.items[index].location;
+            const page = try self.index.bucket.loadPage(self.id);
+            var data = page.data;
+            if (findMatchIndex(self, value)) |offset| {
+                offset += BSONValue.asessSize(data[offset + 1 ..], data[offset]);
+
+                return DocumentLocation{
+                    .pageId = mem.readInt(u64, data[offset .. offset + @sizeOf(u64)], .little),
+                    .offset = mem.readInt(u16, data[offset + @sizeOf(u64) .. offset + @sizeOf(u64) + @sizeOf(u16)], .little),
+                };
             }
             return null;
         }
