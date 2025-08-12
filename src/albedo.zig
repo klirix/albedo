@@ -10,7 +10,7 @@ const query = @import("query.zig");
 const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
 const ALBEDO_FLAGS = 0;
-const DEFAULT_PAGE_SIZE = 8192; // 8kB, or up to 64kB
+pub const DEFAULT_PAGE_SIZE = 8192; // 8kB, or up to 64kB
 
 const BucketHeader = struct {
     magic: [6]u8,

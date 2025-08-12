@@ -11,6 +11,8 @@ const Index = struct {
     root: *Node,
     allocator: mem.Allocator,
     nodeMap: std.AutoHashMap(u64, Node),
+    
+    const MAX_VALUE_SIZE = 512;
 
     const DocumentLocation = struct {
         pageId: u64,
@@ -50,6 +52,15 @@ const Index = struct {
         next: ?*Node = null,
         id: u64,
 
+        fn firstValue(self: *Node) ?BSONValue {
+            const offset: u16 = if (self.isLeaf) 1+8+8 else 1;
+            const valueType = self.page.data[offset];
+            if(valueType != 0) {
+                return BSONValue.read(self.page.data[offset+1..], valueType);
+            }
+            return value;
+        }
+
         fn addChild(self: *Node, value: BSONValue, childId: u64) void {
             const size = value.size();
             const insertionSize: u32 = size + @sizeOf(childId);
@@ -72,6 +83,16 @@ const Index = struct {
 
             offset += size;
             mem.writeInt(u64, data[offset..@sizeOf(u64)], childId, .little);
+        }
+
+        fn mitoseInto(self: *Node, other: *Node) void {
+            var offset: u16 = if (self.isLeaf) 1+8+8 else 1;
+            const minSplitOffset: comptime_int = @divFloor(albedo.DEFAULT_PAGE_SIZE,2) - @divFloor(MAX_VALUE_SIZE, 2);
+            while (offset < minSplitOffset) {
+                const currentSize: u16 = @truncate(BSONValue.asessSize(data[offset + 1 ..], @enumFromInt((data[offset]))));
+                offset += currentSize + if (self.isLeaf) @sizeOf(u64) + @sizeOf(u16) else @sizeOf(u64);
+            }
+
         }
 
         fn addLocation(self: *Node, value: BSONValue, loc: DocumentLocation) void {
@@ -134,32 +155,6 @@ const Index = struct {
         pub fn persist(self: *const Node) !void {
             // Write the node to the page
             const page = self.page;
-            var stream = std.io.fixedBufferStream(page.data);
-            var writer = stream.writer();
-            if (self.isLeaf) {
-                try writer.writeInt(u8, 1, .little);
-                const prevId = if (self.prev) |prevNode| prevNode.id else 0;
-                try writer.writeInt(u64, prevId, .little);
-                const nextId = if (self.next) |nextNode| nextNode.id else 0;
-                try writer.writeInt(u64, nextId, .little);
-                for (self.locationPairs.items) |pair| {
-                    try writer.writeInt(u8, @intFromEnum(pair.bsonValue), .little);
-
-                    try pair.bsonValue.write(writer);
-                    try writer.writeInt(u64, pair.location.pageId, .little);
-                    try writer.writeInt(u16, pair.location.offset, .little);
-                }
-            } else {
-                try writer.writeInt(u8, 0, .little);
-                if (self.children.items.len != 0) {
-                    try writer.writeInt(u64, self.children.items[0].id, .little);
-                    for (self.keys.items, 0..) |key, i| {
-                        try writer.writeInt(u8, @intFromEnum(key), .little);
-                        try key.write(writer);
-                        try writer.writeInt(u64, self.children.items[i + 1].id, .little);
-                    }
-                }
-            }
 
             try self.index.bucket.writePage(page);
         }
@@ -182,7 +177,7 @@ const Index = struct {
             return try self.index.loadNode(current, self);
         }
 
-        fn findMatchIndex(self: *const Node, value: BSONValue) ?u16 {
+        fn findMatchOffset(self: *const Node, value: BSONValue) ?u16 {
             const page = try self.index.bucket.loadPage(self.id);
             var data = page.data;
             var offset: u16 = 1 + 8 + 8;
@@ -199,7 +194,7 @@ const Index = struct {
         fn findMatch(self: *const Node, value: BSONValue) ?DocumentLocation {
             const page = try self.index.bucket.loadPage(self.id);
             var data = page.data;
-            if (findMatchIndex(self, value)) |offset| {
+            if (findMatchOffset(self, value)) |offset| {
                 offset += BSONValue.asessSize(data[offset + 1 ..], data[offset]);
 
                 return DocumentLocation{
@@ -425,23 +420,15 @@ const Index = struct {
         while (current.isLeaf != true) {
             current = current.traverseChildren(value);
         }
-        var index = current.findMatchIndex(value) orelse return;
-        while (true) {
-            if (index >= current.locationPairs.items.len) {
-                current = current.next orelse return;
-                index = 0;
-                continue;
-            }
-            const locPair = current.locationPairs.items[index];
-            if (locPair.location.equal(&loc)) {
-                _ = current.locationPairs.orderedRemove(index);
-                break;
-            }
-            if (locPair.bsonValue.order(value) != .eq) {
-                break;
-            }
-            index += 1;
-        }
+        var data = current.page.data;
+        var offset = current.findMatchOffset(value) orelse return;
+        var currValue = BSONValue.read(data[offset + 1 ..], data[offset]);
+        var currValueSize: u16 = @truncate(currValue.size());
+        var currLoc: DocumentLocation = .{
+            .pageId = mem.readInt(u64, data[offset + 1 + currValueSize .. offset + 1 + currValueSize + 8], .little),
+            .offset = mem.readInt(u16, data[offset + 1 + currValueSize + 8 .. offset + 1 + currValueSize + 8 + 2], .little),
+        };
+        while (currValue.order(value) != .gt) {}
         try current.persist();
     }
 
@@ -477,27 +464,19 @@ const Index = struct {
 
     fn splitLeafNode(self: *Index, node: *Node) !*Node {
         // Split the leaf node into two nodes
-        const page = try self.bucket.createNewPage(.Index);
-        const newNode = try Node.init(self.*.allocator, self, page, true);
-        const mid: usize = @divFloor(node.locationPairs.items.len, 2);
-        try newNode.locationPairs.appendSlice(node.locationPairs.items[mid..]);
-        node.locationPairs.shrinkRetainingCapacity(mid);
+        // find approx mid, copy the right part into the new node, assign next prevs appropriately
+        // add the new node record into the parent, if it exists, if not -- create new root
+        if (node.parent == null or self.root == node) {
+            var newRoot = self.createNode(false, null);
+            newRoot.addChild(node.firstValue(), node.id);
 
-        // Update the next and previous pointers
-        if (node.next) |next| {
-            next.prev = newNode;
-            newNode.next = next;
+            const newNode = self.createNode(true, newRoot);
+
         }
-        newNode.prev = node;
-        node.next = newNode;
 
-        if (node.parent == null) {
-            const newRoot = self.createNode(false, null);
+        if (node.parent) |parent| {
+            con
         }
-        try node.persist();
-        try newNode.persist();
-
-        return newNode;
     }
 };
 
