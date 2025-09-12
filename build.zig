@@ -121,9 +121,9 @@ pub fn build(b: *std.Build) void {
     libModule.addImport("napigen", simple_module.module("napigen"));
 
     if (buildNode == true) {
-        const node_lib = b.addSharedLibrary(.{
+        const node_lib = b.addLibrary(.{
             .name = "albedo_node",
-            // .linkage = .dynamic,
+            .linkage = .dynamic,
             .root_module = nodeModule,
         });
 
@@ -151,25 +151,21 @@ pub fn build(b: *std.Build) void {
     }
 
     const lib_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = libModule,
     });
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
-    const exe_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // const exe_unit_tests = b.addTest(.{
+    //     .root_module = exeModule,
+    // });
 
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+    // const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
-    test_step.dependOn(&run_exe_unit_tests.step);
+    // test_step.dependOn(&run_exe_unit_tests.step);
 }

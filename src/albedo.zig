@@ -171,14 +171,16 @@ pub const Page = struct {
 };
 
 const BucketInitErrors = error{
-    FileStatError,
     InvalidPath,
     InvalidDocId,
+    FileNotFound,
     FileOpenError,
     FileReadError,
+    FileWriteError,
     LoadIndexError,
     InitializationError,
     OutOfMemory,
+    UnexpectedError,
 };
 
 const tree = @import("btree.zig");
@@ -241,82 +243,114 @@ pub const Bucket = struct {
         autoVaccuum: bool = true,
     };
 
+    fn resolvePath(path: []const u8, ally: std.mem.Allocator) std.fs.Dir.RealPathAllocError![]const u8 {
+        if (std.fs.path.isAbsolute(path)) {
+            const dup = try ally.dupe(u8, path);
+            return dup;
+        }
+        const cwd = std.fs.cwd();
+        const abs_path = try cwd.realpathAlloc(ally, path);
+        return abs_path;
+    }
+
     pub fn openFile(ally: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
         return Bucket.openFileWithOptions(ally, path, .{});
     }
 
-    pub fn openFileWithOptions(ally: std.mem.Allocator, path: []const u8, options: OpenBucketOptions) BucketInitErrors!Bucket {
-        const stat: ?File.Stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
-            error.FileNotFound => null, // If the file doesn't exist, return null
-            // error.InvalidPath => return error.InvalidPath, // Return an error if the path is invalid
-            else => {
-                std.debug.print("Error opening file: {any}\n", .{err});
-                return BucketInitErrors.FileStatError; // Return null for any other errors
-            }, // Return any other errors
+    fn createEmptyDBFile(path: []const u8, ally: mem.Allocator) BucketInitErrors!Bucket {
+        const cwd = std.fs.cwd();
+        const new_file = switch (std.fs.path.isAbsolute(path)) {
+            true => std.fs.createFileAbsolute(path, .{}),
+
+            false => cwd.createFile(path, .{}),
+        } catch |err| {
+            std.debug.print("Failed to create file: {s}, error: {any}\n", .{ path, err });
+            return BucketInitErrors.FileOpenError;
         };
-        var file: File = undefined; // Change to a pointer for better management
-        if (stat) |s| {
-            // If the file exists, check if it's a directory
-            // std.debug.print("\nFile exists, opening...\n ", .{});
-            if (s.kind == .directory) {
-                return BucketInitErrors.InvalidPath; // Return an error if it's a directory
-            }
 
-            // Open the file for reading and writing
-            file = std.fs.cwd().openFile(
-                path,
-                .{ .mode = if (options.mode == .ReadWrite) .read_write else .read_only },
-            ) catch return BucketInitErrors.FileOpenError;
-            const header_bytes = file.reader().readBytesNoEof(BucketHeader.byteSize) catch return BucketInitErrors.FileReadError;
-            var bucket = Bucket{
-                .file = file,
-                .path = path,
-                .header = BucketHeader.read(header_bytes[0..BucketHeader.byteSize]),
-                .allocator = ally,
-                .pageCache = .init(ally),
-                .indexes = .init(ally),
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+        const abs_path = cwd.realpath(path, &path_buf) catch |err| {
+            std.debug.print("Failed to resolve path: {s}, error: {any}\n", .{ path, err });
+            return BucketInitErrors.UnexpectedError;
+        };
+
+        errdefer new_file.close();
+        var bucket = Bucket{
+            .file = new_file,
+            .path = abs_path,
+            .header = .init(),
+            .allocator = ally,
+            .pageCache = .init(ally),
+            .indexes = .init(ally),
+        };
+        bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
+
+        const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
+
+        bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
+
+        return bucket;
+    }
+
+    // Path may be relative or absolute
+    pub fn openFileWithOptions(ally: std.mem.Allocator, path: []const u8, options: OpenBucketOptions) BucketInitErrors!Bucket {
+        const cwd = std.fs.cwd();
+
+        var file = cwd.openFile(path, .{ .mode = if (options.mode == .ReadWrite) .read_write else .read_only }) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                if (options.mode != .ReadWrite) break :blk BucketInitErrors.FileNotFound;
+                return createEmptyDBFile(path, ally);
+            },
+            error.IsDir => return BucketInitErrors.InvalidPath,
+            else => return BucketInitErrors.FileOpenError,
+        } catch |err| return err;
+
+        const header_bytes = file.reader().readBytesNoEof(BucketHeader.byteSize) catch |err| {
+            file.close();
+            return switch (err) {
+                error.EndOfStream => BucketInitErrors.FileReadError,
+                else => BucketInitErrors.FileReadError,
             };
+        };
 
-            const meta = bucket.loadPage(0) catch return BucketInitErrors.FileReadError;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-            meta.loadIndices(&bucket.indexes) catch return BucketInitErrors.LoadIndexError;
+        const abs_path = cwd.realpath(path, &path_buf) catch |err| {
+            std.debug.print("Failed to resolve path: {s}, error: {any}\n", .{ path, err });
+            return BucketInitErrors.UnexpectedError;
+        };
 
-            if (options.buildIdIndex) {
-                // bucket.buildIndex("_id");
-            }
+        var bucket = Bucket{
+            .file = file,
+            .path = abs_path,
+            .header = .read(header_bytes[0..BucketHeader.byteSize]),
+            .allocator = ally,
+            .pageCache = .init(ally),
+            .indexes = .init(ally),
+        };
 
-            return bucket;
-        } else {
-            // std.debug.print("\nFile doesnt exists, creating...\n ", .{});
-            // If the file doesn't exist, create it
-            _ = std.fs.cwd().createFile(path, .{}) catch return BucketInitErrors.FileOpenError;
-
-            // Reopen the file for reading and writing
-            file = std.fs.cwd().openFile(path, .{ .mode = if (options.mode == .ReadWrite) .read_write else .read_only }) catch {
-                return BucketInitErrors.FileOpenError;
+        const meta = bucket.loadPage(0) catch |err| {
+            file.close();
+            ally.free(abs_path);
+            return switch (err) {
+                error.EndOfStream => BucketInitErrors.FileReadError,
+                else => BucketInitErrors.FileReadError,
             };
+        };
 
-            // std.debug.print("{d}", .{bytes_written});
-            var bucket = Bucket{
-                .file = file,
-                .path = path,
-                .header = BucketHeader.init(),
-                .allocator = ally,
-                .pageCache = .init(ally),
-                .indexes = .init(ally),
-            };
+        meta.loadIndices(&bucket.indexes) catch {
+            file.close();
+            ally.free(abs_path);
+            return BucketInitErrors.LoadIndexError;
+        };
 
-            bucket.flushHeader() catch return BucketInitErrors.FileReadError;
-
-            // Page 0 is the meta page
-            // It stores information about the indices and other metadata
-            const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.FileReadError;
-            bucket.writePage(meta) catch return BucketInitErrors.InitializationError;
-            // std.debug.print("Created meta page", .{});
-            // try bucket.indexes.put("_id", tree.BPlusTree.init(bucket.allocator));
-
-            return bucket;
+        if (options.buildIdIndex) {
+            // TODO: Implement _id index building
+            // try bucket.buildIndex("_id");
         }
+
+        return bucket;
     }
 
     fn flushHeader(self: *const Bucket) !void {
@@ -937,7 +971,7 @@ pub const Bucket = struct {
         defer self.allocator.free(tempFileName);
 
         var newBucket = try Bucket.openFile(self.allocator, tempFileName);
-        const cwd = std.fs.cwd();
+        const fs = std.fs;
         defer newBucket.deinit();
         // defer cwd.deleteFile(tempFileName) catch |err| {
         //     std.debug.print("Failed to delete temp file: {any}\n", .{err});
@@ -949,16 +983,16 @@ pub const Bucket = struct {
         }
         iterator.deinit();
         self.deinit();
-        cwd.deleteFile(self.path) catch |err| {
+        fs.deleteFileAbsolute(self.path) catch |err| {
             std.debug.print("Failed to delete old file: {any}\n", .{err});
             return err;
         };
-        cwd.rename(tempFileName, self.path) catch |err| {
+        fs.renameAbsolute(tempFileName, self.path) catch |err| {
             std.debug.print("Failed to rename temp file: {any}\n", .{err});
             return err;
         };
 
-        self.file = try cwd.openFile(self.path, .{ .mode = .read_write });
+        self.file = try fs.openFileAbsolute(self.path, .{ .mode = .read_write });
 
         try self.file.seekTo(0);
         var header_bytes = try self.file.reader().readBytesNoEof(64);
@@ -1099,7 +1133,7 @@ test "Bucket.delete" {
         \\}
     ));
 
-    var docs = try bucket.list(allocator, listQ);
+    var docs = try bucket.list(arena, listQ);
     const docCount = docs.len;
 
     // std.debug.print("Doc len before vacuum {d}\n", .{docCount});
@@ -1113,7 +1147,7 @@ test "Bucket.delete" {
     // Delete the document from the bucket
     _ = try bucket.delete(deleteQ);
 
-    docs = try bucket.list(allocator, listQ);
+    docs = try bucket.list(arena, listQ);
     const newDocCount = docs.len;
     // std.debug.print("Doc len after delete {d}\n", .{newDocCount});
 
@@ -1121,7 +1155,7 @@ test "Bucket.delete" {
 
     _ = try bucket.insert(doc);
 
-    docs = try bucket.list(allocator, listQ);
+    docs = try bucket.list(arena, listQ);
     const docCountAfterInsert = docs.len;
     // std.debug.print("Doc len after insert {d}\n", .{docCountAfterInsert});
     try std.testing.expect(docCountAfterInsert == docCount);
@@ -1163,10 +1197,10 @@ test "Deleted docs disappear after vacuum" {
         \\}
     ));
 
-    _ = try bucket.list(allocator, listQ);
-    // const docCount = docs.len;
+    const docs = try bucket.list(arena, listQ);
+    const docCount = docs.len;
 
-    // std.debug.print("Doc len before delete {d}\n", .{docCount});
+    std.debug.print("Doc len before delete {d}\n", .{docCount});
 
     const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
         \\{
@@ -1183,7 +1217,7 @@ test "Deleted docs disappear after vacuum" {
         return err;
     };
 
-    const afterVacuumDocs = try bucket.list(allocator, listQ);
+    const afterVacuumDocs = try bucket.list(arena, listQ);
     const afterVacuumDocCount = afterVacuumDocs.len;
 
     try std.testing.expect(afterVacuumDocCount == 1);
