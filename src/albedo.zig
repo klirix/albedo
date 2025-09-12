@@ -259,7 +259,7 @@ pub const Bucket = struct {
 
     fn createEmptyDBFile(path: []const u8, ally: mem.Allocator) BucketInitErrors!Bucket {
         const cwd = std.fs.cwd();
-        const new_file = switch (std.fs.path.isAbsolute(path)) {
+        var new_file = switch (std.fs.path.isAbsolute(path)) {
             true => std.fs.createFileAbsolute(path, .{}),
 
             false => cwd.createFile(path, .{}),
@@ -275,10 +275,15 @@ pub const Bucket = struct {
             return BucketInitErrors.UnexpectedError;
         };
 
-        errdefer new_file.close();
+        new_file.close();
+        new_file = std.fs.openFileAbsolute(abs_path, .{ .mode = .read_write }) catch |err| {
+            std.debug.print("Failed to open newly created file: {s}, error: {any}\n", .{ abs_path, err });
+            return BucketInitErrors.FileOpenError;
+        };
+
         var bucket = Bucket{
             .file = new_file,
-            .path = abs_path,
+            .path = ally.dupe(u8, abs_path[0..]) catch return BucketInitErrors.OutOfMemory,
             .header = .init(),
             .allocator = ally,
             .pageCache = .init(ally),
@@ -323,7 +328,7 @@ pub const Bucket = struct {
 
         var bucket = Bucket{
             .file = file,
-            .path = abs_path,
+            .path = ally.dupe(u8, abs_path[0..]) catch return BucketInitErrors.OutOfMemory,
             .header = .read(header_bytes[0..BucketHeader.byteSize]),
             .allocator = ally,
             .pageCache = .init(ally),
@@ -1041,7 +1046,13 @@ test "Bucket.insert" {
         \\}
     ));
 
-    const res1 = try bucket.list(allocator, q1);
+    var res1list = std.ArrayList(BSONDocument).init(allocator);
+    defer res1list.deinit();
+    var res1iter = try bucket.listIterate(&arena, q1);
+    while (try res1iter.next(res1iter)) |docItem| {
+        try res1list.append(docItem);
+    }
+    const res1 = res1list.items;
 
     try testing.expect(res1.len == 1);
     try testing.expectEqualStrings(res1[0].get("name").?.string.value, "Alice");
@@ -1052,9 +1063,14 @@ test "Bucket.insert" {
         \\}
     ));
 
-    const res2 = try bucket.list(allocator, q2);
+    var res2list = std.ArrayList(BSONDocument).init(allocator);
+    defer res2list.deinit();
+    var res2iter = try bucket.listIterate(&arena, q2);
+    while (try res2iter.next(res2iter)) |docItem| {
+        try res2list.append(docItem);
+    }
+    const res2 = res2list.items;
 
-    // std.debug.print("{s}\n", .{res1[0]});
     try testing.expectEqual(res1.len, res2.len);
     try testing.expectEqualStrings(res1[0].get("name").?.string.value, "Alice");
 
@@ -1133,7 +1149,13 @@ test "Bucket.delete" {
         \\}
     ));
 
-    var docs = try bucket.list(arena, listQ);
+    var docsList = std.ArrayList(BSONDocument).init(allocator);
+    defer docsList.deinit();
+    var docsIter = try bucket.listIterate(&arena, listQ);
+    while (try docsIter.next(docsIter)) |docItem| {
+        try docsList.append(docItem);
+    }
+    const docs = docsList.items;
     const docCount = docs.len;
 
     // std.debug.print("Doc len before vacuum {d}\n", .{docCount});
@@ -1147,16 +1169,28 @@ test "Bucket.delete" {
     // Delete the document from the bucket
     _ = try bucket.delete(deleteQ);
 
-    docs = try bucket.list(arena, listQ);
-    const newDocCount = docs.len;
+    var newDocsList = std.ArrayList(BSONDocument).init(allocator);
+    defer newDocsList.deinit();
+    var newDocsIter = try bucket.listIterate(&arena, listQ);
+    while (try newDocsIter.next(newDocsIter)) |docItem| {
+        try newDocsList.append(docItem);
+    }
+    const newDocs = newDocsList.items;
+    const newDocCount = newDocs.len;
     // std.debug.print("Doc len after delete {d}\n", .{newDocCount});
 
     try std.testing.expect(newDocCount < docCount);
 
     _ = try bucket.insert(doc);
 
-    docs = try bucket.list(arena, listQ);
-    const docCountAfterInsert = docs.len;
+    var afterInsertList = std.ArrayList(BSONDocument).init(allocator);
+    defer afterInsertList.deinit();
+    var afterInsertIter = try bucket.listIterate(&arena, listQ);
+    while (try afterInsertIter.next(afterInsertIter)) |docItem| {
+        try afterInsertList.append(docItem);
+    }
+    const docsAfterInsert = afterInsertList.items;
+    const docCountAfterInsert = docsAfterInsert.len;
     // std.debug.print("Doc len after insert {d}\n", .{docCountAfterInsert});
     try std.testing.expect(docCountAfterInsert == docCount);
     _ = try bucket.delete(listQ);
@@ -1197,7 +1231,13 @@ test "Deleted docs disappear after vacuum" {
         \\}
     ));
 
-    const docs = try bucket.list(arena, listQ);
+    var docsList = std.ArrayList(BSONDocument).init(allocator);
+    defer docsList.deinit();
+    var docsIter = try bucket.listIterate(&arena, listQ);
+    while (try docsIter.next(docsIter)) |docItem| {
+        try docsList.append(docItem);
+    }
+    const docs = docsList.items;
     const docCount = docs.len;
 
     std.debug.print("Doc len before delete {d}\n", .{docCount});
@@ -1217,7 +1257,13 @@ test "Deleted docs disappear after vacuum" {
         return err;
     };
 
-    const afterVacuumDocs = try bucket.list(arena, listQ);
+    var afterVacuumList = std.ArrayList(BSONDocument).init(allocator);
+    defer afterVacuumList.deinit();
+    var afterVacuumIter = try bucket.listIterate(&arena, listQ);
+    while (try afterVacuumIter.next(afterVacuumIter)) |docItem| {
+        try afterVacuumList.append(docItem);
+    }
+    const afterVacuumDocs = afterVacuumList.items;
     const afterVacuumDocCount = afterVacuumDocs.len;
 
     try std.testing.expect(afterVacuumDocCount == 1);
