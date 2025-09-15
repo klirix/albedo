@@ -60,7 +60,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const buildOptions = b.addOptions();
+
     const isAndroid = b.option(bool, "android", "Build with android libc");
+
+    buildOptions.addOption(bool, "isAndroid", isAndroid orelse false);
+    libModule.addOptions("build_options", buildOptions);
 
     if (buildStatic != true and buildNode != true) {
         // Build a shared library by default
@@ -80,6 +85,8 @@ pub fn build(b: *std.Build) void {
 
         if (isAndroid == true) {
             dynamic.linkLibC();
+            dynamic.link_z_max_page_size = 16 << 10;
+            dynamic.link_z_common_page_size = 16 << 10;
             dynamic.link_emit_relocs = true;
             dynamic.link_eh_frame_hdr = true;
             dynamic.link_function_sections = true;

@@ -3,6 +3,7 @@ const testing = std.testing;
 const albedo = @import("./albedo.zig");
 const bson = @import("./bson.zig");
 const Query = @import("./query.zig").Query;
+const buildOptions = @import("build_options");
 
 const Bucket = albedo.Bucket;
 
