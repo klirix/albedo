@@ -60,8 +60,7 @@ const BucketHeader = struct {
         return header;
     }
 
-    pub fn write(self: *const BucketHeader, writer: anytype) !void {
-
+    pub fn write(self: *const BucketHeader, writer: *std.Io.Writer) !void {
         // var buffer: [64]u8 = [_]u8{0} ** 64;
         _ = try writer.write(ALBEDO_MAGIC);
         _ = try writer.writeByte(self.version);
@@ -303,15 +302,23 @@ pub const Bucket = struct {
         const cwd = std.fs.cwd();
 
         var file = cwd.openFile(path, .{ .mode = if (options.mode == .ReadWrite) .read_write else .read_only }) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                if (options.mode != .ReadWrite) break :blk BucketInitErrors.FileNotFound;
+            error.FileNotFound => {
+                if (options.mode != .ReadWrite) return BucketInitErrors.FileNotFound;
                 return createEmptyDBFile(path, ally);
             },
             error.IsDir => return BucketInitErrors.InvalidPath,
             else => return BucketInitErrors.FileOpenError,
-        } catch |err| return err;
+        };
 
-        const header_bytes = file.reader().readBytesNoEof(BucketHeader.byteSize) catch |err| {
+        var reader_buffer: [1024]u8 = undefined;
+
+        var header_bytes: [BucketHeader.byteSize]u8 = undefined;
+
+        var reader_r = file.reader(&reader_buffer);
+
+        const reader = &reader_r.interface;
+
+        reader.readSliceAll(&header_bytes) catch |err| {
             file.close();
             return switch (err) {
                 error.EndOfStream => BucketInitErrors.FileReadError,
@@ -361,8 +368,16 @@ pub const Bucket = struct {
     fn flushHeader(self: *const Bucket) !void {
         // Flush the header to disk
         try self.file.seekTo(0);
-        const writer = self.file.writer();
+
+        var buf: [1024]u8 = undefined;
+
+        var writer_r = self.file.writer(&buf);
+
+        try writer_r.seekTo(0);
+
+        const writer = &writer_r.interface;
         _ = try self.header.write(writer);
+        try writer.flush();
         // try self.file.sync(); // Ensure the write is flushed to disk
     }
 
@@ -382,12 +397,16 @@ pub const Bucket = struct {
             return page;
         }
 
-        const reader = self.file.reader();
+        var readerBuffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
+        var pageBuffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
+
+        var reader_r = self.file.reader(&readerBuffer);
+        const reader = &reader_r.interface;
 
         const offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
-        try self.file.seekTo(offset);
-        const header_bytes = try reader.readBytesNoEof(PageHeader.byteSize);
-        const header = PageHeader.read(&header_bytes);
+        try reader_r.seekTo(offset);
+        try reader.readSliceAll(pageBuffer[0..BucketHeader.byteSize]);
+        const header = PageHeader.read(pageBuffer[0..BucketHeader.byteSize]);
 
         const page = try self.allocator.create(Page);
         page.* = try Page.init(self.allocator, self, header);
@@ -396,11 +415,7 @@ pub const Bucket = struct {
             return PageError.InvalidPageId;
         }
 
-        const bytes_read = try reader.readAll(page.data);
-        if (bytes_read != page.data.len) {
-            std.debug.print("PageNotFound: Read {d} bytes instead of {d}, at offset: {d}\n", .{ bytes_read, page.data.len, try self.file.getPos() });
-            return PageError.PageNotFound;
-        }
+        try reader.readSliceAll(page.data);
 
         try self.pageCache.put(page_id, page);
 
@@ -412,15 +427,21 @@ pub const Bucket = struct {
         const offset = 64 + (page.header.page_id * DEFAULT_PAGE_SIZE);
 
         // Seek to the correct position
-        try self.file.seekTo(offset);
+
+        var writer_buffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
+
+        var writer_r = self.file.writer(&writer_buffer);
+        const writer = &writer_r.interface;
+        try writer_r.seekTo(offset);
 
         // Write the header
         const header_bytes: [header_size]u8 = PageHeader.write(&page.header);
         // Ensure the header is written correctly
-        _ = try self.file.write(&header_bytes);
+        _ = try writer.write(&header_bytes);
 
         // Write the data
-        _ = try self.file.write(page.data);
+        _ = try writer.write(page.data);
+        try writer.flush();
         // try self.file.sync(); // Ensure the write is flushed to disk
     }
 
@@ -467,7 +488,7 @@ pub const Bucket = struct {
             return header;
         }
 
-        pub fn write(self: DocHeader, writer: anytype) !void {
+        pub fn write(self: DocHeader, writer: *std.Io.Writer) !void {
             // Write the header to the writer
             try writer.writeInt(u96, self.doc_id, .little);
             try writer.writeInt(u8, self.is_deleted, .little);
@@ -780,11 +801,11 @@ pub const Bucket = struct {
         pub fn prequery(self: *ListIterator) !void {
             // Preload the documents into the list
             const ally = self.arena.allocator();
-            var docList = std.ArrayList(BSONDocument).init(ally);
+            var docList = std.ArrayList(BSONDocument){};
             while (try self.scanner.next()) |scanRes| {
                 const bsonDoc = BSONDocument{ .buffer = scanRes.data };
                 if (self.query.filters.len == 0 or self.query.match(&bsonDoc)) {
-                    try docList.append(bsonDoc);
+                    try docList.append(ally, bsonDoc);
                 }
             }
             const resultSlice = docList.items;
@@ -932,7 +953,7 @@ pub const Bucket = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        var locations = std.ArrayList(DocumentMeta).init(allocator);
+        var locations = std.ArrayList(DocumentMeta){};
         var iterator = try ScanIterator.init(self, allocator);
         self.rwlock.lockShared();
 
@@ -941,7 +962,7 @@ pub const Bucket = struct {
             const deletable: BSONDocument = .{ .buffer = doc.data };
             const matched = q.match(&deletable);
             if (!matched) continue;
-            try locations.append(.{
+            try locations.append(allocator, .{
                 .header = doc.header,
                 .page_id = doc.page_id,
                 .offset = doc.offset,
@@ -949,7 +970,9 @@ pub const Bucket = struct {
         }
         self.rwlock.unlockShared();
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
-        const writer = self.file.writer();
+        var writerBuffer: [512]u8 = undefined;
+        var writer_r = self.file.writer(&writerBuffer);
+        const writer = &writer_r.interface;
         self.rwlock.lock();
         defer self.rwlock.unlock();
         for (locations.items) |*location| {
@@ -1000,7 +1023,10 @@ pub const Bucket = struct {
         self.file = try fs.openFileAbsolute(self.path, .{ .mode = .read_write });
 
         try self.file.seekTo(0);
-        var header_bytes = try self.file.reader().readBytesNoEof(64);
+        var readerBuffer: [1024]u8 = undefined;
+        var header_bytes: [BucketHeader.byteSize]u8 = undefined;
+        var reader = self.file.reader(&readerBuffer).interface;
+        try reader.readSliceAll(&header_bytes);
         self.header = BucketHeader.read(header_bytes[0..]);
         self.pageCache = .init(self.allocator);
     }
@@ -1046,11 +1072,11 @@ test "Bucket.insert" {
         \\}
     ));
 
-    var res1list = std.ArrayList(BSONDocument).init(allocator);
-    defer res1list.deinit();
+    var res1list = std.ArrayList(BSONDocument){};
+    defer res1list.deinit(allocator);
     var res1iter = try bucket.listIterate(&arena, q1);
     while (try res1iter.next(res1iter)) |docItem| {
-        try res1list.append(docItem);
+        try res1list.append(allocator, docItem);
     }
     const res1 = res1list.items;
 
@@ -1063,11 +1089,11 @@ test "Bucket.insert" {
         \\}
     ));
 
-    var res2list = std.ArrayList(BSONDocument).init(allocator);
-    defer res2list.deinit();
+    var res2list = std.ArrayList(BSONDocument){};
+    defer res2list.deinit(allocator);
     var res2iter = try bucket.listIterate(&arena, q2);
     while (try res2iter.next(res2iter)) |docItem| {
-        try res2list.append(docItem);
+        try res2list.append(allocator, docItem);
     }
     const res2 = res2list.items;
 
@@ -1086,9 +1112,9 @@ test "Page overflow" {
     defer arena.deinit();
     var bucket = try Bucket.openFile(allocator, "overflow.bucket");
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile("overflow.bucket") catch |err| {
-        std.debug.print("Failed to delete test file: {any}\n", .{err});
-    };
+    // defer std.fs.cwd().deleteFile("overflow.bucket") catch |err| {
+    //     std.debug.print("Failed to delete test file: {any}\n", .{err});
+    // };
     const jsonBuf = try testing.allocator.alloc(u8, 300);
     defer testing.allocator.free(jsonBuf);
     for (0..900) |i| {
@@ -1110,11 +1136,11 @@ test "Page overflow" {
         \\}
     ));
 
-    var res3list = std.ArrayList(BSONDocument).init(allocator);
-    defer res3list.deinit();
+    var res3list = std.ArrayList(BSONDocument){};
+    defer res3list.deinit(allocator);
     var res3iter = try bucket.listIterate(&arena, q1);
     while (try res3iter.next(res3iter)) |doc| {
-        try res3list.append(doc);
+        try res3list.append(allocator, doc);
     }
     const res3 = res3list.items;
 
@@ -1149,11 +1175,11 @@ test "Bucket.delete" {
         \\}
     ));
 
-    var docsList = std.ArrayList(BSONDocument).init(allocator);
-    defer docsList.deinit();
+    var docsList = std.ArrayList(BSONDocument){};
+    defer docsList.deinit(allocator);
     var docsIter = try bucket.listIterate(&arena, listQ);
     while (try docsIter.next(docsIter)) |docItem| {
-        try docsList.append(docItem);
+        try docsList.append(allocator, docItem);
     }
     const docs = docsList.items;
     const docCount = docs.len;
@@ -1169,11 +1195,11 @@ test "Bucket.delete" {
     // Delete the document from the bucket
     _ = try bucket.delete(deleteQ);
 
-    var newDocsList = std.ArrayList(BSONDocument).init(allocator);
-    defer newDocsList.deinit();
+    var newDocsList = std.ArrayList(BSONDocument){};
+    defer newDocsList.deinit(allocator);
     var newDocsIter = try bucket.listIterate(&arena, listQ);
     while (try newDocsIter.next(newDocsIter)) |docItem| {
-        try newDocsList.append(docItem);
+        try newDocsList.append(allocator, docItem);
     }
     const newDocs = newDocsList.items;
     const newDocCount = newDocs.len;
@@ -1183,11 +1209,11 @@ test "Bucket.delete" {
 
     _ = try bucket.insert(doc);
 
-    var afterInsertList = std.ArrayList(BSONDocument).init(allocator);
-    defer afterInsertList.deinit();
+    var afterInsertList = std.ArrayList(BSONDocument){};
+    defer afterInsertList.deinit(allocator);
     var afterInsertIter = try bucket.listIterate(&arena, listQ);
     while (try afterInsertIter.next(afterInsertIter)) |docItem| {
-        try afterInsertList.append(docItem);
+        try afterInsertList.append(allocator, docItem);
     }
     const docsAfterInsert = afterInsertList.items;
     const docCountAfterInsert = docsAfterInsert.len;
@@ -1231,11 +1257,11 @@ test "Deleted docs disappear after vacuum" {
         \\}
     ));
 
-    var docsList = std.ArrayList(BSONDocument).init(allocator);
-    defer docsList.deinit();
+    var docsList = std.ArrayList(BSONDocument){};
+    defer docsList.deinit(allocator);
     var docsIter = try bucket.listIterate(&arena, listQ);
     while (try docsIter.next(docsIter)) |docItem| {
-        try docsList.append(docItem);
+        try docsList.append(allocator, docItem);
     }
     const docs = docsList.items;
     const docCount = docs.len;
@@ -1257,11 +1283,11 @@ test "Deleted docs disappear after vacuum" {
         return err;
     };
 
-    var afterVacuumList = std.ArrayList(BSONDocument).init(allocator);
-    defer afterVacuumList.deinit();
+    var afterVacuumList = std.ArrayList(BSONDocument){};
+    defer afterVacuumList.deinit(allocator);
     var afterVacuumIter = try bucket.listIterate(&arena, listQ);
     while (try afterVacuumIter.next(afterVacuumIter)) |docItem| {
-        try afterVacuumList.append(docItem);
+        try afterVacuumList.append(allocator, docItem);
     }
     const afterVacuumDocs = afterVacuumList.items;
     const afterVacuumDocCount = afterVacuumDocs.len;

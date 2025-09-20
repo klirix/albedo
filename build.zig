@@ -12,10 +12,10 @@ const lib_dir = ndkBase ++ "/lib";
 fn createLibCFile(b: *std.Build, arch: []const u8) ![]const u8 {
     const fname = b.fmt("android-{s}.conf", .{arch});
 
-    var contents = std.ArrayList(u8).init(b.allocator);
+    var contents = std.ArrayList(u8);
     errdefer contents.deinit();
 
-    var writer = contents.writer();
+    var writer = contents.writer(b.allocator);
 
     //  The directory that contains `stdlib.h`.
     //  On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null

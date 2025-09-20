@@ -772,8 +772,8 @@ pub const BSONDocument = struct {
     }
 
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
-        var pairs = std.ArrayList(u8).init(allocator);
-        var writer = pairs.writer();
+        var pairs = std.ArrayList(u8){};
+        var writer = pairs.writer(allocator);
         try writer.writeInt(u32, 0, .little); // Placeholder for length
         if (try json.next() != .object_begin) {
             return error.InvalidJSON;
@@ -850,7 +850,7 @@ pub const BSONDocument = struct {
         }
         std.mem.writeInt(u32, pairs.items[0..4], @truncate(pairs.items.len + 1), .little);
         try writer.writeByte(0); // Null terminator for the document
-        return pairs.toOwnedSlice();
+        return pairs.toOwnedSlice(allocator);
     }
 
     const PairIterator = struct {
@@ -879,8 +879,8 @@ pub const BSONDocument = struct {
     }
 
     pub fn fromPairs(allocator: mem.Allocator, pairs: []BSONKeyValuePair) !BSONDocument {
-        var list = std.ArrayList(u8).init(allocator);
-        const writer = list.writer();
+        var list = std.ArrayList(u8){};
+        const writer = list.writer(allocator);
         try writer.writeInt(u32, 0, .little);
 
         for (pairs) |pair| {
@@ -893,7 +893,7 @@ pub const BSONDocument = struct {
 
         std.mem.writeInt(u32, list.items[0..4], @as(u32, @truncate(list.items.len)), .little);
 
-        return BSONDocument{ .buffer = try list.toOwnedSlice() };
+        return BSONDocument{ .buffer = try list.toOwnedSlice(allocator) };
     }
 
     pub fn write(self: *const BSONDocument, writer: anytype) !void {
@@ -1145,23 +1145,23 @@ test "format" {
     });
     defer doc.deinit(allocator);
 
-    var arrList = std.ArrayList(u8).init(allocator);
-    defer arrList.deinit();
-    try doc.format("{s}", .{}, arrList.writer());
+    var arrList = std.ArrayList(u8){};
+    defer arrList.deinit(allocator);
+    try doc.format("{s}", .{}, arrList.writer(allocator));
 
     try std.testing.expectEqualStrings("{ key: \"test\" }", arrList.items);
 }
 
 test "BSONDocument write" {
     const allocator = std.testing.allocator;
-    var list = std.ArrayList(u8).init(allocator);
-    defer list.deinit();
+    var list = std.ArrayList(u8){};
+    defer list.deinit(allocator);
     var doc = BSONDocument.initEmpty();
     doc = try doc.set(allocator, "test", .{ .string = .{ .value = "test" } });
     defer doc.deinit(allocator);
     // const actual = allocator.alloc(u8, 100) catch unreachable;
 
-    try doc.write(list.writer());
+    try doc.write(list.writer(allocator));
     const expected_string = ("\x14\x00\x00\x00\x02test\x00\x05\x00\x00\x00test\x00\x00");
     try std.testing.expectEqualSlices(u8, expected_string, list.allocatedSlice()[0..doc.buffer.len]);
 }
