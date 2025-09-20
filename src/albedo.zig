@@ -301,7 +301,7 @@ pub const Bucket = struct {
     pub fn openFileWithOptions(ally: std.mem.Allocator, path: []const u8, options: OpenBucketOptions) BucketInitErrors!Bucket {
         const cwd = std.fs.cwd();
 
-        var file = cwd.openFile(path, .{ .mode = if (options.mode == .ReadWrite) .read_write else .read_only }) catch |err| switch (err) {
+        var file = cwd.openFile(path, .{ .mode = if (options.mode == .ReadOnly) .read_only else .read_write }) catch |err| switch (err) {
             error.FileNotFound => {
                 if (options.mode != .ReadWrite) return BucketInitErrors.FileNotFound;
                 return createEmptyDBFile(path, ally);
@@ -1001,9 +1001,9 @@ pub const Bucket = struct {
         var newBucket = try Bucket.openFile(self.allocator, tempFileName);
         const fs = std.fs;
         defer newBucket.deinit();
-        // defer cwd.deleteFile(tempFileName) catch |err| {
-        //     std.debug.print("Failed to delete temp file: {any}\n", .{err});
-        // };
+        defer fs.deleteFileAbsolute(tempFileName) catch |err| {
+            std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
+        };
         var iterator = try ScanIterator.init(self, self.allocator);
         while (try iterator.next()) |doc| {
             const newDoc = bson.BSONDocument.init(doc.data);
