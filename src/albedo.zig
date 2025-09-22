@@ -316,9 +316,7 @@ pub const Bucket = struct {
 
         var reader_r = file.reader(&reader_buffer);
 
-        const reader = &reader_r.interface;
-
-        reader.readSliceAll(&header_bytes) catch |err| {
+        _ = reader_r.read(&header_bytes) catch |err| {
             file.close();
             return switch (err) {
                 error.EndOfStream => BucketInitErrors.FileReadError,
@@ -398,15 +396,16 @@ pub const Bucket = struct {
         }
 
         var readerBuffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
-        var pageBuffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
 
         var reader_r = self.file.reader(&readerBuffer);
-        const reader = &reader_r.interface;
+        // const reader = &reader_r.interface;
 
         const offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
         try reader_r.seekTo(offset);
-        try reader.readSliceAll(pageBuffer[0..BucketHeader.byteSize]);
-        const header = PageHeader.read(pageBuffer[0..BucketHeader.byteSize]);
+
+        var header_bytes: [PageHeader.byteSize]u8 = undefined;
+        _ = try reader_r.read(&header_bytes);
+        const header = PageHeader.read(&header_bytes);
 
         const page = try self.allocator.create(Page);
         page.* = try Page.init(self.allocator, self, header);
@@ -415,7 +414,7 @@ pub const Bucket = struct {
             return PageError.InvalidPageId;
         }
 
-        try reader.readSliceAll(page.data);
+        _ = try reader_r.read(page.data);
 
         try self.pageCache.put(page_id, page);
 
@@ -709,8 +708,9 @@ pub const Bucket = struct {
 
             const header = std.mem.bytesToValue(DocHeader, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)]);
             if (header.reserved != 0 or header.is_deleted > 1) {
-                std.log.err("Doc {d} header is corrupted:\nAt page: {d} position: {x} header looks like: {any}", .{ @sizeOf(DocHeader), self.page.header.page_id, self.offset, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)] });
+                std.log.err("Doc header is corrupted:\nAt page: {d} position: {x} header looks like: {x}\n", .{ self.page.header.page_id, self.offset, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)] });
                 // @panic("Header is corrupted");
+                std.log.err("page data: {x}\n", .{self.page.data[0..128]});
 
                 return error.InvalidHeader;
             }
@@ -793,6 +793,7 @@ pub const Bucket = struct {
         bucket: *Bucket,
         query: query.Query,
         index: usize = 0,
+
         scanner: ScanIterator,
         limitLeft: ?u64 = null,
         offsetLeft: u64 = 0,
@@ -801,9 +802,9 @@ pub const Bucket = struct {
         pub fn prequery(self: *ListIterator) !void {
             // Preload the documents into the list
             const ally = self.arena.allocator();
-            var docList = std.ArrayList(BSONDocument){};
+            var docList: std.ArrayList(BSONDocument) = .{};
             while (try self.scanner.next()) |scanRes| {
-                const bsonDoc = BSONDocument{ .buffer = scanRes.data };
+                const bsonDoc: BSONDocument = .{ .buffer = scanRes.data };
                 if (self.query.filters.len == 0 or self.query.match(&bsonDoc)) {
                     try docList.append(ally, bsonDoc);
                 }
@@ -814,8 +815,6 @@ pub const Bucket = struct {
             }
 
             if (self.query.sector) |sector| {
-                // std.debug.print("Sector: {any}\n", .{sector});
-                // std.debug.print("Result slice: {any}\n", .{resultSlice});
                 if (sector.offset) |offset| {
                     std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[@truncate(offset)..]);
                 }
@@ -846,7 +845,7 @@ pub const Bucket = struct {
                     return error.ScanError;
                 }
             } orelse return null;
-            const bsonDoc = BSONDocument{ .buffer = doc.data };
+            const bsonDoc: BSONDocument = .{ .buffer = doc.data };
             if (self.query.match(&bsonDoc) and self.offsetLeft == 0) {
                 if (self.limitLeft != null) self.limitLeft = self.limitLeft.? - 1;
                 return bsonDoc;
@@ -869,8 +868,10 @@ pub const Bucket = struct {
             .bucket = self,
             .arena = arena,
             .query = q,
+
             .docList = undefined,
             .scanner = try ScanIterator.init(self, ally),
+            .index = 0,
         };
         if (q.sortConfig != null) {
             try rc.prequery();
@@ -978,11 +979,11 @@ pub const Bucket = struct {
         for (locations.items) |*location| {
             _ = self.pageCache.remove(location.page_id);
             location.header.is_deleted = 1;
-            var file = self.file;
             const offset = BucketHeader.byteSize + @sizeOf(PageHeader) + (location.page_id * DEFAULT_PAGE_SIZE);
-            try file.seekTo(offset + location.offset);
+            try writer_r.seekTo(offset + location.offset);
             try location.header.write(writer);
         }
+        try writer.flush();
 
         self.header.doc_count -= locations.items.len;
         self.header.deleted_count += locations.items.len;
@@ -1001,9 +1002,9 @@ pub const Bucket = struct {
         var newBucket = try Bucket.openFile(self.allocator, tempFileName);
         const fs = std.fs;
         defer newBucket.deinit();
-        defer fs.deleteFileAbsolute(tempFileName) catch |err| {
-            std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
-        };
+        // defer fs.deleteFileAbsolute(tempFileName) catch |err| {
+        //     std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
+        // };
         var iterator = try ScanIterator.init(self, self.allocator);
         while (try iterator.next()) |doc| {
             const newDoc = bson.BSONDocument.init(doc.data);
@@ -1025,9 +1026,9 @@ pub const Bucket = struct {
         try self.file.seekTo(0);
         var readerBuffer: [1024]u8 = undefined;
         var header_bytes: [BucketHeader.byteSize]u8 = undefined;
-        var reader = self.file.reader(&readerBuffer).interface;
-        try reader.readSliceAll(&header_bytes);
-        self.header = BucketHeader.read(header_bytes[0..]);
+        var reader = self.file.reader(&readerBuffer);
+        _ = try reader.read(&header_bytes);
+        self.header = BucketHeader.read(&header_bytes);
         self.pageCache = .init(self.allocator);
     }
 
@@ -1112,9 +1113,9 @@ test "Page overflow" {
     defer arena.deinit();
     var bucket = try Bucket.openFile(allocator, "overflow.bucket");
     defer bucket.deinit();
-    // defer std.fs.cwd().deleteFile("overflow.bucket") catch |err| {
-    //     std.debug.print("Failed to delete test file: {any}\n", .{err});
-    // };
+    defer std.fs.cwd().deleteFile("overflow.bucket") catch |err| {
+        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    };
     const jsonBuf = try testing.allocator.alloc(u8, 300);
     defer testing.allocator.free(jsonBuf);
     for (0..900) |i| {
@@ -1263,10 +1264,6 @@ test "Deleted docs disappear after vacuum" {
     while (try docsIter.next(docsIter)) |docItem| {
         try docsList.append(allocator, docItem);
     }
-    const docs = docsList.items;
-    const docCount = docs.len;
-
-    std.debug.print("Doc len before delete {d}\n", .{docCount});
 
     const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
         \\{
