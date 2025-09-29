@@ -1034,6 +1034,7 @@ pub const Bucket = struct {
 
     pub fn deinit(self: *Bucket) void {
         self.file.close();
+        self.allocator.free(self.path);
         defer self.pageCache.deinit();
         var cacheIter = self.pageCache.valueIterator();
         while (cacheIter.next()) |pair| {

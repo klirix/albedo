@@ -74,24 +74,24 @@ const Index = struct {
             location: DocumentLocation,
         };
 
-        pub fn init(ally: mem.Allocator, index: *Index, page: *Page) !*Node {
+        pub fn init(index: *Index, page: *Page) !*Node {
             const isLeaf = page.data[0] == 1;
-            const node = try ally.create(Node);
+            const node = try index.allocator.create(Node);
             node.* = Node{
                 .page = page,
                 .isLeaf = isLeaf,
                 .index = index,
-                .children = .init(ally),
-                .keys = .init(ally),
-                .locationPairs = .init(ally),
+                .children = .{},
+                .keys = .{},
+                .locationPairs = .{},
                 .id = page.header.page_id,
             };
             return node;
         }
 
-        pub fn nodeFromPage(ally: mem.Allocator, index: *Index, page: Page, lastLeaf: *?Node) !*Node {
-            const node = try Node.init(ally, index, page);
-
+        pub fn nodeFromPage(index: *Index, page: Page, lastLeaf: *?Node) !*Node {
+            const node = try Node.init(index, page);
+            const ally = index.allocator;
             if (node.isLeaf) {
                 var offset: u16 = 17;
                 const data = page.data;
@@ -106,7 +106,7 @@ const Index = struct {
                     offset += 8;
                     const pageOffset = mem.readInt(u16, data[8..10], .little);
                     offset += 2;
-                    try node.locationPairs.append(LocationPair{
+                    try node.locationPairs.append(ally, LocationPair{
                         .bsonValue = bsonValue,
                         .location = DocumentLocation{
                             .pageId = pageId,
@@ -124,21 +124,21 @@ const Index = struct {
                 const data = page.data;
                 const firstChildId = mem.readInt(u64, data[1..9], .little);
                 const firstChildPage = try index.bucket.loadPage(firstChildId);
-                const firstChildNode = try Node.nodeFromPage(ally, index, firstChildPage, lastLeaf);
-                try node.children.append(firstChildNode);
+                const firstChildNode = try Node.nodeFromPage(index, firstChildPage, lastLeaf);
+                try node.children.append(ally, firstChildNode);
                 while (offset < data.len) {
                     if (data[offset] == 0) break;
                     const typeId: bson.BSONValueType = @enumFromInt(data[offset]);
                     offset += 1;
                     const bsonValue = BSONValue.read(data[offset..], typeId);
-                    try node.keys.append(bsonValue);
+                    try node.keys.append(ally, bsonValue);
                     offset += @truncate(bsonValue.size());
                     const nodeId = mem.readInt(u64, data[offset..][0..8], .little);
                     offset += 8;
 
                     const childPage = try index.bucket.loadPage(nodeId);
-                    const childNode = try Node.nodeFromPage(ally, index, childPage, lastLeaf);
-                    try node.children.append(childNode);
+                    const childNode = try Node.nodeFromPage(index, childPage, lastLeaf);
+                    try node.children.append(ally, childNode);
                 }
             }
             return node;
@@ -177,13 +177,14 @@ const Index = struct {
             try self.index.bucket.writePage(page);
         }
 
-        pub fn deinit(self: *const Node, ally: mem.Allocator) void {
-            self.keys.deinit();
-            defer self.children.deinit();
-            self.locationPairs.deinit();
+        pub fn deinit(self: *Node) void {
+            const ally = self.index.allocator;
+            self.keys.deinit(ally);
+            defer self.children.deinit(ally);
+            self.locationPairs.deinit(ally);
 
             for (self.children.items) |node| {
-                node.deinit(ally);
+                node.deinit();
                 ally.destroy(node);
             }
         }
@@ -235,14 +236,15 @@ const Index = struct {
             .allocator = ally,
         };
         var lastLeafNode: ?Node = null;
-        const node = try Node.nodeFromPage(ally, &index, page, &lastLeafNode);
+        const node = try Node.nodeFromPage(&index, page, &lastLeafNode);
         index.root = node;
         return index;
     }
 
-    fn deinit(self: *Index, ally: mem.Allocator) void {
+    fn deinit(self: *Index) void {
         // Deinitialize the index
-        self.root.deinit(ally);
+        const ally = self.allocator;
+        self.root.deinit();
         ally.destroy(self.root);
         ally.destroy(self);
     }
@@ -258,7 +260,7 @@ const Index = struct {
             .root = undefined,
             .allocator = ally,
         };
-        const node = try Node.init(ally, index, page);
+        const node = try Node.init(index, page);
         try node.persist();
         index.root = node;
         return index;
@@ -339,6 +341,7 @@ const Index = struct {
 
     fn insertInternal(self: *Index, node: *Node, value: BSONValue, loc: DocumentLocation) !?*Node {
         // Insert a new document location into the index
+        const ally = self.allocator;
         if (node.isLeaf) {
             var insertAt = node.locationPairs.items.len;
             for (node.locationPairs.items, 0..) |locPair, i| {
@@ -352,7 +355,7 @@ const Index = struct {
                     },
                 }
             }
-            try node.locationPairs.insert(insertAt, Node.LocationPair{
+            try node.locationPairs.insert(ally, insertAt, Node.LocationPair{
                 .bsonValue = value,
                 .location = loc,
             });
@@ -381,8 +384,8 @@ const Index = struct {
                 else
                     newChild.keys.items[0];
 
-                try node.keys.insert(insertAt, key);
-                try node.children.insert(insertAt + 1, newChild);
+                try node.keys.insert(ally, insertAt, key);
+                try node.children.insert(ally, insertAt + 1, newChild);
                 try node.persist();
 
                 if (node.internalSize() > node.page.data.len - 20) {
@@ -425,13 +428,13 @@ const Index = struct {
     fn splitInternalNode(self: *Index, node: *Node) !*Node {
         // Split the internal node into two nodes
         const page = try self.bucket.createNewPage(.Index);
-        const newNode = try Node.init(self.*.allocator, self, page);
+        const newNode = try Node.init(self, page);
         const mid: usize = @divFloor(node.keys.items.len, 2) + 1;
-
+        const ally = self.allocator;
         // Update the children pointers
-        try newNode.keys.appendSlice(node.keys.items[mid + 1 ..]);
+        try newNode.keys.appendSlice(ally, node.keys.items[mid + 1 ..]);
         node.keys.shrinkRetainingCapacity(mid);
-        try newNode.children.appendSlice(node.children.items[mid..]);
+        try newNode.children.appendSlice(ally, node.children.items[mid..]);
         node.children.shrinkRetainingCapacity(mid);
 
         try newNode.persist();
@@ -440,10 +443,10 @@ const Index = struct {
         const promoKey = node.keys.items[mid];
 
         if (node == self.root) {
-            const newRoot = try Node.init(self.allocator, false);
-            try newRoot.keys.append(promoKey);
-            try newRoot.children.append(node);
-            try newRoot.children.append(newNode);
+            const newRoot = try Node.init(self, false);
+            try newRoot.keys.append(ally, promoKey);
+            try newRoot.children.append(ally, node);
+            try newRoot.children.append(ally, newNode);
             try newRoot.persist();
             self.root = newRoot;
             return null;
@@ -455,9 +458,10 @@ const Index = struct {
     fn splitLeafNode(self: *Index, node: *Node) !*Node {
         // Split the leaf node into two nodes
         const page = try self.bucket.createNewPage(.Index);
-        const newNode = try Node.init(self.*.allocator, self, page);
+        const newNode = try Node.init(self, page);
+        const ally = self.allocator;
         const mid: usize = @divFloor(node.locationPairs.items.len, 2);
-        try newNode.locationPairs.appendSlice(node.locationPairs.items[mid..]);
+        try newNode.locationPairs.appendSlice(ally, node.locationPairs.items[mid..]);
         node.locationPairs.shrinkRetainingCapacity(mid);
 
         // Update the next and previous pointers
@@ -526,7 +530,7 @@ test "Index delete" {
     };
 
     var index = try Index.create(testing.allocator, &bucket);
-    defer index.deinit(testing.allocator);
+    defer index.deinit();
     try index.insert(BSONValue{ .int32 = .{ .value = 10 } }, .{ .pageId = 1, .offset = 10 });
     try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
     try index.insert(BSONValue{ .int32 = .{ .value = 15 } }, .{ .pageId = 1, .offset = 30 });

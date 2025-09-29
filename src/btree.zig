@@ -10,19 +10,21 @@ pub const DocumentLocation = struct {
 
 pub const DocLocationList = struct {
     locations: std.ArrayList(DocumentLocation),
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) DocLocationList {
         return .{
-            .locations = std.ArrayList(DocumentLocation).init(allocator),
+            .locations = std.ArrayList(DocumentLocation){},
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *DocLocationList) void {
-        self.locations.deinit();
+        self.locations.deinit(self.allocator);
     }
 
     pub fn append(self: *DocLocationList, loc: DocumentLocation) !void {
-        try self.locations.append(loc);
+        try self.locations.append(self.allocator, loc);
     }
 
     pub fn items(self: *const DocLocationList) []const DocumentLocation {
@@ -43,30 +45,33 @@ pub const BPlusTree = struct {
         children: std.ArrayList(*Node),
         values: ?std.ArrayList(DocLocationList), // Changed to store lists of locations
         next: ?*Node,
+        index: *BPlusTree,
 
-        pub fn init(allocator: std.mem.Allocator, isLeaf: bool) !*Node {
-            const node = try allocator.create(Node);
+        pub fn init(tree: *BPlusTree, isLeaf: bool) !*Node {
+            const node = try tree.allocator.create(Node);
             node.* = Node{
-                .keys = std.ArrayList(BSONValue).init(allocator),
+                .keys = std.ArrayList(BSONValue){},
                 .isLeaf = isLeaf,
-                .children = std.ArrayList(*Node).init(allocator),
-                .values = if (isLeaf) std.ArrayList(DocLocationList).init(allocator) else null,
+                .children = std.ArrayList(*Node){},
+                .values = if (isLeaf) std.ArrayList(DocLocationList){} else null,
                 .next = null,
+                .index = tree,
             };
             return node;
         }
 
-        pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
-            self.keys.deinit();
+        pub fn deinit(self: *Node) void {
+            const allocator = self.index.allocator;
+            self.keys.deinit(allocator);
             for (self.children.items) |child| {
-                child.deinit(allocator);
+                child.deinit();
             }
-            self.children.deinit();
+            self.children.deinit(self.index.allocator);
             if (self.values) |*values| {
                 for (values.items) |*list| {
                     list.deinit();
                 }
-                values.deinit();
+                values.deinit(allocator);
             }
             allocator.destroy(self);
         }
@@ -81,7 +86,7 @@ pub const BPlusTree = struct {
         }
 
         fn findExactKeyIndex(self: *Node, key: BSONValue) ?usize {
-            for (self.keys.items, 0..) |nodeKey, i| {
+            for (self.keys.items, 0..) |*nodeKey, i| {
                 if (key.eql(nodeKey)) {
                     return i;
                 }
@@ -99,17 +104,18 @@ pub const BPlusTree = struct {
 
     pub fn deinit(self: *BPlusTree) void {
         if (self.root) |root| {
-            root.deinit(self.allocator);
+            root.deinit();
         }
     }
 
     pub fn insert(self: *BPlusTree, key: BSONValue, loc: DocumentLocation) !void {
         if (self.root == null) {
-            const newNode = try Node.init(self.allocator, true);
-            try newNode.keys.append(key);
+            const newNode = try Node.init(self, true);
+            const allocator = self.allocator;
+            try newNode.keys.append(allocator, key);
             var locList = DocLocationList.init(self.allocator);
             try locList.append(loc);
-            try newNode.values.?.append(locList);
+            try newNode.values.?.append(allocator, locList);
             self.root = newNode;
             return;
         }
@@ -128,12 +134,12 @@ pub const BPlusTree = struct {
                 try node.values.?.items[existingIndex].append(loc);
                 return null;
             }
-
+            const allocator = self.allocator;
             const keyIndex = node.findKeyIndex(key);
-            try node.keys.insert(keyIndex, key);
-            var locList = DocLocationList.init(self.allocator);
+            try node.keys.insert(allocator, keyIndex, key);
+            var locList = DocLocationList.init(allocator);
             try locList.append(loc);
-            try node.values.?.insert(keyIndex, locList);
+            try node.values.?.insert(allocator, keyIndex, locList);
 
             if (node.keys.items.len < DEFAULT_ORDER) {
                 return null;
@@ -144,8 +150,9 @@ pub const BPlusTree = struct {
         const keyIndex = node.findKeyIndex(key);
         const childResult = try self.insertInternal(node.children.items[keyIndex], key, loc);
         if (childResult) |newChild| {
-            try node.keys.insert(keyIndex, newChild.keys.items[0]);
-            try node.children.insert(keyIndex + 1, newChild);
+            const allocator = self.allocator;
+            try node.keys.insert(allocator, keyIndex, newChild.keys.items[0]);
+            try node.children.insert(allocator, keyIndex + 1, newChild);
 
             if (node.keys.items.len < DEFAULT_ORDER) {
                 return null;
@@ -158,14 +165,14 @@ pub const BPlusTree = struct {
 
     fn splitLeaf(self: *BPlusTree, node: *Node) !*Node {
         const midPoint = (DEFAULT_ORDER + 1) / 2;
-        const newNode = try Node.init(self.allocator, true);
-
+        const newNode = try Node.init(self, true);
+        const allocator = self.allocator;
         // Move half of the keys and values to the new node
-        try newNode.keys.appendSlice(node.keys.items[midPoint..]);
+        try newNode.keys.appendSlice(allocator, node.keys.items[midPoint..]);
         for (node.values.?.items[midPoint..]) |locList| {
-            var newLocList = DocLocationList.init(self.allocator);
-            try newLocList.locations.appendSlice(locList.locations.items);
-            try newNode.values.?.append(newLocList);
+            var newLocList = DocLocationList.init(allocator);
+            try newLocList.locations.appendSlice(allocator, locList.locations.items);
+            try newNode.values.?.append(allocator, newLocList);
         }
 
         // Clean up old values
@@ -186,15 +193,16 @@ pub const BPlusTree = struct {
 
     fn splitInternal(self: *BPlusTree, node: *Node) !?*Node {
         const midPoint = DEFAULT_ORDER / 2;
-        const newNode = try Node.init(self.allocator, false);
+        const newNode = try Node.init(self, false);
 
         // Save the middle key that will be promoted
         const promoKey = node.keys.items[midPoint];
+        const allocator = self.allocator;
 
         // Copy keys after midPoint+1 to new node
-        try newNode.keys.appendSlice(node.keys.items[midPoint + 1 ..]);
+        try newNode.keys.appendSlice(allocator, node.keys.items[midPoint + 1 ..]);
         // Copy children after midPoint+1 to new node
-        try newNode.children.appendSlice(node.children.items[midPoint + 1 ..]);
+        try newNode.children.appendSlice(allocator, node.children.items[midPoint + 1 ..]);
 
         // Truncate the original node
         node.keys.shrinkRetainingCapacity(midPoint);
@@ -202,10 +210,10 @@ pub const BPlusTree = struct {
 
         // If this is the root node, create a new root
         if (node == self.root) {
-            const newRoot = try Node.init(self.allocator, false);
-            try newRoot.keys.append(promoKey);
-            try newRoot.children.append(node);
-            try newRoot.children.append(newNode);
+            const newRoot = try Node.init(self, false);
+            try newRoot.keys.append(allocator, promoKey);
+            try newRoot.children.append(allocator, node);
+            try newRoot.children.append(allocator, newNode);
             self.root = newRoot;
             return null;
         }
@@ -229,8 +237,9 @@ pub const BPlusTree = struct {
     }
 
     pub fn range(self: *const BPlusTree, start: BSONValue, end: BSONValue) !std.ArrayList(DocumentLocation) {
-        var results = std.ArrayList(DocumentLocation).init(self.allocator);
-        errdefer results.deinit();
+        var results = std.ArrayList(DocumentLocation){};
+        const allocator = self.allocator;
+        errdefer results.deinit(allocator);
 
         var current: ?*Node = self.root orelse return results;
 
@@ -252,7 +261,7 @@ pub const BPlusTree = struct {
                     return results;
                 }
                 // Append all locations for this key
-                try results.appendSlice(curr.values.?.items[index].items());
+                try results.appendSlice(allocator, curr.values.?.items[index].items());
             }
         }
 
@@ -288,7 +297,7 @@ test "BPlusTree multiple values per key" {
 
     // Test range query
     var range_results = try tree.range(key1, key2);
-    defer range_results.deinit();
+    defer range_results.deinit(tree.allocator);
 
     try std.testing.expectEqual(@as(usize, 4), range_results.items.len);
     try std.testing.expectEqual(@as(u64, 1), range_results.items[0].pageId);
