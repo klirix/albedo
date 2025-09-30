@@ -495,7 +495,7 @@ test "Index inserts" {
     const rand = prng.random();
 
     var index = try Index.create(testing.allocator, &bucket);
-    defer index.deinit(testing.allocator);
+    defer index.deinit();
     for (0..10000) |_| {
         const value = BSONValue{ .int32 = .{ .value = rand.int(i32) } };
         const loc = Index.DocumentLocation{ .pageId = rand.int(u64), .offset = rand.int(u16) };
@@ -511,7 +511,7 @@ test "Index range" {
     };
 
     var index = try Index.create(testing.allocator, &bucket);
-    defer index.deinit(testing.allocator);
+    defer index.deinit();
     try index.insert(BSONValue{ .int32 = .{ .value = 10 } }, .{ .pageId = 1, .offset = 10 });
     try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
     try index.insert(BSONValue{ .int32 = .{ .value = 12 } }, .{ .pageId = 1, .offset = 30 });
