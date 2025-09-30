@@ -5,6 +5,7 @@ const BSONDocument = bson.BSONDocument;
 const File = std.fs.File;
 const mem = std.mem;
 const ObjectId = @import("object_id.zig").ObjectId;
+const ObjectIdGenerator = @import("object_id.zig").ObjectIdGenerator;
 const query = @import("query.zig");
 
 const ALBEDO_MAGIC = "ALBEDO";
@@ -193,6 +194,7 @@ pub const Bucket = struct {
     rwlock: std.Thread.RwLock = .{},
     indexes: std.StringHashMap(u64),
     autoVaccuum: bool = true,
+    objectIdGenerator: ObjectIdGenerator,
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -287,6 +289,7 @@ pub const Bucket = struct {
             .allocator = ally,
             .pageCache = .init(ally),
             .indexes = .init(ally),
+            .objectIdGenerator = .init(),
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
@@ -338,6 +341,7 @@ pub const Bucket = struct {
             .allocator = ally,
             .pageCache = .init(ally),
             .indexes = .init(ally),
+            .objectIdGenerator = .init(),
         };
 
         const meta = bucket.loadPage(0) catch |err| {
@@ -462,14 +466,6 @@ pub const Bucket = struct {
         reserved: u24,
         pub const byteSize = 16;
 
-        pub fn init() DocHeader {
-            return DocHeader{
-                .is_deleted = 0,
-                .doc_id = ObjectId.init().toInt(),
-                .reserved = 0,
-            };
-        }
-
         pub fn fromMemory(memory: []const u8) error{ InvalidDocId, InvalidHeader }!DocHeader {
             const header = DocHeader{
                 .is_deleted = memory[12],
@@ -533,7 +529,7 @@ pub const Bucket = struct {
 
     pub fn insert(self: *Bucket, insertable: bson.BSONDocument) !DocInsertResult {
         var doc = insertable;
-        const docId = ObjectId.init();
+        const docId = self.objectIdGenerator.next();
         const needCleanup = doc.get("_id") == null;
         if (needCleanup) {
             // If the document doesn't have an _id, generate one

@@ -660,6 +660,84 @@ test "range respects bounds" {
     try testing.expectEqualSlices(u16, expected[0..], offsets.items);
 }
 
+test "Index orders strings lexicographically" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_strings.bucket");
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("bplus_strings.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(testing.allocator, &bucket);
+    defer index.deinit();
+
+    const entries = [_]struct { value: []const u8, offset: u16 }{
+        .{ .value = "delta", .offset = 3 },
+        .{ .value = "alpha", .offset = 0 },
+        .{ .value = "charlie", .offset = 2 },
+        .{ .value = "bravo", .offset = 1 },
+        .{ .value = "echo", .offset = 4 },
+    };
+
+    const insert_order = [_]usize{ 0, 2, 4, 1, 3 };
+    for (insert_order, 0..) |idx, i| {
+        const entry = entries[idx];
+        const value = BSONValue{ .string = .{ .value = entry.value } };
+        const loc = Index.DocumentLocation{ .pageId = @intCast(i + 1), .offset = entry.offset };
+        try index.insert(value, loc);
+    }
+
+    var iter = try index.range(null, null);
+    var offsets = std.ArrayList(u16){};
+    defer offsets.deinit(testing.allocator);
+
+    while (try iter.next()) |loc| {
+        try offsets.append(testing.allocator, loc.offset);
+    }
+
+    const expected = [_]u16{ 0, 1, 2, 3, 4 };
+    try testing.expectEqualSlices(u16, expected[0..], offsets.items);
+}
+
+test "Index orders ObjectIds lexicographically" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_objectids.bucket");
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("bplus_objectids.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(testing.allocator, &bucket);
+    defer index.deinit();
+
+    const hex_values = [_][]const u8{
+        "507c7f79bcf86cd7994f6c0e",
+        "507c7f79bcf86cd7994f6c0f",
+        "507c7f79bcf86cd7994f6c0a",
+        "507c7f79bcf86cd7994f6c0d",
+        "507c7f79bcf86cd7994f6c0b",
+    };
+
+    const expected_offsets = [_]u16{ 3, 4, 0, 2, 1 };
+    const insert_order = [_]usize{ 0, 4, 2, 1, 3 };
+
+    for (insert_order, 0..) |idx, i| {
+        const object_id = try bson.ObjectId.parseString(hex_values[idx]);
+        const value = BSONValue{ .objectId = .{ .value = object_id } };
+        const loc = Index.DocumentLocation{ .pageId = @intCast(i + 1), .offset = expected_offsets[idx] };
+        try index.insert(value, loc);
+    }
+
+    var iter = try index.range(null, null);
+    var offsets = std.ArrayList(u16){};
+    defer offsets.deinit(testing.allocator);
+
+    while (try iter.next()) |loc| {
+        try offsets.append(testing.allocator, loc.offset);
+    }
+
+    const expected = [_]u16{ 0, 1, 2, 3, 4 };
+    try testing.expectEqualSlices(u16, expected[0..], offsets.items);
+}
+
 test "Index delete" {
     var bucket = try Bucket.openFile(testing.allocator, "bplus_test2.bucket");
     defer bucket.deinit();

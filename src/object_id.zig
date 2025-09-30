@@ -1,11 +1,32 @@
 const std = @import("std");
 const crypto = std.crypto;
 
-// var process_rand = rand: {
-//     var arr = [5]u8{ 0, 0, 0, 0, 0 };
-//     crypto.random.bytes(&arr);
-//     break :rand arr;
-// };
+pub const ObjectIdGenerator = struct {
+    machine: u40,
+    counter: u24,
+
+    pub fn init() ObjectIdGenerator {
+        const machine = crypto.random.int(u40);
+        const counter = crypto.random.int(u24);
+        return ObjectIdGenerator{
+            .machine = machine,
+            .counter = counter,
+        };
+    }
+
+    pub fn next(self: *ObjectIdGenerator) ObjectId {
+        // self.counter +%= 1;
+        const counter = @atomicRmw(u24, &self.counter, .Add, 1, .monotonic);
+        var buffer: [12]u8 = undefined;
+        const time = @as(u32, (@intCast(std.time.timestamp())));
+
+        std.mem.writeInt(u32, buffer[0..4], time, .big);
+        std.mem.writeInt(u40, buffer[4..9], self.machine, .little);
+        std.mem.writeInt(u24, buffer[9..12], counter, .big);
+
+        return ObjectId{ .buffer = buffer };
+    }
+};
 
 pub const ObjectId = struct {
     buffer: [12]u8, // 12
