@@ -998,7 +998,6 @@ pub const Bucket = struct {
     pub fn vacuum(self: *Bucket) !void {
         const tempFileName = try std.fmt.allocPrint(self.allocator, "{s}-temp", .{self.path});
         defer self.allocator.free(tempFileName);
-
         var newBucket = try Bucket.openFile(self.allocator, tempFileName);
         const fs = std.fs;
         defer newBucket.deinit();
@@ -1010,18 +1009,21 @@ pub const Bucket = struct {
             const newDoc = bson.BSONDocument.init(doc.data);
             _ = try newBucket.insert(newDoc);
         }
+        const path = try self.allocator.dupe(u8, self.path);
         iterator.deinit();
         self.deinit();
-        fs.deleteFileAbsolute(self.path) catch |err| {
+
+        fs.deleteFileAbsolute(path) catch |err| {
             std.debug.print("Failed to delete old file: {any}\n", .{err});
             return err;
         };
-        fs.renameAbsolute(tempFileName, self.path) catch |err| {
+        fs.renameAbsolute(tempFileName, path) catch |err| {
             std.debug.print("Failed to rename temp file: {any}\n", .{err});
             return err;
         };
 
-        self.file = try fs.openFileAbsolute(self.path, .{ .mode = .read_write });
+        self.file = try fs.openFileAbsolute(path, .{ .mode = .read_write });
+        self.path = path;
 
         try self.file.seekTo(0);
         var readerBuffer: [1024]u8 = undefined;
