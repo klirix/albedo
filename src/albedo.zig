@@ -7,6 +7,9 @@ const mem = std.mem;
 const ObjectId = @import("object_id.zig").ObjectId;
 const ObjectIdGenerator = @import("object_id.zig").ObjectIdGenerator;
 const query = @import("query.zig");
+const bindex = @import("bplusindex.zig");
+const Index = bindex.Index;
+const IndexOptions = bindex.IndexOptions;
 
 const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
@@ -151,22 +154,6 @@ pub const Page = struct {
         allocator.free(self.data);
     }
 
-    fn loadIndices(self: *const Page, hash: *std.StringHashMap(u64)) !void {
-        var idx: u16 = 0;
-        var data = self.data;
-        while (data[idx] != 0) {
-            // Read the index path
-            const path = mem.span(@as([*:0]u8, @ptrCast(data[idx..].ptr)));
-            idx += @truncate(path.len + 1);
-
-            // Read the index page ID
-            const page_id = mem.readInt(u64, @ptrCast(data[idx .. idx + 8]), .little);
-            idx += @sizeOf(u64);
-
-            // Insert the index into the hash map
-            try hash.put(path, page_id);
-        }
-    }
     // Load indices from the page
 };
 
@@ -192,7 +179,7 @@ pub const Bucket = struct {
     header: BucketHeader,
     pageCache: std.AutoHashMap(u64, *Page),
     rwlock: std.Thread.RwLock = .{},
-    indexes: std.StringHashMap(u64),
+    indexes: std.StringHashMap(*Index),
     autoVaccuum: bool = true,
     objectIdGenerator: ObjectIdGenerator,
 
@@ -244,6 +231,80 @@ pub const Bucket = struct {
         autoVaccuum: bool = true,
     };
 
+    fn loadIndices(self: *Bucket, page: *const Page) !void {
+        var reader = std.io.Reader.fixed(page.data);
+        while (true) {
+            // Stop when we hit the first NUL at the beginning (no more entries)
+            const b = try reader.peekByte();
+            if (b == 0) break;
+
+            // Read the index path (NUL-terminated); returned slice is inclusive of NUL
+            const path_inclusive = reader.takeDelimiterInclusive(0) catch return PageError.InvalidPageSize;
+            if (path_inclusive.len == 0) break; // defensive
+            // Strip trailing NUL so map key does not include it
+            const path_no_nul = path_inclusive[0 .. path_inclusive.len - 1];
+            const key = try self.allocator.dupe(u8, path_no_nul);
+            errdefer self.allocator.free(key);
+
+            // Read index options
+            const options = reader.takeStruct(IndexOptions, .little) catch return PageError.InvalidPageSize;
+
+            // Read the index page ID
+            const page_id = reader.takeInt(u64, .little) catch return PageError.InvalidPageSize;
+
+            const idx = Index.loadWithOptions(self, page_id, options) catch {
+                std.debug.print("Failed to load index at page {d} for path {s}\n", .{ page_id, key });
+                return BucketInitErrors.LoadIndexError;
+            };
+
+            // Insert the index into the hash map
+            try self.indexes.put(key, idx);
+        }
+    }
+
+    fn recordIndexes(self: *Bucket) !void {
+        const meta_page = try self.loadPage(0);
+
+        var buffer: [DEFAULT_PAGE_SIZE - @sizeOf(PageHeader)]u8 = undefined;
+        var writer = std.io.Writer.fixed(&buffer);
+
+        var it = self.indexes.iterator();
+
+        while (it.next()) |entry| {
+            const path_full = entry.key_ptr.*;
+            // Sanitize: ensure we don't have a trailing NUL stored as part of the key
+            const path = if (path_full.len > 0 and path_full[path_full.len - 1] == 0)
+                path_full[0 .. path_full.len - 1]
+            else
+                path_full;
+            const index = entry.value_ptr.*;
+
+            try writer.writeAll(path);
+            try writer.writeByte(0);
+            try writer.writeStruct(index.options, .little);
+            try writer.writeInt(u64, index.root.id, .little);
+        }
+        const unused = writer.unusedCapacityLen();
+        try writer.splatByteAll(0, unused); // Null-terminate the list
+        @memcpy(meta_page.data, &buffer);
+
+        try self.writePage(meta_page);
+    }
+
+    fn ensureIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
+        if (self.indexes.contains(path)) {
+            // Index already exists
+            return;
+        }
+
+        const newIndex = try Index.create(self);
+        newIndex.options = options;
+        const key = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(key);
+        try self.indexes.put(key, newIndex);
+        try self.recordIndexes();
+    }
+
     fn resolvePath(path: []const u8, ally: std.mem.Allocator) std.fs.Dir.RealPathAllocError![]const u8 {
         if (std.fs.path.isAbsolute(path)) {
             const dup = try ally.dupe(u8, path);
@@ -294,6 +355,7 @@ pub const Bucket = struct {
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
+        bucket.ensureIndex("_id", .{}) catch return BucketInitErrors.InitializationError;
 
         bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
 
@@ -353,7 +415,7 @@ pub const Bucket = struct {
             };
         };
 
-        meta.loadIndices(&bucket.indexes) catch {
+        bucket.loadIndices(meta) catch {
             file.close();
             ally.free(abs_path);
             return BucketInitErrors.LoadIndexError;
@@ -403,7 +465,7 @@ pub const Bucket = struct {
 
         var reader_r = self.file.reader(&readerBuffer);
         // const reader = &reader_r.interface;
-
+        // std.debug.print("Reading page {} from file, {} + ({}*{})\n", .{ page_id, BucketHeader.byteSize, page_id, DEFAULT_PAGE_SIZE });
         const offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
         try reader_r.seekTo(offset);
 
@@ -551,12 +613,11 @@ pub const Bucket = struct {
         self.rwlock.lock();
         defer self.rwlock.unlock();
         // If no pages exist yet, create one
-        if (self.header.page_count == 1) {
+        if (try findLastDataPage(self)) |p| {
+            page = p;
+        } else {
             page = try self.createNewPage(.Data);
             try self.writePage(page);
-        } else {
-            // Start from the last page
-            page = try findLastDataPage(self) orelse unreachable;
         }
 
         // Check if the page has enough space for header and doc size
@@ -1001,6 +1062,14 @@ pub const Bucket = struct {
         //     std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
         // };
         var iterator = try ScanIterator.init(self, self.allocator);
+        const newMeta = try newBucket.loadPage(0);
+        const oldMeta = try self.loadPage(0);
+        @memcpy(newMeta.data, oldMeta.data);
+        newBucket.loadIndices(newMeta) catch {
+            return BucketInitErrors.LoadIndexError;
+        };
+        try newBucket.recordIndexes();
+
         while (try iterator.next()) |doc| {
             const newDoc = bson.BSONDocument.init(doc.data);
             _ = try newBucket.insert(newDoc);
@@ -1028,12 +1097,23 @@ pub const Bucket = struct {
         _ = try reader.read(&header_bytes);
         self.header = BucketHeader.read(&header_bytes);
         self.pageCache = .init(self.allocator);
+        // Reinitialize and reload indexes from the meta page
+        self.indexes = .init(self.allocator);
+        const meta = try self.loadPage(0);
+        try self.loadIndices(meta);
     }
 
     pub fn deinit(self: *Bucket) void {
         self.file.close();
         self.allocator.free(self.path);
         defer self.pageCache.deinit();
+        // Free index values and their keys
+        var idx_iter = self.indexes.iterator();
+        while (idx_iter.next()) |pair| {
+            pair.value_ptr.*.deinit();
+            self.allocator.free(pair.key_ptr.*);
+        }
+        self.indexes.deinit();
         var cacheIter = self.pageCache.valueIterator();
         while (cacheIter.next()) |pair| {
             pair.*.deinit(self.allocator);
