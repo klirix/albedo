@@ -309,6 +309,30 @@ pub const BSONNull = struct {
     }
 };
 
+pub const BSONMinKey = struct {
+    pub fn write(_: BSONMinKey, _: []u8) void {}
+
+    pub fn size(_: BSONMinKey) u32 {
+        return 0;
+    }
+
+    pub fn read(_: []const u8) BSONMinKey {
+        return BSONMinKey{};
+    }
+};
+
+pub const BSONMaxKey = struct {
+    pub fn write(_: BSONMaxKey, _: []u8) void {}
+
+    pub fn size(_: BSONMaxKey) u32 {
+        return 0;
+    }
+
+    pub fn read(_: []const u8) BSONMaxKey {
+        return BSONMaxKey{};
+    }
+};
+
 test "encodes BSONNull" {
     var allocator = std.testing.allocator;
     var null_value = BSONNull{};
@@ -338,6 +362,8 @@ pub const BSONValue = union(BSONValueType) {
     null: BSONNull,
     int32: BSONInt32,
     int64: BSONInt64,
+    maxKey: BSONMaxKey,
+    minKey: BSONMinKey,
 
     pub fn init(value: anytype) BSONValue {
         return switch (@TypeOf(value)) {
@@ -368,6 +394,8 @@ pub const BSONValue = union(BSONValueType) {
             .binary => try std.fmt.format(writer, "Binary{{{s}}}", .{self.binary.value}),
             .boolean => try std.fmt.format(writer, "{s}", .{if (self.boolean.value) "true" else "false"}),
             .null => try writer.writeAll("null"),
+            .minKey => try writer.writeAll("MinKey"),
+            .maxKey => try writer.writeAll("MaxKey"),
             .objectId => try std.fmt.format(writer, "ObjectId(\"{s}\")", .{&self.objectId.value.toString()}),
         }
     }
@@ -385,6 +413,8 @@ pub const BSONValue = union(BSONValueType) {
             .binary => self.binary.size(),
             .boolean => 1,
             .null => 0,
+            .minKey => 0,
+            .maxKey => 0,
             .objectId => 12,
         };
     }
@@ -401,12 +431,15 @@ pub const BSONValue = union(BSONValueType) {
             .binary => .binary,
             .boolean => .boolean,
             .null => .null,
+            .minKey => .minKey,
+            .maxKey => .maxKey,
             .objectId => .objectId,
         };
     }
 
     pub inline fn valueOrder(self: *const BSONValue) u8 {
         return switch (self.*) {
+            .minKey => 0,
             .null => 1,
             .double, .int32, .int64 => 2,
             .string => 3,
@@ -416,6 +449,7 @@ pub const BSONValue = union(BSONValueType) {
             .objectId => 7,
             .boolean => 8,
             .datetime => 9,
+            .maxKey => 10,
         };
     }
 
@@ -428,6 +462,8 @@ pub const BSONValue = union(BSONValueType) {
             .int32 => 4,
             .boolean => 1,
             .null => 0,
+            .minKey => 0,
+            .maxKey => 0,
             .objectId => 12,
         };
     }
@@ -477,6 +513,8 @@ pub const BSONValue = union(BSONValueType) {
             .binary => std.mem.eql(u8, self.binary.value, other.binary.value),
             .boolean => self.boolean.value == other.boolean.value,
             .null => true,
+            .minKey => true,
+            .maxKey => true,
             .objectId => |objid| std.mem.eql(u8, &objid.value.buffer, &other.objectId.value.buffer),
             else => false,
         };
@@ -498,6 +536,8 @@ pub const BSONValue = union(BSONValueType) {
             .binary => .eq,
             .boolean => .eq,
             .null => .eq,
+            .minKey => .eq,
+            .maxKey => .eq,
             .objectId => std.mem.order(u8, &self.objectId.value.buffer, &other.objectId.value.buffer),
         };
     }
@@ -565,6 +605,12 @@ pub const BSONValue = union(BSONValueType) {
             .null => {
                 // Null type does not need to write any data
             },
+            .minKey => {
+                // MinKey encodes without payload
+            },
+            .maxKey => {
+                // MaxKey encodes without payload
+            },
             .objectId => {
                 try writer.writeAll(&self.objectId.value.buffer);
             },
@@ -589,6 +635,8 @@ pub const BSONValue = union(BSONValueType) {
             .binary => BSONValue{ .binary = BSONBinary.read(memory) },
             .boolean => BSONValue{ .boolean = BSONBoolean.read(memory) },
             .null => BSONValue{ .null = BSONNull.read(memory) },
+            .minKey => BSONValue{ .minKey = BSONMinKey.read(memory) },
+            .maxKey => BSONValue{ .maxKey = BSONMaxKey.read(memory) },
             .objectId => BSONValue{ .objectId = BSONObjectId.read(memory) },
         };
     }
@@ -614,6 +662,21 @@ test "BSONValue.eql int32" {
     try std.testing.expectEqual(true, double.eql(&other));
 }
 
+test "BSONValue.order min/max key" {
+    const min_val = BSONValue{ .minKey = BSONMinKey{} };
+    const max_val = BSONValue{ .maxKey = BSONMaxKey{} };
+    const null_val = BSONValue{ .null = BSONNull{} };
+    const int_val = BSONValue{ .int32 = BSONInt32{ .value = 0 } };
+
+    try std.testing.expect(min_val.order(null_val) == .lt);
+    try std.testing.expect(max_val.order(int_val) == .gt);
+
+    const another_min = BSONValue{ .minKey = BSONMinKey{} };
+    const another_max = BSONValue{ .maxKey = BSONMaxKey{} };
+    try std.testing.expect(min_val.eql(&another_min));
+    try std.testing.expect(max_val.eql(&another_max));
+}
+
 pub const BSONValueType = enum(u8) {
     double = 0x01,
     string = 0x02,
@@ -630,8 +693,8 @@ pub const BSONValueType = enum(u8) {
     int32 = 0x10,
     // 0x11, // timestamp
     int64 = 0x12, // 64-bit integer
-    // 0xFF, // min key
-    // 0x7F, // max key
+    maxKey = 0x7F,
+    minKey = 0xFF,
 };
 
 const TypeNamePair = struct {
@@ -1124,6 +1187,8 @@ pub const BSONDocument = struct {
                 newBuffer[writeIdx] = if (value.boolean.value) 0x01 else 0x00;
             },
             .null => {},
+            .maxKey => {},
+            .minKey => {},
             .objectId => {
                 @memcpy(newBuffer[writeIdx .. writeIdx + 12], value.objectId.value.buffer[0..]);
             },

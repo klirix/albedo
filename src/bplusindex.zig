@@ -2,6 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const albedo = @import("albedo.zig");
 const bson = @import("bson.zig");
+const query = @import("query.zig");
 const BSONValue = bson.BSONValue;
 const Bucket = albedo.Bucket;
 const Page = albedo.Page;
@@ -18,6 +19,32 @@ pub const Index = struct {
     root: *Node,
     allocator: mem.Allocator,
     options: IndexOptions = .{},
+
+    pub const RangeBoundError = error{
+        InvalidLowerBoundOperator,
+        InvalidUpperBoundOperator,
+    };
+
+    pub const RangeBound = struct {
+        filter: query.FilterType,
+        value: BSONValue,
+
+        pub fn gt(value: BSONValue) RangeBound {
+            return .{ .filter = .gt, .value = value };
+        }
+
+        pub fn gte(value: BSONValue) RangeBound {
+            return .{ .filter = .gte, .value = value };
+        }
+
+        pub fn lt(value: BSONValue) RangeBound {
+            return .{ .filter = .lt, .value = value };
+        }
+
+        pub fn lte(value: BSONValue) RangeBound {
+            return .{ .filter = .lte, .value = value };
+        }
+    };
 
     const DocumentLocation = struct {
         pageId: u64,
@@ -233,6 +260,22 @@ pub const Index = struct {
             }
             return null;
         }
+
+        fn findLowerBoundIndex(self: *const Node, value: BSONValue, inclusive: bool) usize {
+            var i: usize = 0;
+            while (i < self.locationPairs.items.len) : (i += 1) {
+                const order = self.locationPairs.items[i].bsonValue.order(value);
+                switch (order) {
+                    .lt => continue,
+                    .eq => {
+                        if (inclusive) return i;
+                        continue;
+                    },
+                    .gt => return i,
+                }
+            }
+            return self.locationPairs.items.len;
+        }
     };
 
     pub fn loadWithOptions(bucket: *Bucket, pageId: u64, options: IndexOptions) !*Index {
@@ -296,59 +339,109 @@ pub const Index = struct {
         index: *Index,
         current: *Node,
         currentIndex: usize,
-        until: ?BSONValue,
+        lower: ?RangeBound,
+        upper: ?RangeBound,
+        lowerSatisfied: bool,
 
         pub fn next(self: *RangeIterator) !?DocumentLocation {
-            // Get the next document location in the index
-            if (self.currentIndex >= self.current.locationPairs.items.len) {
-                if (self.current.next) |nextNode| {
-                    self.current = nextNode;
-                    self.currentIndex = 0;
-                } else {
-                    return null;
+            while (true) {
+                if (self.currentIndex >= self.current.locationPairs.items.len) {
+                    if (self.current.next) |nextNode| {
+                        self.current = nextNode;
+                        self.currentIndex = 0;
+                    } else {
+                        return null;
+                    }
                 }
-            }
-            const pair = self.current.locationPairs.items[self.currentIndex];
-            if (self.until) |untilValue| {
-                if (pair.bsonValue.order(untilValue) == .gt) {
-                    return null;
+
+                const pair = self.current.locationPairs.items[self.currentIndex];
+
+                if (self.upper) |upperBound| {
+                    const cmp = pair.bsonValue.order(upperBound.value);
+                    const within = switch (upperBound.filter) {
+                        .lt => cmp == .lt,
+                        .lte => cmp != .gt,
+                        else => unreachable,
+                    };
+                    if (!within) return null;
                 }
+
+                if (!self.lowerSatisfied) {
+                    if (self.lower) |lowerBound| {
+                        const cmp = pair.bsonValue.order(lowerBound.value);
+                        const meetsLower = switch (lowerBound.filter) {
+                            .gt => cmp == .gt,
+                            .gte => cmp != .lt,
+                            else => unreachable,
+                        };
+                        if (!meetsLower) {
+                            self.currentIndex += 1;
+                            continue;
+                        }
+                    }
+                    self.lowerSatisfied = true;
+                }
+
+                self.currentIndex += 1;
+                return pair.location;
             }
-            const loc = self.current.locationPairs.items[self.currentIndex].location;
-            self.currentIndex += 1;
-            return loc;
         }
     };
 
-    pub fn range(self: *Index, gt: ?BSONValue, lt: ?BSONValue) !RangeIterator {
-        // Create a range iterator for the index
-        var iter = RangeIterator{
-            .index = self,
-            .current = self.root,
-            .currentIndex = 0,
-            .until = lt,
+    pub fn range(self: *Index, lower: ?RangeBound, upper: ?RangeBound) !RangeIterator {
+        if (lower) |bound| switch (bound.filter) {
+            .gt, .gte => {},
+            else => return RangeBoundError.InvalidLowerBoundOperator,
         };
-        if (gt) |gtValue| {
-            // Descend to the correct leaf for the lower bound
-            while (!iter.current.isLeaf) {
-                iter.current = iter.current.traverseChildren(gtValue);
+
+        if (upper) |bound| switch (bound.filter) {
+            .lt, .lte => {},
+            else => return RangeBoundError.InvalidUpperBoundOperator,
+        };
+
+        var current = self.root;
+        if (lower) |bound| {
+            while (!current.isLeaf) {
+                current = current.traverseChildren(bound.value);
             }
-            iter.currentIndex = blk: {
-                for (iter.current.locationPairs.items, 0..) |pair, i| {
-                    if (pair.bsonValue.order(gtValue) != .lt) {
-                        break :blk i;
-                    }
-                }
-                break :blk iter.current.locationPairs.items.len;
-            };
+
+            while (current.prev) |prevNode| {
+                if (prevNode.locationPairs.items.len == 0) break;
+                const lastPair = prevNode.locationPairs.items[prevNode.locationPairs.items.len - 1];
+                const order = lastPair.bsonValue.order(bound.value);
+                const shouldMove = switch (bound.filter) {
+                    .gte => order != .lt,
+                    .gt => order == .gt,
+                    else => false,
+                };
+                if (!shouldMove) break;
+                current = prevNode;
+            }
         } else {
-            // Find the left-most leaf node
-            while (!iter.current.isLeaf) {
-                iter.current = iter.current.children.items[0];
+            while (!current.isLeaf) {
+                current = current.children.items[0];
             }
         }
 
-        return iter;
+        const startIndex: usize = if (lower) |bound|
+            current.findLowerBoundIndex(bound.value, bound.filter == .gte)
+        else
+            0;
+
+        return RangeIterator{
+            .index = self,
+            .current = current,
+            .currentIndex = startIndex,
+            .lower = lower,
+            .upper = upper,
+            .lowerSatisfied = lower == null,
+        };
+    }
+
+    pub fn point(self: *Index, value: BSONValue) !RangeIterator {
+        const lower = RangeBound.gte(value);
+        const upper = RangeBound.lte(value);
+        return self.range(lower, upper);
     }
 
     pub fn insert(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
@@ -621,7 +714,7 @@ test "range handles duplicates" {
     try index.insert(BSONValue{ .int32 = .{ .value = 9 } }, .{ .pageId = 99, .offset = 990 });
     try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 111, .offset = 1110 });
 
-    var iter = try index.range(key, key);
+    var iter = try index.point(key);
     var results = std.ArrayList(u16){};
     defer results.deinit(testing.allocator);
 
@@ -659,7 +752,7 @@ test "range respects bounds" {
 
     const lower = BSONValue{ .int32 = .{ .value = 10 } };
     const upper = BSONValue{ .int32 = .{ .value = 20 } };
-    var iter = try index.range(lower, upper);
+    var iter = try index.range(Index.RangeBound.gte(lower), Index.RangeBound.lte(upper));
     var offsets = std.ArrayList(u16){};
     defer offsets.deinit(testing.allocator);
 
@@ -668,6 +761,45 @@ test "range respects bounds" {
     }
 
     const expected = [_]u16{ 100, 101, 150, 200 };
+    try testing.expectEqualSlices(u16, expected[0..], offsets.items);
+}
+
+test "range supports exclusive bounds" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_range_exclusive.bucket");
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("bplus_range_exclusive.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(&bucket);
+    defer index.deinit();
+
+    const entries = [_]struct { value: i32, page: u64, offset: u16 }{
+        .{ .value = 5, .page = 1, .offset = 50 },
+        .{ .value = 10, .page = 2, .offset = 100 },
+        .{ .value = 10, .page = 3, .offset = 101 },
+        .{ .value = 15, .page = 4, .offset = 150 },
+        .{ .value = 20, .page = 5, .offset = 200 },
+        .{ .value = 25, .page = 6, .offset = 250 },
+    };
+
+    for (entries) |entry| {
+        const value = BSONValue{ .int32 = .{ .value = entry.value } };
+        const loc = Index.DocumentLocation{ .pageId = entry.page, .offset = entry.offset };
+        try index.insert(value, loc);
+    }
+
+    const lower = BSONValue{ .int32 = .{ .value = 10 } };
+    const upper = BSONValue{ .int32 = .{ .value = 20 } };
+    var iter = try index.range(.gt(lower), .lt(upper));
+    var offsets = std.ArrayList(u16){};
+    defer offsets.deinit(testing.allocator);
+
+    while (try iter.next()) |loc| {
+        try offsets.append(testing.allocator, loc.offset);
+    }
+
+    const expected = [_]u16{150};
     try testing.expectEqualSlices(u16, expected[0..], offsets.items);
 }
 
@@ -763,7 +895,7 @@ test "Index delete" {
     try index.insert(BSONValue{ .int32 = .{ .value = 15 } }, .{ .pageId = 1, .offset = 30 });
 
     try index.delete(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
-    var iter = try index.range(null, .{ .int32 = .{ .value = 12 } });
+    var iter = try index.range(null, Index.RangeBound.lt(BSONValue{ .int32 = .{ .value = 12 } }));
     while (try iter.next()) |loc| {
         std.debug.print("Found no deleted location: pageId={}, offset={}\n", .{ loc.pageId, loc.offset });
     }
@@ -808,7 +940,7 @@ test "Index load from root and query" {
     // Range [100, 199] inclusive should yield exactly 100 entries in order
     const lower = BSONValue{ .int32 = .{ .value = 100 } };
     const upper = BSONValue{ .int32 = .{ .value = 199 } };
-    var iter = try loaded.range(lower, upper);
+    var iter = try loaded.range(Index.RangeBound.gte(lower), Index.RangeBound.lte(upper));
     var count: usize = 0;
     var expected_offset: u16 = 100;
     while (try iter.next()) |loc| {

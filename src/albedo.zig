@@ -272,8 +272,6 @@ const BucketInitErrors = error{
     UnexpectedError,
 };
 
-const tree = @import("btree.zig");
-
 pub const Bucket = struct {
     file: std.fs.File,
     path: []const u8,
