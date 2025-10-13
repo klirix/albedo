@@ -15,6 +15,8 @@ const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
 const ALBEDO_FLAGS = 0;
 const DEFAULT_PAGE_SIZE = 8192; // 8kB, or up to 64kB
+const DEFAULT_PAGE_CACHE_CAPACITY: usize = 256 * 32; // 64MB cache
+const DoublyLinkedList = std.DoublyLinkedList;
 
 const BucketHeader = struct {
     magic: [6]u8,
@@ -157,6 +159,106 @@ pub const Page = struct {
     // Load indices from the page
 };
 
+const PageCache = struct {
+    allocator: std.mem.Allocator,
+    capacity: usize,
+    map: std.AutoHashMap(u64, *Entry),
+    lru: DoublyLinkedList = .{},
+
+    const Entry = struct {
+        page_id: u64,
+        page: *Page,
+        node: DoublyLinkedList.Node,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) PageCache {
+        const normalized_capacity = if (capacity == 0) 1 else capacity;
+        return .{
+            .allocator = allocator,
+            .capacity = normalized_capacity,
+            .map = std.AutoHashMap(u64, *Entry).init(allocator),
+            .lru = .{},
+        };
+    }
+
+    pub fn deinit(self: *PageCache) void {
+        self.map.deinit();
+    }
+
+    fn promote(self: *PageCache, entry: *Entry) void {
+        self.lru.remove(&entry.node);
+        self.lru.prepend(&entry.node);
+    }
+
+    fn takeOldestEntry(self: *PageCache) ?*Entry {
+        const node = self.lru.pop() orelse return null;
+        const entry: *Entry = @fieldParentPtr("node", node);
+        _ = self.map.remove(entry.page_id);
+        return entry;
+    }
+
+    pub fn get(self: *PageCache, page_id: u64) ?*Page {
+        const entry = self.map.get(page_id) orelse return null;
+        self.promote(entry);
+        return entry.page;
+    }
+
+    pub fn put(self: *PageCache, page_id: u64, page: *Page) !?*Page {
+        if (self.capacity == 0) {
+            return page;
+        }
+
+        if (self.map.get(page_id)) |entry| {
+            self.promote(entry);
+            const old_page = entry.page;
+            entry.page = page;
+            return old_page;
+        }
+
+        var evicted_page: ?*Page = null;
+        if (self.map.count() >= self.capacity) {
+            if (self.takeOldestEntry()) |evicted_entry| {
+                evicted_page = evicted_entry.page;
+                self.allocator.destroy(evicted_entry);
+            }
+        }
+
+        const entry = try self.allocator.create(Entry);
+        entry.* = .{
+            .page_id = page_id,
+            .page = page,
+            .node = .{},
+        };
+        self.lru.prepend(&entry.node);
+        try self.map.put(page_id, entry);
+
+        return evicted_page;
+    }
+
+    pub fn remove(self: *PageCache, page_id: u64) ?*Page {
+        if (self.map.fetchRemove(page_id)) |kv| {
+            const entry = kv.value;
+            self.lru.remove(&entry.node);
+            const page = entry.page;
+            self.allocator.destroy(entry);
+            return page;
+        }
+        return null;
+    }
+
+    pub fn clear(self: *PageCache, page_allocator: std.mem.Allocator) void {
+        while (self.lru.popFirst()) |node| {
+            const entry: *Entry = @fieldParentPtr("node", node);
+            _ = self.map.remove(entry.page_id);
+            entry.page.deinit(page_allocator);
+            page_allocator.destroy(entry.page);
+            self.allocator.destroy(entry);
+        }
+        self.lru = .{};
+        self.map.clearRetainingCapacity();
+    }
+};
+
 const BucketInitErrors = error{
     InvalidPath,
     InvalidDocId,
@@ -177,7 +279,7 @@ pub const Bucket = struct {
     path: []const u8,
     allocator: std.mem.Allocator,
     header: BucketHeader,
-    pageCache: std.AutoHashMap(u64, *Page),
+    pageCache: PageCache,
     rwlock: std.Thread.RwLock = .{},
     indexes: std.StringHashMap(*Index),
     autoVaccuum: bool = true,
@@ -216,7 +318,6 @@ pub const Bucket = struct {
     // Update init to include allocator
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Bucket {
         const bucket = try Bucket.openFile(allocator, path);
-        // bucket.pageCache = std.AutoHashMap(u64, Page).init(allocator);
         return bucket;
     }
 
@@ -229,6 +330,7 @@ pub const Bucket = struct {
         buildIdIndex: bool = false,
         mode: BucketFileMode = BucketFileMode.ReadWrite,
         autoVaccuum: bool = true,
+        page_cache_capacity: usize = DEFAULT_PAGE_CACHE_CAPACITY,
     };
 
     fn loadIndices(self: *Bucket, page: *const Page) !void {
@@ -319,7 +421,7 @@ pub const Bucket = struct {
         return Bucket.openFileWithOptions(ally, path, .{});
     }
 
-    fn createEmptyDBFile(path: []const u8, ally: mem.Allocator) BucketInitErrors!Bucket {
+    fn createEmptyDBFile(path: []const u8, ally: mem.Allocator, options: OpenBucketOptions) BucketInitErrors!Bucket {
         const cwd = std.fs.cwd();
         var new_file = switch (std.fs.path.isAbsolute(path)) {
             true => std.fs.createFileAbsolute(path, .{}),
@@ -348,8 +450,9 @@ pub const Bucket = struct {
             .path = ally.dupe(u8, abs_path[0..]) catch return BucketInitErrors.OutOfMemory,
             .header = .init(),
             .allocator = ally,
-            .pageCache = .init(ally),
+            .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
+            .autoVaccuum = options.autoVaccuum,
             .objectIdGenerator = .init(),
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
@@ -369,7 +472,7 @@ pub const Bucket = struct {
         var file = cwd.openFile(path, .{ .mode = if (options.mode == .ReadOnly) .read_only else .read_write }) catch |err| switch (err) {
             error.FileNotFound => {
                 if (options.mode != .ReadWrite) return BucketInitErrors.FileNotFound;
-                return createEmptyDBFile(path, ally);
+                return createEmptyDBFile(path, ally, options);
             },
             error.IsDir => return BucketInitErrors.InvalidPath,
             else => return BucketInitErrors.FileOpenError,
@@ -401,8 +504,9 @@ pub const Bucket = struct {
             .path = ally.dupe(u8, abs_path[0..]) catch return BucketInitErrors.OutOfMemory,
             .header = .read(header_bytes[0..BucketHeader.byteSize]),
             .allocator = ally,
-            .pageCache = .init(ally),
+            .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
+            .autoVaccuum = options.autoVaccuum,
             .objectIdGenerator = .init(),
         };
 
@@ -482,7 +586,12 @@ pub const Bucket = struct {
 
         _ = try reader_r.read(page.data);
 
-        try self.pageCache.put(page_id, page);
+        if (try self.pageCache.put(page_id, page)) |evicted| {
+            if (evicted != page) {
+                evicted.deinit(self.allocator);
+                self.allocator.destroy(evicted);
+            }
+        }
 
         return page;
     }
@@ -518,7 +627,12 @@ pub const Bucket = struct {
         try self.flushHeader(); // Ensure the header is flushed to disk
         const page = try self.allocator.create(Page);
         page.* = try Page.init(self.allocator, self, PageHeader.init(page_type, new_page_id));
-        try self.pageCache.put(new_page_id, page);
+        if (try self.pageCache.put(new_page_id, page)) |evicted| {
+            if (evicted != page) {
+                evicted.deinit(self.allocator);
+                self.allocator.destroy(evicted);
+            }
+        }
         return page;
     }
 
@@ -1009,7 +1123,10 @@ pub const Bucket = struct {
         self.rwlock.lock();
         defer self.rwlock.unlock();
         for (locations.items) |*location| {
-            _ = self.pageCache.remove(location.page_id);
+            if (self.pageCache.remove(location.page_id)) |removed_page| {
+                removed_page.deinit(self.allocator);
+                self.allocator.destroy(removed_page);
+            }
             location.header.is_deleted = 1;
             const offset = BucketHeader.byteSize + @sizeOf(PageHeader) + (location.page_id * DEFAULT_PAGE_SIZE);
             try writer_r.seekTo(offset + location.offset);
@@ -1030,7 +1147,11 @@ pub const Bucket = struct {
     pub fn vacuum(self: *Bucket) !void {
         const tempFileName = try std.fmt.allocPrint(self.allocator, "{s}-temp", .{self.path});
         defer self.allocator.free(tempFileName);
-        var newBucket = try Bucket.openFile(self.allocator, tempFileName);
+        const cache_capacity = self.pageCache.capacity;
+        var newBucket = try Bucket.openFileWithOptions(self.allocator, tempFileName, .{
+            .page_cache_capacity = cache_capacity,
+            .autoVaccuum = self.autoVaccuum,
+        });
         const fs = std.fs;
         defer newBucket.deinit();
         // defer fs.deleteFileAbsolute(tempFileName) catch |err| {
@@ -1071,7 +1192,7 @@ pub const Bucket = struct {
         var reader = self.file.reader(&readerBuffer);
         _ = try reader.read(&header_bytes);
         self.header = BucketHeader.read(&header_bytes);
-        self.pageCache = .init(self.allocator);
+        self.pageCache = PageCache.init(self.allocator, cache_capacity);
         // Reinitialize and reload indexes from the meta page
         self.indexes = .init(self.allocator);
         const meta = try self.loadPage(0);
@@ -1081,7 +1202,8 @@ pub const Bucket = struct {
     pub fn deinit(self: *Bucket) void {
         self.file.close();
         self.allocator.free(self.path);
-        defer self.pageCache.deinit();
+        self.pageCache.clear(self.allocator);
+        self.pageCache.deinit();
         // Free index values and their keys
         var idx_iter = self.indexes.iterator();
         while (idx_iter.next()) |pair| {
@@ -1089,12 +1211,6 @@ pub const Bucket = struct {
             self.allocator.free(pair.key_ptr.*);
         }
         self.indexes.deinit();
-        var cacheIter = self.pageCache.valueIterator();
-        while (cacheIter.next()) |pair| {
-            pair.*.deinit(self.allocator);
-            self.allocator.destroy(pair.*);
-            // self.allocator.free(pair.value_ptr.*);
-        }
     }
 };
 
@@ -1159,6 +1275,40 @@ test "Bucket.insert" {
     //     // const oId = item.get("_id").?.objectId.value;
     //     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
     // }
+}
+
+test "Page cache enforces capacity with LRU eviction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const bucket_path = "cache-capacity.bucket";
+
+    var bucket = try Bucket.openFileWithOptions(allocator, bucket_path, .{
+        .page_cache_capacity = 2,
+    });
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile(bucket_path) catch |err| {
+        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    };
+
+    _ = try bucket.loadPage(0); // meta page
+    _ = try bucket.createNewPage(.Data);
+    _ = try bucket.createNewPage(.Data);
+
+    try testing.expectEqual(@as(usize, 2), bucket.pageCache.map.count());
+    var found_key0 = false;
+    var found_key2 = false;
+    var found_key3 = false;
+    var iter = bucket.pageCache.map.iterator();
+    while (iter.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (key == 0) found_key0 = true;
+        if (key == 2) found_key2 = true;
+        if (key == 3) found_key3 = true;
+    }
+    try testing.expect(!found_key0);
+    try testing.expect(found_key2);
+    try testing.expect(found_key3);
 }
 
 test "Page overflow" {
