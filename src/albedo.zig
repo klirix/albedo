@@ -678,31 +678,6 @@ pub const Bucket = struct {
         self.header.doc_count += 1;
         try self.flushHeader();
 
-        // for (self.indexes.keys()) |indexPath| {
-        //     const index = self.indexes.get(indexPath) catch unreachable;
-        //     const value = doc.get(indexPath);
-        //     if (value == null or value.? == .binary or value.? == .document) {
-        //         index.insert(
-        //             .{ .null = .{} },
-        //             .{ .offset = result.offset, .pageId = result.page_id },
-        //         );
-        //         continue;
-        //         // This is obly for sparse indexes
-        //         //continue;
-        //     }
-
-        //     if (value.?.string and value.?.string.len > 1024) {
-        //         return error.StringIndexTooLong;
-        //     } else {
-        //         // copy the string to a new buffer
-        //         const newBuffer = try self.allocator.alloc(u8, value.?.string.len);
-        //         @memcpy(newBuffer, value.?.string);
-        //         value = .{ .string = .{ .value = newBuffer } };
-        //     }
-        //     // std.debug.print("Inserting into index {s}\n", .{indexPath});
-        //     index.insert(value.?, .{ .offset = result.offset, .pageId = result.page_id });
-        // }
-
         // After writing is done, free the page resources
         return result;
     }

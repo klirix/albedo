@@ -9,7 +9,8 @@ const Page = albedo.Page;
 pub const IndexOptions = packed struct {
     unique: u1 = 0,
     sparse: u1 = 0,
-    reserved: u6 = 0,
+    reverse: u1 = 0,
+    reserved: u5 = 0,
 };
 
 pub const Index = struct {
