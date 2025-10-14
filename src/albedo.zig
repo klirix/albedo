@@ -15,7 +15,8 @@ const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
 const ALBEDO_FLAGS = 0;
 const DEFAULT_PAGE_SIZE = 8192; // 8kB, or up to 64kB
-const DEFAULT_PAGE_CACHE_CAPACITY: usize = 256 * 32; // 64MB cache
+const DEFAULT_PAGE_CACHE_CAPACITY: usize = 256 * 64; // 64MB cache
+const MAX_INDEX_STRING_BYTES: usize = 256;
 const DoublyLinkedList = std.DoublyLinkedList;
 
 const BucketHeader = struct {
@@ -391,18 +392,18 @@ pub const Bucket = struct {
         try self.writePage(meta_page);
     }
 
-    fn ensureIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
+    pub fn ensureIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
         if (self.indexes.contains(path)) {
             // Index already exists
             return;
         }
-
-        const newIndex = try Index.create(self);
-        newIndex.options = options;
-        const key = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(key);
-        try self.indexes.put(key, newIndex);
-        try self.recordIndexes();
+        // const newIndex = try Index.create(self);
+        // newIndex.options = options;
+        // const key = try self.allocator.dupe(u8, path);
+        // errdefer self.allocator.free(key);
+        // try self.indexes.put(key, newIndex);
+        // try self.recordIndexes();
+        try self.buildIndex(path, options);
     }
 
     fn resolvePath(path: []const u8, ally: std.mem.Allocator) std.fs.Dir.RealPathAllocError![]const u8 {
@@ -459,6 +460,7 @@ pub const Bucket = struct {
         bucket.ensureIndex("_id", .{}) catch return BucketInitErrors.InitializationError;
 
         bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
+        bucket.rwlock = .{};
 
         return bucket;
     }
@@ -523,11 +525,6 @@ pub const Bucket = struct {
             return BucketInitErrors.LoadIndexError;
         };
 
-        if (options.buildIdIndex) {
-            // TODO: Implement _id index building
-            // try bucket.buildIndex("_id");
-        }
-
         return bucket;
     }
 
@@ -547,11 +544,95 @@ pub const Bucket = struct {
         // try self.file.sync(); // Ensure the write is flushed to disk
     }
 
-    pub fn buildIndex(self: *Bucket, _: []const u8) !void {
-        // Check if the index already exists
-        _ = try self.createNewPage(.Index);
+    pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
+        std.debug.print("BUCKET LOCKING: {s}\n", .{path});
+        self.rwlock.lock();
+        defer {
+            self.rwlock.unlock();
 
-        // try self.indexes.put(path, newTree);
+            std.debug.print("BUCKET UNLOCKED: {s}\n", .{path});
+        }
+        std.debug.print("Index creating: {s}\n", .{path});
+
+        if (self.indexes.contains(path)) {
+            return;
+        }
+
+        var owned_strings = std.ArrayList([]u8){};
+        defer {
+            for (owned_strings.items) |buf| {
+                self.allocator.free(buf);
+            }
+            owned_strings.deinit(self.allocator);
+        }
+
+        var index = try Index.create(self);
+        var index_owner = true;
+        defer if (index_owner) index.deinit();
+        index.options = options;
+
+        var scanner = try ScanIterator.init(self, self.allocator);
+        defer scanner.deinit();
+        std.debug.print("Index scanning: {s}\n", .{path});
+
+        while (true) {
+            const maybe_doc = try scanner.next();
+            if (maybe_doc == null) break;
+            const doc_result = maybe_doc.?;
+
+            defer self.allocator.free(doc_result.data);
+
+            var doc = BSONDocument{ .buffer = doc_result.data };
+
+            var values = std.ArrayList(BSONValue){};
+            defer values.deinit(self.allocator);
+
+            const has_values = try self.gatherIndexValuesForPath(&doc, path, options, &values);
+            if (!has_values) continue;
+
+            for (values.items, 0..) |_, i| {
+                values.items[i] = try self.cloneIndexValue(values.items[i], &owned_strings);
+            }
+
+            const location = Index.DocumentLocation{
+                .pageId = doc_result.page_id,
+                .offset = doc_result.offset,
+            };
+
+            for (values.items) |value| {
+                try index.insert(value, location);
+            }
+        }
+
+        const root_id = index.root.id;
+        index.deinit();
+        index_owner = false;
+
+        var final_index = try Index.loadWithOptions(self, root_id, options);
+        var final_index_owner = true;
+        defer if (final_index_owner) final_index.deinit();
+
+        const key = try self.allocator.dupe(u8, path);
+        var key_owner = true;
+        defer if (key_owner) self.allocator.free(key);
+
+        var inserted_into_map = false;
+        errdefer if (inserted_into_map) {
+            _ = self.indexes.remove(path);
+        };
+
+        try self.indexes.put(key, final_index);
+        inserted_into_map = true;
+
+        self.bindIndex(final_index);
+
+        try self.recordIndexes();
+
+        std.debug.print("Index created: {s}\n", .{path});
+
+        final_index_owner = false;
+        key_owner = false;
+        inserted_into_map = false;
     }
 
     // Previous openFile implementation remains the same...
@@ -721,9 +802,45 @@ pub const Bucket = struct {
         doc.serializeToMemory(encoded_doc);
         var page: *Page = undefined;
 
-        // Get the size of the document to be inserted
         self.rwlock.lock();
-        defer self.rwlock.unlock();
+        defer {
+            self.rwlock.unlock();
+        }
+
+        var planned_index_inserts = std.ArrayList(PlannedIndexInsert){};
+        defer {
+            for (planned_index_inserts.items) |*plan| {
+                plan.values.deinit(self.allocator);
+            }
+            planned_index_inserts.deinit(self.allocator);
+        }
+
+        var idx_iter = self.indexes.iterator();
+        while (idx_iter.next()) |entry| {
+            var values = std.ArrayList(BSONValue){};
+            var retain_values = false;
+            defer {
+                if (!retain_values) {
+                    values.deinit(self.allocator);
+                }
+            }
+
+            const index_ptr = entry.value_ptr.*;
+            const path = entry.key_ptr.*;
+            self.bindIndex(index_ptr);
+
+            const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values);
+            if (!has_values) {
+                continue;
+            }
+
+            try planned_index_inserts.append(self.allocator, PlannedIndexInsert{
+                .index = index_ptr,
+                .values = values,
+            });
+            retain_values = true;
+        }
+
         // If no pages exist yet, create one
         if (try findLastDataPage(self)) |p| {
             page = p;
@@ -787,6 +904,18 @@ pub const Bucket = struct {
             }
         }
 
+        const index_location = Index.DocumentLocation{
+            .pageId = result.page_id,
+            .offset = result.offset,
+        };
+
+        for (planned_index_inserts.items) |plan| {
+            self.bindIndex(plan.index);
+            for (plan.values.items) |value| {
+                try plan.index.insert(value, index_location);
+            }
+        }
+
         self.header.doc_count += 1;
         try self.flushHeader();
 
@@ -811,6 +940,120 @@ pub const Bucket = struct {
         header: DocHeader,
         data: []u8,
     };
+
+    const PlannedIndexInsert = struct {
+        index: *Index,
+        values: std.ArrayList(BSONValue) = .{},
+    };
+
+    const IndexValueError = error{
+        IndexedStringTooLong,
+    };
+
+    fn docLocationKey(loc: Index.DocumentLocation) u128 {
+        return (@as(u128, loc.pageId) << 16) | @as(u128, loc.offset);
+    }
+
+    fn isIndexableValue(value: bson.BSONValue) bool {
+        return switch (value) {
+            .document, .binary => false,
+            .array => false,
+            .string => value.string.value.len <= MAX_INDEX_STRING_BYTES,
+            else => true,
+        };
+    }
+
+    fn appendSingleIndexValue(
+        values: *std.ArrayList(BSONValue),
+        allocator: mem.Allocator,
+        value: bson.BSONValue,
+    ) (IndexValueError || mem.Allocator.Error)!bool {
+        switch (value) {
+            .document, .binary => return false,
+            .array => return false,
+            .string => {
+                if (value.string.value.len > MAX_INDEX_STRING_BYTES) {
+                    return IndexValueError.IndexedStringTooLong;
+                }
+                try values.append(allocator, value);
+                return true;
+            },
+            else => {
+                try values.append(allocator, value);
+                return true;
+            },
+        }
+    }
+
+    fn collectIndexableValue(
+        values: *std.ArrayListUnmanaged(BSONValue),
+        allocator: mem.Allocator,
+        value: bson.BSONValue,
+    ) (IndexValueError || mem.Allocator.Error)!usize {
+        switch (value) {
+            .array => |arr| {
+                var iter = arr.iter();
+                var count: usize = 0;
+                while (iter.next()) |pair| {
+                    if (try appendSingleIndexValue(values, allocator, pair.value)) {
+                        count += 1;
+                    }
+                }
+                return count;
+            },
+            else => {
+                if (try appendSingleIndexValue(values, allocator, value)) {
+                    return 1;
+                }
+                return 0;
+            },
+        }
+    }
+
+    fn gatherIndexValuesForPath(
+        self: *Bucket,
+        doc: *const bson.BSONDocument,
+        path: []const u8,
+        options: IndexOptions,
+        values: *std.ArrayListUnmanaged(BSONValue),
+    ) (IndexValueError || mem.Allocator.Error)!bool {
+        var appended: usize = 0;
+        if (doc.getPath(path)) |value| {
+            appended = try collectIndexableValue(values, self.allocator, value);
+            if (appended > 0) {
+                return true;
+            }
+        }
+
+        if (options.sparse == 1) {
+            return false;
+        }
+
+        try values.append(self.allocator, BSONValue{ .null = bson.BSONNull{} });
+        return true;
+    }
+
+    fn cloneIndexValue(
+        self: *Bucket,
+        value: BSONValue,
+        owned_strings: *std.ArrayList([]u8),
+    ) mem.Allocator.Error!BSONValue {
+        return switch (value) {
+            .string => {
+                const dup = try self.allocator.dupe(u8, value.string.value);
+                errdefer self.allocator.free(dup);
+                try owned_strings.append(self.allocator, dup);
+                return BSONValue{ .string = .{ .value = dup } };
+            },
+            else => value,
+        };
+    }
+
+    fn bindIndex(self: *Bucket, index: *Index) void {
+        if (index.bucket != self) {
+            index.bucket = self;
+        }
+    }
 
     pub const ScanIterator = struct {
         bucket: *Bucket,
@@ -931,42 +1174,95 @@ pub const Bucket = struct {
         }
     };
 
+    const QueryPlan = struct {
+        const Source = enum {
+            full_scan,
+            index,
+        };
+
+        const IndexStrategy = enum {
+            range,
+            points,
+        };
+
+        const IndexBounds = struct {
+            lower: ?Index.RangeBound = null,
+            upper: ?Index.RangeBound = null,
+        };
+
+        source: Source = .full_scan,
+        index: ?*Index = null,
+        filter_index: ?usize = null,
+        index_path: ?[]const u8 = null,
+        bounds: IndexBounds = .{},
+        eager: bool = false,
+        sort_covered: bool = false,
+        index_strategy: IndexStrategy = .range,
+    };
+
     pub const ListIterator = struct {
-        docList: []BSONDocument,
+        docList: []BSONDocument = &[_]BSONDocument{},
         arena: *std.heap.ArenaAllocator,
         bucket: *Bucket,
         query: query.Query,
+        plan: QueryPlan,
         index: usize = 0,
 
         scanner: ScanIterator,
+        index_iterator: Index.RangeIterator = undefined,
+        index_iterator_initialized: bool = false,
+        point_iterator: Index.RangeIterator = undefined,
+        point_iterator_initialized: bool = false,
+        point_values: std.ArrayListUnmanaged(bson.BSONValue) = .{},
+        point_values_consumed: usize = 0,
+        point_value_total: usize = 0,
+        point_seen: std.AutoHashMap(u128, void) = undefined,
+        point_seen_initialized: bool = false,
         limitLeft: ?u64 = null,
         offsetLeft: u64 = 0,
         next: *const fn (*ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument = nextUnfetched,
 
+        fn ensureIndexIterator(self: *ListIterator) error{ScanError}!*Index.RangeIterator {
+            if (self.plan.index_strategy != .range) {
+                return error.ScanError;
+            }
+            if (!self.index_iterator_initialized) {
+                self.index_iterator = self.bucket.initIndexIterator(&self.plan) catch {
+                    return error.ScanError;
+                };
+                self.index_iterator_initialized = true;
+            }
+            return &self.index_iterator;
+        }
+
         pub fn prequery(self: *ListIterator) !void {
-            // Preload the documents into the list
             const ally = self.arena.allocator();
             var docList: std.ArrayList(BSONDocument) = .{};
-            while (try self.scanner.next()) |scanRes| {
-                const bsonDoc: BSONDocument = .{ .buffer = scanRes.data };
-                if (self.query.filters.len == 0 or self.query.match(&bsonDoc)) {
-                    try docList.append(ally, bsonDoc);
-                }
-            }
-            const resultSlice = docList.items;
+            try self.bucket.collectDocs(&docList, ally, &self.query, &self.plan);
+
+            var resultSlice = docList.items;
             if (self.query.sortConfig) |sortConfig| {
-                std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
+                if (!self.plan.sort_covered) {
+                    std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
+                }
             }
 
             if (self.query.sector) |sector| {
                 if (sector.offset) |offset| {
-                    std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[@truncate(offset)..]);
+                    if (offset < resultSlice.len) {
+                        const start: usize = @intCast(offset);
+                        std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[start..]);
+                    } else {
+                        resultSlice = resultSlice[0..0];
+                    }
                 }
             }
+
             const offset = if (self.query.sector) |sector| sector.offset orelse 0 else 0;
             const limit = if (self.query.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
             self.docList = resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
+            self.index = 0;
         }
 
         fn nextPrefetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
@@ -979,115 +1275,602 @@ pub const Bucket = struct {
         }
 
         pub fn nextUnfetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
+            std.debug.assert(self.plan.source == .full_scan);
+
+            while (true) {
+                if (self.limitLeft != null and self.limitLeft.? == 0) {
+                    return null;
+                }
+
+                const doc = self.scanner.next() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ScanError,
+                } orelse return null;
+
+                const bsonDoc: BSONDocument = .{ .buffer = doc.data };
+                if (self.query.match(&bsonDoc) and self.offsetLeft == 0) {
+                    if (self.limitLeft != null) self.limitLeft = self.limitLeft.? - 1;
+                    return bsonDoc;
+                }
+
+                if (self.offsetLeft != 0) {
+                    self.offsetLeft -= 1;
+                }
+            }
+        }
+
+        fn nextIndex(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
+            std.debug.assert(self.plan.source == .index);
             if (self.limitLeft != null and self.limitLeft.? == 0) {
                 return null;
             }
-            const doc = self.scanner.next() catch |err| {
-                if (err == error.OutOfMemory) {
-                    return error.OutOfMemory;
-                } else {
-                    return error.ScanError;
+            const ally = self.arena.allocator();
+
+            if (self.plan.index_strategy == .range) {
+                const iterator = try self.ensureIndexIterator();
+
+                while (true) {
+                    const loc = try iterator.next() orelse return null;
+                    var doc = self.bucket.readDocAt(ally, .{
+                        .page_id = loc.pageId,
+                        .offset = loc.offset,
+                    }) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.DocumentDeleted => continue,
+                        else => return error.ScanError,
+                    };
+
+                    if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
+                        ally.free(doc.buffer);
+                        continue;
+                    }
+
+                    if (self.offsetLeft != 0) {
+                        self.offsetLeft -= 1;
+                        ally.free(doc.buffer);
+                        continue;
+                    }
+
+                    if (self.limitLeft) |*limit| {
+                        if (limit.* == 0) {
+                            ally.free(doc.buffer);
+                            return null;
+                        }
+                        limit.* -= 1;
+                    }
+
+                    return doc;
                 }
-            } orelse return null;
-            const bsonDoc: BSONDocument = .{ .buffer = doc.data };
-            if (self.query.match(&bsonDoc) and self.offsetLeft == 0) {
-                if (self.limitLeft != null) self.limitLeft = self.limitLeft.? - 1;
-                return bsonDoc;
-            } else if (self.offsetLeft != 0) {
-                self.offsetLeft -= 1;
             }
-            return nextUnfetched(self);
+
+            if (self.plan.index == null) {
+                return null;
+            }
+
+            if (self.point_value_total == 0) {
+                return null;
+            }
+
+            if (!self.point_seen_initialized) {
+                self.point_seen = std.AutoHashMap(u128, void).init(ally);
+                self.point_seen_initialized = true;
+            }
+
+            while (true) {
+                if (!self.point_iterator_initialized) {
+                    const next_value = self.nextPointFilterValue() orelse return null;
+                    const index_ptr = self.plan.index.?;
+                    self.bucket.bindIndex(index_ptr);
+                    self.point_iterator = index_ptr.point(next_value) catch return error.ScanError;
+                    self.point_iterator_initialized = true;
+                }
+
+                const maybe_loc = self.point_iterator.next() catch return error.ScanError;
+                const loc = maybe_loc orelse {
+                    self.point_iterator_initialized = false;
+                    continue;
+                };
+
+                const key = docLocationKey(loc);
+                if (self.point_seen.contains(key)) {
+                    continue;
+                }
+
+                self.point_seen.put(key, {}) catch return error.OutOfMemory;
+
+                var doc = self.bucket.readDocAt(ally, .{
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DocumentDeleted => continue,
+                    else => return error.ScanError,
+                };
+
+                if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
+                    ally.free(doc.buffer);
+                    continue;
+                }
+
+                if (self.offsetLeft != 0) {
+                    self.offsetLeft -= 1;
+                    ally.free(doc.buffer);
+                    continue;
+                }
+
+                if (self.limitLeft) |*limit| {
+                    if (limit.* == 0) {
+                        ally.free(doc.buffer);
+                        return null;
+                    }
+                    limit.* -= 1;
+                }
+
+                return doc;
+            }
+        }
+
+        fn nextPointFilterValue(self: *ListIterator) ?bson.BSONValue {
+            if (self.point_values_consumed >= self.point_value_total) return null;
+            const value = self.point_values.items[self.point_values_consumed];
+            self.point_values_consumed += 1;
+            return value;
         }
 
         fn deinit(self: *ListIterator) !void {
-            // Deinitialize the list iterator
-            self.scanner.deinit();
+            if (self.plan.source == .full_scan) {
+                self.scanner.deinit();
+            }
+            if (self.point_seen_initialized) {
+                self.point_seen.deinit();
+            }
+            if (self.point_value_total > 0) {
+                self.point_values.deinit(self.arena.allocator());
+            }
         }
     };
 
+    fn planQuery(self: *Bucket, q: *const query.Query) QueryPlan {
+        var plan = QueryPlan{};
+        var best_score: u8 = 0;
+
+        for (q.filters, 0..) |filter, idx| {
+            switch (filter) {
+                .eq => |data| {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const candidate_bounds = QueryPlan.IndexBounds{
+                        .lower = Index.RangeBound.gte(data.value),
+                        .upper = Index.RangeBound.lte(data.value),
+                    };
+                    const score: u8 = 100;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = candidate_bounds;
+                        plan.sort_covered = false;
+                        plan.index_strategy = .range;
+                    }
+                },
+                .lt => |data| {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const candidate_bounds = QueryPlan.IndexBounds{
+                        .upper = Index.RangeBound.lt(data.value),
+                    };
+                    const score: u8 = 80;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = candidate_bounds;
+                        plan.sort_covered = false;
+                        plan.index_strategy = .range;
+                    }
+                },
+                .lte => |data| {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const candidate_bounds = QueryPlan.IndexBounds{
+                        .upper = Index.RangeBound.lte(data.value),
+                    };
+                    const score: u8 = 80;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = candidate_bounds;
+                        plan.sort_covered = false;
+                        plan.index_strategy = .range;
+                    }
+                },
+                .gt => |data| {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const candidate_bounds = QueryPlan.IndexBounds{
+                        .lower = Index.RangeBound.gt(data.value),
+                    };
+                    const score: u8 = 80;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = candidate_bounds;
+                        plan.sort_covered = false;
+                        plan.index_strategy = .range;
+                    }
+                },
+                .gte => |data| {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const candidate_bounds = QueryPlan.IndexBounds{
+                        .lower = Index.RangeBound.gte(data.value),
+                    };
+                    const score: u8 = 80;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = candidate_bounds;
+                        plan.sort_covered = false;
+                        plan.index_strategy = .range;
+                    }
+                },
+                .between => |data| {
+                    const lower = data.value.array.get("0") orelse continue;
+                    const upper = data.value.array.get("1") orelse continue;
+                    if (!isIndexableValue(lower) or !isIndexableValue(upper)) continue;
+
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const candidate_bounds = QueryPlan.IndexBounds{
+                        .lower = Index.RangeBound.gt(lower),
+                        .upper = Index.RangeBound.lt(upper),
+                    };
+                    const score: u8 = 85;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = candidate_bounds;
+                        plan.sort_covered = false;
+                        plan.index_strategy = .range;
+                    }
+                },
+                .in => |data| {
+                    if (data.value != bson.BSONValueType.array) continue;
+                    var iter = data.value.array.iter();
+                    var count: usize = 0;
+                    var all_indexable = true;
+                    while (iter.next()) |pair| {
+                        if (!isIndexableValue(pair.value)) {
+                            all_indexable = false;
+                            break;
+                        }
+                        count += 1;
+                    }
+                    if (!all_indexable or count == 0) continue;
+
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const score: u8 = 95;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = .{};
+                        plan.sort_covered = false;
+                        plan.index_strategy = .points;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (q.sortConfig) |sortConfig| {
+            const sort_path = switch (sortConfig) {
+                .asc => |p| p,
+                .desc => |p| p,
+            };
+
+            if (plan.source == .index and plan.index_strategy == .range) {
+                if (plan.index_path) |path| {
+                    if (std.mem.eql(u8, path, sort_path)) {
+                        if (plan.index) |idx_ptr| {
+                            plan.sort_covered = switch (sortConfig) {
+                                .asc => idx_ptr.options.reverse == 0,
+                                .desc => idx_ptr.options.reverse == 1,
+                            };
+                        }
+                    }
+                }
+            } else if (best_score == 0) {
+                if (self.indexes.get(sort_path)) |index_ptr| {
+                    plan.source = .index;
+                    plan.index = index_ptr;
+                    plan.filter_index = null;
+                    plan.index_path = sort_path;
+                    plan.bounds = .{};
+                    plan.sort_covered = switch (sortConfig) {
+                        .asc => index_ptr.options.reverse == 0,
+                        .desc => index_ptr.options.reverse == 1,
+                    };
+                    plan.index_strategy = .range;
+                }
+            }
+
+            plan.eager = !plan.sort_covered;
+        } else {
+            plan.eager = false;
+        }
+
+        return plan;
+    }
+
+    const PlanningError = error{
+        InvalidIndexPlan,
+        InvalidLowerBoundOperator,
+        InvalidUpperBoundOperator,
+    };
+
+    fn initIndexIterator(self: *Bucket, plan: *const QueryPlan) PlanningError!Index.RangeIterator {
+        const index_ptr = plan.index orelse return PlanningError.InvalidIndexPlan;
+        self.bindIndex(index_ptr);
+        return index_ptr.range(plan.bounds.lower, plan.bounds.upper);
+    }
+
+    fn collectDocs(
+        self: *Bucket,
+        docList: *std.ArrayList(BSONDocument),
+        ally: std.mem.Allocator,
+        q: *const query.Query,
+        plan: *const QueryPlan,
+    ) error{ OutOfMemory, ScanError }!void {
+        switch (plan.source) {
+            .full_scan => {
+                var iterator = ScanIterator.init(self, ally) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ScanError,
+                };
+                defer iterator.deinit();
+                while (true) {
+                    const next_doc = iterator.next() catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.ScanError,
+                    } orelse break;
+                    const docRaw = next_doc;
+                    const doc = BSONDocument{ .buffer = docRaw.data };
+                    if (q.filters.len == 0 or q.match(&doc)) {
+                        try docList.append(ally, doc);
+                    } else {
+                        ally.free(docRaw.data);
+                    }
+                }
+            },
+            .index => {
+                const index_ptr = plan.index orelse return error.ScanError;
+                self.bindIndex(index_ptr);
+
+                switch (plan.index_strategy) {
+                    .range => {
+                        var iterator = self.initIndexIterator(plan) catch return error.ScanError;
+                        while (true) {
+                            const maybe_loc = iterator.next() catch return error.ScanError;
+                            const loc = maybe_loc orelse break;
+                            var doc = self.readDocAt(ally, .{
+                                .page_id = loc.pageId,
+                                .offset = loc.offset,
+                            }) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                error.DocumentDeleted => continue,
+                                else => return error.ScanError,
+                            };
+                            if (q.filters.len == 0 or q.match(&doc)) {
+                                try docList.append(ally, doc);
+                            } else {
+                                ally.free(doc.buffer);
+                            }
+                        }
+                    },
+                    .points => {
+                        const filter_index = plan.filter_index orelse return error.ScanError;
+                        const filter_ptr = &q.filters[filter_index];
+                        const inFilter = switch (filter_ptr.*) {
+                            .in => |*in_ref| in_ref,
+                            else => return error.ScanError,
+                        };
+
+                        var seen = std.AutoHashMap(u128, void).init(ally);
+                        defer seen.deinit();
+
+                        var value_iter = inFilter.value.array.iter();
+                        while (value_iter.next()) |pair| {
+                            if (!isIndexableValue(pair.value)) continue;
+
+                            var range_iter = index_ptr.point(pair.value) catch return error.ScanError;
+                            while (true) {
+                                const maybe_loc = range_iter.next() catch return error.ScanError;
+                                const loc = maybe_loc orelse break;
+                                const key = docLocationKey(loc);
+                                if (seen.contains(key)) continue;
+                                try seen.put(key, {});
+
+                                var doc = self.readDocAt(ally, .{
+                                    .page_id = loc.pageId,
+                                    .offset = loc.offset,
+                                }) catch |err| switch (err) {
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    error.DocumentDeleted => continue,
+                                    else => return error.ScanError,
+                                };
+
+                                if (q.filters.len == 0 or q.match(&doc)) {
+                                    try docList.append(ally, doc);
+                                } else {
+                                    ally.free(doc.buffer);
+                                }
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+
     pub fn listIterate(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*ListIterator {
         var ally = arena.allocator();
+        const plan = self.planQuery(&q);
+
+        var scanner_instance: ScanIterator = undefined;
+        if (plan.source == .full_scan) {
+            scanner_instance = try ScanIterator.init(self, ally);
+        }
+
         const rc = try ally.create(ListIterator);
         rc.* = ListIterator{
             .bucket = self,
             .arena = arena,
             .query = q,
-
-            .docList = undefined,
-            .scanner = try ScanIterator.init(self, ally),
+            .plan = plan,
+            .docList = &[_]BSONDocument{},
+            .scanner = if (plan.source == .full_scan) scanner_instance else undefined,
+            .index_iterator = undefined,
+            .index_iterator_initialized = false,
+            .point_iterator = undefined,
+            .point_iterator_initialized = false,
+            .point_values = .{},
+            .point_values_consumed = 0,
+            .point_value_total = 0,
+            .point_seen = undefined,
+            .point_seen_initialized = false,
+            .limitLeft = null,
+            .offsetLeft = 0,
             .index = 0,
         };
-        if (q.sortConfig != null) {
+
+        if (plan.source == .index and plan.index_strategy == .points) {
+            if (plan.filter_index) |fi| {
+                switch (rc.query.filters[fi]) {
+                    .in => |inFilter| {
+                        var iter = inFilter.value.array.iter();
+                        while (iter.next()) |pair| {
+                            if (!isIndexableValue(pair.value)) continue;
+                            try rc.point_values.append(ally, pair.value);
+                        }
+                        rc.point_value_total = rc.point_values.items.len;
+                        rc.point_values_consumed = 0;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        if (plan.eager) {
             try rc.prequery();
             rc.next = ListIterator.nextPrefetched;
         } else {
-            if (q.sector) |sector| {
-                rc.limitLeft = sector.limit;
-                if (sector.offset) |offset| rc.offsetLeft = offset;
+            if (plan.source == .index) {
+                if (q.sector) |sector| {
+                    rc.limitLeft = sector.limit;
+                    if (sector.offset) |offset| rc.offsetLeft = offset;
+                }
+                rc.next = ListIterator.nextIndex;
+            } else {
+                if (q.sector) |sector| {
+                    rc.limitLeft = sector.limit;
+                    if (sector.offset) |offset| rc.offsetLeft = offset;
+                }
+                rc.next = ListIterator.nextUnfetched;
             }
         }
+
         return rc;
     }
 
     pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]BSONDocument {
-        var docList = std.ArrayList(BSONDocument).init(allocator);
-        if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(limit);
-        var iterator = try ScanIterator.init(self, allocator);
+        var plan = self.planQuery(&q);
+        var docList: std.ArrayList(BSONDocument) = .{};
+        if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(allocator, limit);
 
-        while (try iterator.next()) |docRaw| {
-            const doc = BSONDocument{ .buffer = docRaw.data };
-            if (q.filters.len == 0 or q.match(&doc)) {
-                @branchHint(.likely);
-                try docList.append(doc);
+        try self.collectDocs(&docList, allocator, &q, &plan);
+
+        var resultSlice = docList.items;
+        if (q.sortConfig) |sortConfig| {
+            if (!plan.sort_covered) {
+                std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
             }
         }
 
-        const resultSlice = docList.items;
-
-        if (q.sortConfig) |sortConfig| {
-            std.mem.sort(BSONDocument, resultSlice, sortConfig, query.Query.sort);
+        if (q.sector) |sector| {
+            if (sector.offset) |offset| {
+                if (offset < resultSlice.len) {
+                    const start: usize = @intCast(offset);
+                    std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[start..]);
+                } else {
+                    resultSlice = resultSlice[0..0];
+                }
+            }
         }
+
         const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
         const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
         return resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
     }
 
-    fn readDocAt(self: *Bucket, ally: mem.Allocator, loc: DocumentLocation) BSONDocument {
-        var offset = loc.offset;
-        const pageIterator = PageIterator{
+    fn readDocAt(
+        self: *Bucket,
+        ally: mem.Allocator,
+        loc: DocumentLocation,
+    ) error{ OutOfMemory, PageNotFound, DocumentDeleted }!BSONDocument {
+        var page = self.loadPage(loc.page_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PageNotFound,
+        };
+        var offset: u16 = loc.offset;
+
+        if (offset + @sizeOf(DocHeader) > page.data.len) {
+            return error.PageNotFound;
+        }
+
+        const header = std.mem.bytesToValue(DocHeader, page.data[offset .. offset + @sizeOf(DocHeader)]);
+        if (header.is_deleted == 1) {
+            return error.DocumentDeleted;
+        }
+        offset += @sizeOf(DocHeader);
+
+        const doc_len_u32 = mem.readInt(u32, page.data[offset..][0..4], .little);
+        const doc_len = @as(usize, doc_len_u32);
+
+        var docBuffer = try ally.alloc(u8, doc_len);
+        var remaining = doc_len;
+        const first_chunk = @min(doc_len, page.data.len - offset);
+        @memcpy(docBuffer[0..first_chunk], page.data[offset .. offset + first_chunk]);
+        remaining -= first_chunk;
+        var written = first_chunk;
+
+        var page_iterator = PageIterator{
             .bucket = self,
-            .index = loc.page_id,
+            .index = loc.page_id + 1,
             .type = .Data,
             .reverse = false,
         };
-        const page = self.loadPage(loc.page_id) catch {
-            // std.debug.print("Failed to load page {d}: {any}\n", .{ loc.page_id, err });
-            return error.PageNotFound;
-        };
 
-        const doc_len = mem.readInt(u32, page.data[offset..][0..4], .little);
-        var leftToCopy: u32 = doc_len;
-
-        var docBuffer = try ally.alloc(u8, doc_len);
-
-        var writableBuffer = docBuffer[0..doc_len];
-        var availableToCopy: u16 = @truncate(@min(doc_len, page.data.len - offset));
-        @memcpy(writableBuffer[0..availableToCopy], page.data[offset .. offset + availableToCopy]);
-        offset += @truncate(availableToCopy);
-        leftToCopy -= availableToCopy;
-
-        while (leftToCopy > 0) {
-            writableBuffer = docBuffer[(doc_len - leftToCopy)..doc_len];
-            // Check if we need to load a new page
-            page = try pageIterator.next() orelse {
-                return error.PageNotFound;
-            };
-            availableToCopy = @truncate(@min(leftToCopy, page.data.len));
-
-            @memcpy(writableBuffer[0..availableToCopy], page.data[0..availableToCopy]);
-            offset = availableToCopy;
-            leftToCopy -= availableToCopy;
+        while (remaining > 0) {
+            const next_page = page_iterator.next() catch return error.PageNotFound;
+            const page_ref = next_page orelse return error.PageNotFound;
+            const chunk = @min(remaining, page_ref.data.len);
+            @memcpy(docBuffer[written .. written + chunk], page_ref.data[0..chunk]);
+            written += chunk;
+            remaining -= chunk;
         }
 
         return BSONDocument{ .buffer = docBuffer };
@@ -1275,6 +2058,289 @@ test "Bucket.insert" {
     // }
 }
 
+test "Bucket.indexed queries use indexes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var bucket = try Bucket.init(allocator, "index-query.bucket");
+    defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("index-query.bucket") catch |err| {
+        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    };
+
+    const canLockShared = bucket.rwlock.tryLockShared();
+    std.debug.print("Can lock shared: {any}\n", .{canLockShared});
+    if (canLockShared) {
+        bucket.rwlock.unlockShared();
+    }
+    const canLockExclusive = bucket.rwlock.tryLock();
+    std.debug.print("Can lock exclusive: {any}\n", .{canLockExclusive});
+    if (canLockExclusive) {
+        bucket.rwlock.unlock();
+    }
+    try bucket.ensureIndex("age", .{});
+    try bucket.ensureIndex("scores", .{ .sparse = 1 });
+
+    const alice_scores_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 5 } }),
+        bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 7 } }),
+    };
+    var alice_scores = try bson.BSONDocument.fromPairs(allocator, @constCast(alice_scores_pairs[0..]));
+    defer alice_scores.deinit(allocator);
+
+    const bob_scores_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 9 } }),
+    };
+    var bob_scores = try bson.BSONDocument.fromPairs(allocator, @constCast(bob_scores_pairs[0..]));
+    defer bob_scores.deinit(allocator);
+
+    const dora_scores_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 7 } }),
+    };
+    var dora_scores = try bson.BSONDocument.fromPairs(allocator, @constCast(dora_scores_pairs[0..]));
+    defer dora_scores.deinit(allocator);
+
+    const doc_pairs = [_][]const bson.BSONKeyValuePair{
+        &[_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Alice" } }),
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
+            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .array = alice_scores }),
+        },
+        &[_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Bob" } }),
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 40 } }),
+            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .array = bob_scores }),
+        },
+        &[_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Carol" } }),
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 50 } }),
+        },
+        &[_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Dora" } }),
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 35 } }),
+            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .array = dora_scores }),
+        },
+    };
+
+    for (doc_pairs) |pairs| {
+        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs));
+        _ = try bucket.insert(doc);
+        doc.deinit(allocator);
+    }
+
+    // Equality uses range strategy
+    {
+        const age_filter_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
+        };
+        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+        defer age_filter_doc.deinit(allocator);
+
+        const root_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+        };
+        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+        defer qdoc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, qdoc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(plan.source == .index);
+        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+
+        var iter = try bucket.listIterate(&arena, q);
+        defer {
+            iter.deinit() catch {};
+        }
+        var count: usize = 0;
+        while (try iter.next(iter)) |doc| {
+            const name = doc.get("name").?.string.value;
+            try testing.expect(std.mem.eql(u8, name, "Alice"));
+            count += 1;
+            allocator.free(doc.buffer);
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+
+    // $in uses point strategy and returns two documents
+    {
+        const in_values_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 30 } }),
+            bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 40 } }),
+        };
+        var in_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(in_values_pairs[0..]));
+        defer in_values_doc.deinit(allocator);
+
+        const age_in_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = in_values_doc }),
+        };
+        var age_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_in_pairs[0..]));
+        defer age_in_doc.deinit(allocator);
+
+        const age_filter_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_in_doc }),
+        };
+        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+        defer age_filter_doc.deinit(allocator);
+
+        const root_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+        };
+        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+        defer qdoc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, qdoc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(plan.source == .index);
+        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
+        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+
+        var iter = try bucket.listIterate(&arena, q);
+        defer {
+            iter.deinit() catch {};
+        }
+        var seen_alice = false;
+        var seen_bob = false;
+        var count: usize = 0;
+        while (try iter.next(iter)) |doc| {
+            const name = doc.get("name").?.string.value;
+            if (std.mem.eql(u8, name, "Alice")) {
+                try testing.expect(!seen_alice);
+                seen_alice = true;
+            } else if (std.mem.eql(u8, name, "Bob")) {
+                try testing.expect(!seen_bob);
+                seen_bob = true;
+            } else {
+                try testing.expect(false);
+            }
+            count += 1;
+            allocator.free(doc.buffer);
+        }
+        try testing.expectEqual(@as(usize, 2), count);
+        try testing.expect(seen_alice and seen_bob);
+    }
+
+    // $between uses range strategy and returns Alice and Dora
+    {
+        const between_values_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 29 } }),
+            bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 38 } }),
+        };
+        var between_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(between_values_pairs[0..]));
+        defer between_values_doc.deinit(allocator);
+
+        const age_between_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("$between", bson.BSONValue{ .array = between_values_doc }),
+        };
+        var age_between_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_between_pairs[0..]));
+        defer age_between_doc.deinit(allocator);
+
+        const age_filter_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_between_doc }),
+        };
+        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+        defer age_filter_doc.deinit(allocator);
+
+        const root_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+        };
+        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+        defer qdoc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, qdoc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(plan.source == .index);
+        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+
+        var iter = try bucket.listIterate(&arena, q);
+        defer {
+            iter.deinit() catch {};
+        }
+        var seen_alice = false;
+        var seen_dora = false;
+        var count: usize = 0;
+        while (try iter.next(iter)) |doc| {
+            const name = doc.get("name").?.string.value;
+            if (std.mem.eql(u8, name, "Alice")) {
+                seen_alice = true;
+            } else if (std.mem.eql(u8, name, "Dora")) {
+                seen_dora = true;
+            } else {
+                try testing.expect(false);
+            }
+            count += 1;
+            allocator.free(doc.buffer);
+        }
+        try testing.expectEqual(@as(usize, 2), count);
+        try testing.expect(seen_alice and seen_dora);
+    }
+
+    // $in on scores should hit the scores index using point strategy and avoid duplicates
+    {
+        const score_values_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 7 } }),
+        };
+        var score_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(score_values_pairs[0..]));
+        defer score_values_doc.deinit(allocator);
+
+        const scores_in_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = score_values_doc }),
+        };
+        var scores_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_in_pairs[0..]));
+        defer scores_in_doc.deinit(allocator);
+
+        const scores_filter_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .document = scores_in_doc }),
+        };
+        var scores_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_filter_pairs[0..]));
+        defer scores_filter_doc.deinit(allocator);
+
+        const root_pairs_scores = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = scores_filter_doc }),
+        };
+        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs_scores[0..]));
+        defer qdoc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, qdoc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(plan.source == .index);
+        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
+        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "scores"));
+
+        var doc_list: std.ArrayList(BSONDocument) = .{};
+        defer {
+            for (doc_list.items) |doc_item| allocator.free(doc_item.buffer);
+            doc_list.deinit(allocator);
+        }
+        try bucket.collectDocs(&doc_list, allocator, &q, &plan);
+
+        var seen_alice = false;
+        var seen_dora = false;
+        for (doc_list.items) |doc| {
+            const name = doc.get("name").?.string.value;
+            if (std.mem.eql(u8, name, "Alice")) {
+                try testing.expect(!seen_alice);
+                seen_alice = true;
+            } else if (std.mem.eql(u8, name, "Dora")) {
+                try testing.expect(!seen_dora);
+                seen_dora = true;
+            } else {
+                try testing.expect(false);
+            }
+        }
+        try testing.expectEqual(@as(usize, 2), doc_list.items.len);
+        try testing.expect(seen_alice and seen_dora);
+    }
+}
+
 test "Page cache enforces capacity with LRU eviction" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1292,6 +2358,7 @@ test "Page cache enforces capacity with LRU eviction" {
     _ = try bucket.loadPage(0); // meta page
     _ = try bucket.createNewPage(.Data);
     _ = try bucket.createNewPage(.Data);
+    _ = try bucket.createNewPage(.Data);
 
     try testing.expectEqual(@as(usize, 2), bucket.pageCache.map.count());
     var found_key0 = false;
@@ -1299,6 +2366,7 @@ test "Page cache enforces capacity with LRU eviction" {
     var found_key3 = false;
     var iter = bucket.pageCache.map.iterator();
     while (iter.next()) |entry| {
+        std.debug.print("Found page: {any}\n", .{entry.key_ptr.*});
         const key = entry.key_ptr.*;
         if (key == 0) found_key0 = true;
         if (key == 2) found_key2 = true;

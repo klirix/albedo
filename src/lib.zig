@@ -3,6 +3,7 @@ const testing = std.testing;
 const albedo = @import("./albedo.zig");
 const bson = @import("./bson.zig");
 const Query = @import("./query.zig").Query;
+const IndexOptions = @import("./bplusindex.zig").IndexOptions;
 const buildOptions = @import("build_options");
 
 const Bucket = albedo.Bucket;
@@ -57,6 +58,28 @@ pub export fn albedo_insert(bucket: *albedo.Bucket, docBuffer: [*]u8) Result {
     return Result.OK;
     // Insert the document into the bucket
     // This is a placeholder for actual insertion logic
+}
+
+pub export fn albedo_ensure_index(bucket: *albedo.Bucket, path: [*:0]const u8, options_byte: u8) Result {
+    const path_proper = std.mem.span(path);
+    const index_options = IndexOptions{
+        .unique = @intCast(options_byte & 0x01),
+        .sparse = @intCast((options_byte >> 1) & 0x01),
+        .reverse = @intCast((options_byte >> 2) & 0x01),
+        .reserved = @intCast((options_byte >> 3) & 0x1F),
+    };
+
+    bucket.ensureIndex(path_proper, index_options) catch |err| switch (err) {
+        error.OutOfMemory => {
+            return Result.OutOfMemory;
+        },
+        else => {
+            std.debug.print("Failed to ensure index for path {s}, {any}\n", .{ path_proper, err });
+            return Result.Error;
+        },
+    };
+
+    return Result.OK;
 }
 
 pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen: u16) Result {

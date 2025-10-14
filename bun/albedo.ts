@@ -26,6 +26,10 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
     args: [FFIType.pointer, FFIType.pointer, FFIType.pointer],
     returns: "u8",
   },
+  albedo_ensure_index: {
+    args: [FFIType.pointer, FFIType.cstring, FFIType.uint8_t],
+    returns: "u8",
+  },
   albedo_delete: {
     args: [FFIType.pointer, FFIType.pointer],
     returns: "u8",
@@ -100,6 +104,27 @@ export class Bucket {
     const result = albedo.albedo_close(this.pointer);
     if (result !== 0) {
       throw new Error("Failed to close Albedo database");
+    }
+  }
+
+  static defaultIndexOptions = {
+    unique: false,
+    sparse: false,
+    reverse: false,
+  };
+
+  ensureIndex(field: string, options = Bucket.defaultIndexOptions) {
+    var optionFlags = 0;
+    optionFlags |= Number(options.reverse) << 0;
+    optionFlags |= Number(options.sparse) << 1;
+    optionFlags |= Number(options.unique) << 2;
+    const res = albedo.albedo_ensure_index(
+      this.pointer,
+      Buffer.from(`${field}\0`),
+      optionFlags
+    );
+    if (res !== 0) {
+      throw new Error("Failed to create index in Albedo database");
     }
   }
 

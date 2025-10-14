@@ -46,7 +46,7 @@ pub const Index = struct {
         }
     };
 
-    const DocumentLocation = struct {
+    pub const DocumentLocation = struct {
         pageId: u64,
         offset: u16,
         inline fn equal(self: *const DocumentLocation, other: *const DocumentLocation) bool {
@@ -335,7 +335,7 @@ pub const Index = struct {
         return current.findMatch(value);
     }
 
-    const RangeIterator = struct {
+    pub const RangeIterator = struct {
         index: *Index,
         current: *Node,
         currentIndex: usize,
