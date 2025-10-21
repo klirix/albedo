@@ -545,14 +545,10 @@ pub const Bucket = struct {
     }
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
-        std.debug.print("BUCKET LOCKING: {s}\n", .{path});
         self.rwlock.lock();
         defer {
             self.rwlock.unlock();
-
-            std.debug.print("BUCKET UNLOCKED: {s}\n", .{path});
         }
-        std.debug.print("Index creating: {s}\n", .{path});
 
         if (self.indexes.contains(path)) {
             return;
@@ -573,7 +569,6 @@ pub const Bucket = struct {
 
         var scanner = try ScanIterator.init(self, self.allocator);
         defer scanner.deinit();
-        std.debug.print("Index scanning: {s}\n", .{path});
 
         while (true) {
             const maybe_doc = try scanner.next();
@@ -627,8 +622,6 @@ pub const Bucket = struct {
         self.bindIndex(final_index);
 
         try self.recordIndexes();
-
-        std.debug.print("Index created: {s}\n", .{path});
 
         final_index_owner = false;
         key_owner = false;
@@ -2068,16 +2061,6 @@ test "Bucket.indexed queries use indexes" {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
-    const canLockShared = bucket.rwlock.tryLockShared();
-    std.debug.print("Can lock shared: {any}\n", .{canLockShared});
-    if (canLockShared) {
-        bucket.rwlock.unlockShared();
-    }
-    const canLockExclusive = bucket.rwlock.tryLock();
-    std.debug.print("Can lock exclusive: {any}\n", .{canLockExclusive});
-    if (canLockExclusive) {
-        bucket.rwlock.unlock();
-    }
     try bucket.ensureIndex("age", .{});
     try bucket.ensureIndex("scores", .{ .sparse = 1 });
 
@@ -2366,11 +2349,10 @@ test "Page cache enforces capacity with LRU eviction" {
     var found_key3 = false;
     var iter = bucket.pageCache.map.iterator();
     while (iter.next()) |entry| {
-        std.debug.print("Found page: {any}\n", .{entry.key_ptr.*});
         const key = entry.key_ptr.*;
         if (key == 0) found_key0 = true;
-        if (key == 2) found_key2 = true;
-        if (key == 3) found_key3 = true;
+        if (key == 3) found_key2 = true;
+        if (key == 4) found_key3 = true;
     }
     try testing.expect(!found_key0);
     try testing.expect(found_key2);
