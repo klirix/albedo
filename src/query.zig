@@ -91,60 +91,81 @@ pub const Filter = union(FilterType) {
     };
 
     fn parseDoc(ally: Allocator, doc: bson.BSONDocument) FilterParsingErrors![]Filter {
-        var filters = try ally.alloc(Filter, doc.keyNumber());
+        var filters = std.ArrayListUnmanaged(Filter){};
+        defer filters.deinit(ally);
+
         var iter = doc.iter();
-        var i: usize = 0;
-        while (iter.next()) |pair| : (i += 1) {
+        while (iter.next()) |pair| {
             const path = pair.key;
             if (path.len == 0) return FilterParsingErrors.InvalidQueryPath;
 
             switch (pair.value) {
                 .document => |*operatorDoc| {
-                    if (operatorDoc.get("$eq")) |operand| {
-                        filters[i] = Filter{
-                            .eq = .{ .path = path, .value = operand },
-                        };
-                        continue;
-                    } else if (operatorDoc.get("$in")) |operand| {
-                        filters[i] = Filter{
-                            .in = .{ .path = path, .value = operand },
-                        };
-                        continue;
-                    } else if (operatorDoc.get("$ne")) |operand| {
-                        filters[i] = Filter{
-                            .ne = .{ .path = path, .value = operand },
-                        };
-                        continue;
-                    } else if (operatorDoc.get("$lt")) |operand| {
-                        filters[i] = Filter{
-                            .lt = .{ .path = path, .value = operand },
-                        };
-                        continue;
-                    } else if (operatorDoc.get("$gt")) |operand| {
-                        filters[i] = Filter{
-                            .gt = .{ .path = path, .value = operand },
-                        };
-                        continue;
-                    } else if (operatorDoc.get("$between")) |operand| {
-                        if (operand != .array) return FilterParsingErrors.InvalidQueryOperatorParameter;
-                        if (operand.array.keyNumber() != 2) return FilterParsingErrors.InvalidQueryOperatorBetweenSize;
-                        filters[i] = Filter{
-                            .between = .{ .path = path, .value = operand },
-                        };
-                    } else {
-                        return FilterParsingErrors.InvalidQueryOperator;
+                    var op_iter = operatorDoc.iter();
+                    var matched = false;
+                    while (op_iter.next()) |op_pair| {
+                        const operand = op_pair.value;
+                        if (std.mem.eql(u8, op_pair.key, "$eq")) {
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .eq = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else if (std.mem.eql(u8, op_pair.key, "$in")) {
+                            if (operand != .array) return FilterParsingErrors.InvalidInOperatorValue;
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .in = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else if (std.mem.eql(u8, op_pair.key, "$ne")) {
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .ne = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else if (std.mem.eql(u8, op_pair.key, "$lt")) {
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .lt = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else if (std.mem.eql(u8, op_pair.key, "$lte")) {
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .lte = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else if (std.mem.eql(u8, op_pair.key, "$gt")) {
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .gt = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else if (std.mem.eql(u8, op_pair.key, "$gte")) {
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .gte = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else if (std.mem.eql(u8, op_pair.key, "$between")) {
+                            if (operand != .array) return FilterParsingErrors.InvalidQueryOperatorParameter;
+                            if (operand.array.keyNumber() != 2) return FilterParsingErrors.InvalidQueryOperatorBetweenSize;
+                            const path_copy = try ally.dupe(u8, path);
+                            errdefer ally.free(path_copy);
+                            try filters.append(ally, .{ .between = .{ .path = path_copy, .value = operand } });
+                            matched = true;
+                        } else {
+                            return FilterParsingErrors.InvalidQueryOperator;
+                        }
                     }
+
+                    if (!matched) return FilterParsingErrors.InvalidQueryOperator;
                 },
                 .string, .int32, .int64, .objectId, .datetime, .boolean, .null => {
-                    filters[i] = Filter{
-                        .eq = .{ .path = path, .value = pair.value },
-                    };
+                    const path_copy = try ally.dupe(u8, path);
+                    errdefer ally.free(path_copy);
+                    try filters.append(ally, .{ .eq = .{ .path = path_copy, .value = pair.value } });
                 },
 
                 else => return FilterParsingErrors.InvalidQueryFilter,
             }
         }
-        return filters;
+
+        return filters.toOwnedSlice(ally);
     }
 
     pub fn parse(ally: Allocator, doc: bson.BSONValue) FilterParsingErrors![]Filter {
@@ -209,6 +230,7 @@ test "Filter.parse" {
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
+        for (filters) |*f| f.deinit(ally);
         ally.free(filters);
     }
     try std.testing.expectEqual(filters.len, 1);
@@ -217,6 +239,60 @@ test "Filter.parse" {
         .eq => |*eqFilter| {
             try std.testing.expectEqualSlices(u8, "field.subfield", eqFilter.path);
             try std.testing.expectEqualStrings(eqFilter.value.string.value, "value");
+        },
+        else => unreachable,
+    }
+}
+
+test "Filter.parse handles gte" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$gte", .value = .{ .int32 = .{ .value = 10 } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "score", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(filters.len, 1);
+    switch (filters[0]) {
+        .gte => |*gteFilter| {
+            try std.testing.expectEqualSlices(u8, "score", gteFilter.path);
+            try std.testing.expectEqual(@as(i32, 10), gteFilter.value.int32.value);
+        },
+        else => unreachable,
+    }
+}
+
+test "Filter.parse handles lte" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$lte", .value = .{ .int32 = .{ .value = 20 } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "score", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(filters.len, 1);
+    switch (filters[0]) {
+        .lte => |*lteFilter| {
+            try std.testing.expectEqualSlices(u8, "score", lteFilter.path);
+            try std.testing.expectEqual(@as(i32, 20), lteFilter.value.int32.value);
         },
         else => unreachable,
     }

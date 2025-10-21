@@ -383,7 +383,7 @@ pub const Bucket = struct {
             try writer.writeAll(path);
             try writer.writeByte(0);
             try writer.writeStruct(index.options, .little);
-            try writer.writeInt(u64, index.root.id, .little);
+            try writer.writeInt(u64, index.root_page_id, .little);
         }
         const unused = writer.unusedCapacityLen();
         try writer.splatByteAll(0, unused); // Null-terminate the list
@@ -404,6 +404,25 @@ pub const Bucket = struct {
         // try self.indexes.put(key, newIndex);
         // try self.recordIndexes();
         try self.buildIndex(path, options);
+    }
+
+    pub fn dropIndex(self: *Bucket, path: []const u8) !void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+
+        var removed = self.indexes.fetchRemove(path) orelse return error.IndexNotFound;
+        errdefer {
+            // Attempt to restore the removed entry if anything fails after removal.
+            self.indexes.put(removed.key, removed.value) catch {
+                removed.value.deinit();
+                self.allocator.free(@constCast(removed.key));
+            };
+        }
+
+        try self.recordIndexes();
+
+        removed.value.deinit();
+        self.allocator.free(@constCast(removed.key));
     }
 
     fn resolvePath(path: []const u8, ally: std.mem.Allocator) std.fs.Dir.RealPathAllocError![]const u8 {
@@ -599,7 +618,7 @@ pub const Bucket = struct {
             }
         }
 
-        const root_id = index.root.id;
+        const root_id = index.root_page_id;
         index.deinit();
         index_owner = false;
 
@@ -1193,6 +1212,55 @@ pub const Bucket = struct {
         index_strategy: IndexStrategy = .range,
     };
 
+    inline fn planUsesPointStrategy(plan: *const QueryPlan, filters: []const query.Filter) bool {
+        if (plan.index_strategy != .points) return false;
+        if (plan.filter_index) |idx| {
+            return switch (filters[idx]) {
+                .in => true,
+                else => false,
+            };
+        }
+        return false;
+    }
+
+    inline fn planMatchesRange(plan: *const QueryPlan, index_ptr: *Index, path: []const u8) bool {
+        return plan.source == .index and plan.index_strategy == .range and plan.index != null and plan.index.? == index_ptr and plan.index_path != null and mem.eql(u8, plan.index_path.?, path);
+    }
+
+    inline fn tightenLowerBound(current: *?Index.RangeBound, candidate: Index.RangeBound) void {
+        if (current.* == null) {
+            current.* = candidate;
+            return;
+        }
+        const existing = current.*.?;
+        switch (existing.value.order(candidate.value)) {
+            .lt => current.* = candidate,
+            .gt => {},
+            .eq => {
+                if (existing.filter == .gte and candidate.filter == .gt) {
+                    current.* = candidate;
+                }
+            },
+        }
+    }
+
+    inline fn tightenUpperBound(current: *?Index.RangeBound, candidate: Index.RangeBound) void {
+        if (current.* == null) {
+            current.* = candidate;
+            return;
+        }
+        const existing = current.*.?;
+        switch (existing.value.order(candidate.value)) {
+            .gt => current.* = candidate,
+            .lt => {},
+            .eq => {
+                if (existing.filter == .lte and candidate.filter == .lt) {
+                    current.* = candidate;
+                }
+            },
+        }
+    }
+
     pub const ListIterator = struct {
         docList: []BSONDocument = &[_]BSONDocument{},
         arena: *std.heap.ArenaAllocator,
@@ -1216,7 +1284,7 @@ pub const Bucket = struct {
         next: *const fn (*ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument = nextUnfetched,
 
         fn ensureIndexIterator(self: *ListIterator) error{ScanError}!*Index.RangeIterator {
-            if (self.plan.index_strategy != .range) {
+            if (Bucket.planUsesPointStrategy(&self.plan, self.query.filters)) {
                 return error.ScanError;
             }
             if (!self.index_iterator_initialized) {
@@ -1298,12 +1366,16 @@ pub const Bucket = struct {
                 return null;
             }
             const ally = self.arena.allocator();
+            const use_points = Bucket.planUsesPointStrategy(&self.plan, self.query.filters);
 
-            if (self.plan.index_strategy == .range) {
+            if (!use_points) {
                 const iterator = try self.ensureIndexIterator();
 
                 while (true) {
-                    const loc = try iterator.next() orelse return null;
+                    const loc = iterator.next() catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.ScanError,
+                    } orelse return null;
                     var doc = self.bucket.readDocAt(ally, .{
                         .page_id = loc.pageId,
                         .offset = loc.offset,
@@ -1358,7 +1430,10 @@ pub const Bucket = struct {
                     self.point_iterator_initialized = true;
                 }
 
-                const maybe_loc = self.point_iterator.next() catch return error.ScanError;
+                const maybe_loc = self.point_iterator.next() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ScanError,
+                };
                 const loc = maybe_loc orelse {
                     self.point_iterator_initialized = false;
                     continue;
@@ -1436,6 +1511,7 @@ pub const Bucket = struct {
                         .upper = Index.RangeBound.lte(data.value),
                     };
                     const score: u8 = 100;
+                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
                     if (score > best_score) {
                         best_score = score;
                         plan.source = .index;
@@ -1445,6 +1521,13 @@ pub const Bucket = struct {
                         plan.bounds = candidate_bounds;
                         plan.sort_covered = false;
                         plan.index_strategy = .range;
+                    } else if (matches_current) {
+                        if (candidate_bounds.lower) |lower| {
+                            tightenLowerBound(&plan.bounds.lower, lower);
+                        }
+                        if (candidate_bounds.upper) |upper| {
+                            tightenUpperBound(&plan.bounds.upper, upper);
+                        }
                     }
                 },
                 .lt => |data| {
@@ -1453,6 +1536,7 @@ pub const Bucket = struct {
                         .upper = Index.RangeBound.lt(data.value),
                     };
                     const score: u8 = 80;
+                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
                     if (score > best_score) {
                         best_score = score;
                         plan.source = .index;
@@ -1462,6 +1546,10 @@ pub const Bucket = struct {
                         plan.bounds = candidate_bounds;
                         plan.sort_covered = false;
                         plan.index_strategy = .range;
+                    } else if (matches_current) {
+                        if (candidate_bounds.upper) |upper| {
+                            tightenUpperBound(&plan.bounds.upper, upper);
+                        }
                     }
                 },
                 .lte => |data| {
@@ -1470,6 +1558,7 @@ pub const Bucket = struct {
                         .upper = Index.RangeBound.lte(data.value),
                     };
                     const score: u8 = 80;
+                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
                     if (score > best_score) {
                         best_score = score;
                         plan.source = .index;
@@ -1479,6 +1568,10 @@ pub const Bucket = struct {
                         plan.bounds = candidate_bounds;
                         plan.sort_covered = false;
                         plan.index_strategy = .range;
+                    } else if (matches_current) {
+                        if (candidate_bounds.upper) |upper| {
+                            tightenUpperBound(&plan.bounds.upper, upper);
+                        }
                     }
                 },
                 .gt => |data| {
@@ -1487,6 +1580,7 @@ pub const Bucket = struct {
                         .lower = Index.RangeBound.gt(data.value),
                     };
                     const score: u8 = 80;
+                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
                     if (score > best_score) {
                         best_score = score;
                         plan.source = .index;
@@ -1496,6 +1590,10 @@ pub const Bucket = struct {
                         plan.bounds = candidate_bounds;
                         plan.sort_covered = false;
                         plan.index_strategy = .range;
+                    } else if (matches_current) {
+                        if (candidate_bounds.lower) |lower| {
+                            tightenLowerBound(&plan.bounds.lower, lower);
+                        }
                     }
                 },
                 .gte => |data| {
@@ -1504,6 +1602,7 @@ pub const Bucket = struct {
                         .lower = Index.RangeBound.gte(data.value),
                     };
                     const score: u8 = 80;
+                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
                     if (score > best_score) {
                         best_score = score;
                         plan.source = .index;
@@ -1513,6 +1612,10 @@ pub const Bucket = struct {
                         plan.bounds = candidate_bounds;
                         plan.sort_covered = false;
                         plan.index_strategy = .range;
+                    } else if (matches_current) {
+                        if (candidate_bounds.lower) |lower| {
+                            tightenLowerBound(&plan.bounds.lower, lower);
+                        }
                     }
                 },
                 .between => |data| {
@@ -1526,6 +1629,7 @@ pub const Bucket = struct {
                         .upper = Index.RangeBound.lt(upper),
                     };
                     const score: u8 = 85;
+                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
                     if (score > best_score) {
                         best_score = score;
                         plan.source = .index;
@@ -1535,6 +1639,13 @@ pub const Bucket = struct {
                         plan.bounds = candidate_bounds;
                         plan.sort_covered = false;
                         plan.index_strategy = .range;
+                    } else if (matches_current) {
+                        if (candidate_bounds.lower) |lower_bound| {
+                            tightenLowerBound(&plan.bounds.lower, lower_bound);
+                        }
+                        if (candidate_bounds.upper) |upper_bound| {
+                            tightenUpperBound(&plan.bounds.upper, upper_bound);
+                        }
                     }
                 },
                 .in => |data| {
@@ -1617,7 +1728,11 @@ pub const Bucket = struct {
     fn initIndexIterator(self: *Bucket, plan: *const QueryPlan) PlanningError!Index.RangeIterator {
         const index_ptr = plan.index orelse return PlanningError.InvalidIndexPlan;
         self.bindIndex(index_ptr);
-        return index_ptr.range(plan.bounds.lower, plan.bounds.upper);
+        return index_ptr.range(plan.bounds.lower, plan.bounds.upper) catch |err| switch (err) {
+            error.InvalidLowerBoundOperator => return PlanningError.InvalidLowerBoundOperator,
+            error.InvalidUpperBoundOperator => return PlanningError.InvalidUpperBoundOperator,
+            else => return PlanningError.InvalidIndexPlan,
+        };
     }
 
     fn collectDocs(
@@ -1652,12 +1767,32 @@ pub const Bucket = struct {
                 const index_ptr = plan.index orelse return error.ScanError;
                 self.bindIndex(index_ptr);
 
-                switch (plan.index_strategy) {
-                    .range => {
-                        var iterator = self.initIndexIterator(plan) catch return error.ScanError;
+                if (planUsesPointStrategy(plan, q.filters)) {
+                    const filter_index = plan.filter_index orelse return error.ScanError;
+                    const filter_ptr = &q.filters[filter_index];
+                    const inFilter = switch (filter_ptr.*) {
+                        .in => |*in_ref| in_ref,
+                        else => return error.ScanError,
+                    };
+
+                    var seen = std.AutoHashMap(u128, void).init(ally);
+                    defer seen.deinit();
+
+                    var value_iter = inFilter.value.array.iter();
+                    while (value_iter.next()) |pair| {
+                        if (!isIndexableValue(pair.value)) continue;
+
+                        var range_iter = index_ptr.point(pair.value) catch return error.ScanError;
                         while (true) {
-                            const maybe_loc = iterator.next() catch return error.ScanError;
+                            const maybe_loc = range_iter.next() catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.ScanError,
+                            };
                             const loc = maybe_loc orelse break;
+                            const key = docLocationKey(loc);
+                            if (seen.contains(key)) continue;
+                            try seen.put(key, {});
+
                             var doc = self.readDocAt(ally, .{
                                 .page_id = loc.pageId,
                                 .offset = loc.offset,
@@ -1666,53 +1801,36 @@ pub const Bucket = struct {
                                 error.DocumentDeleted => continue,
                                 else => return error.ScanError,
                             };
+
                             if (q.filters.len == 0 or q.match(&doc)) {
                                 try docList.append(ally, doc);
                             } else {
                                 ally.free(doc.buffer);
                             }
                         }
-                    },
-                    .points => {
-                        const filter_index = plan.filter_index orelse return error.ScanError;
-                        const filter_ptr = &q.filters[filter_index];
-                        const inFilter = switch (filter_ptr.*) {
-                            .in => |*in_ref| in_ref,
+                    }
+                } else {
+                    var iterator = self.initIndexIterator(plan) catch return error.ScanError;
+                    while (true) {
+                        const maybe_loc = iterator.next() catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
                             else => return error.ScanError,
                         };
-
-                        var seen = std.AutoHashMap(u128, void).init(ally);
-                        defer seen.deinit();
-
-                        var value_iter = inFilter.value.array.iter();
-                        while (value_iter.next()) |pair| {
-                            if (!isIndexableValue(pair.value)) continue;
-
-                            var range_iter = index_ptr.point(pair.value) catch return error.ScanError;
-                            while (true) {
-                                const maybe_loc = range_iter.next() catch return error.ScanError;
-                                const loc = maybe_loc orelse break;
-                                const key = docLocationKey(loc);
-                                if (seen.contains(key)) continue;
-                                try seen.put(key, {});
-
-                                var doc = self.readDocAt(ally, .{
-                                    .page_id = loc.pageId,
-                                    .offset = loc.offset,
-                                }) catch |err| switch (err) {
-                                    error.OutOfMemory => return error.OutOfMemory,
-                                    error.DocumentDeleted => continue,
-                                    else => return error.ScanError,
-                                };
-
-                                if (q.filters.len == 0 or q.match(&doc)) {
-                                    try docList.append(ally, doc);
-                                } else {
-                                    ally.free(doc.buffer);
-                                }
-                            }
+                        const loc = maybe_loc orelse break;
+                        var doc = self.readDocAt(ally, .{
+                            .page_id = loc.pageId,
+                            .offset = loc.offset,
+                        }) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.DocumentDeleted => continue,
+                            else => return error.ScanError,
+                        };
+                        if (q.filters.len == 0 or q.match(&doc)) {
+                            try docList.append(ally, doc);
+                        } else {
+                            ally.free(doc.buffer);
                         }
-                    },
+                    }
                 }
             },
         }
@@ -1749,20 +1867,19 @@ pub const Bucket = struct {
             .index = 0,
         };
 
-        if (plan.source == .index and plan.index_strategy == .points) {
-            if (plan.filter_index) |fi| {
-                switch (rc.query.filters[fi]) {
-                    .in => |inFilter| {
-                        var iter = inFilter.value.array.iter();
-                        while (iter.next()) |pair| {
-                            if (!isIndexableValue(pair.value)) continue;
-                            try rc.point_values.append(ally, pair.value);
-                        }
-                        rc.point_value_total = rc.point_values.items.len;
-                        rc.point_values_consumed = 0;
-                    },
-                    else => {},
-                }
+        if (Bucket.planUsesPointStrategy(&rc.plan, rc.query.filters)) {
+            const fi = rc.plan.filter_index.?;
+            switch (rc.query.filters[fi]) {
+                .in => |inFilter| {
+                    var iter = inFilter.value.array.iter();
+                    while (iter.next()) |pair| {
+                        if (!isIndexableValue(pair.value)) continue;
+                        try rc.point_values.append(ally, pair.value);
+                    }
+                    rc.point_value_total = rc.point_values.items.len;
+                    rc.point_values_consumed = 0;
+                },
+                else => {},
             }
         }
 
@@ -1932,13 +2049,35 @@ pub const Bucket = struct {
         //     std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
         // };
         var iterator = try ScanIterator.init(self, self.allocator);
-        const newMeta = try newBucket.loadPage(0);
+        // const newMeta = try newBucket.loadPage(0);
         const oldMeta = try self.loadPage(0);
-        @memcpy(newMeta.data, oldMeta.data);
-        newBucket.loadIndices(newMeta) catch {
-            return BucketInitErrors.LoadIndexError;
-        };
-        try newBucket.recordIndexes();
+        // // @memcpy(newMeta.data, oldMeta.data);
+        // // newBucket.loadIndices(newMeta) catch {
+        // //     return BucketInitErrors.LoadIndexError;
+        // // };
+        // try newBucket.recordIndexes();
+        var idxReader = std.io.Reader.fixed(oldMeta.data);
+        while (true) {
+            // Stop when we hit the first NUL at the beginning (no more entries)
+            const b = try idxReader.peekByte();
+            if (b == 0) break;
+
+            // Read the index path (NUL-terminated); returned slice is inclusive of NUL
+            const path_inclusive = idxReader.takeDelimiterInclusive(0) catch return PageError.InvalidPageSize;
+            if (path_inclusive.len == 0) break; // defensive
+            // Strip trailing NUL so map key does not include it
+            const path_no_nul = path_inclusive[0 .. path_inclusive.len - 1];
+            const key = try self.allocator.dupe(u8, path_no_nul);
+            errdefer self.allocator.free(key);
+
+            // Read index options
+            const options = idxReader.takeStruct(IndexOptions, .little) catch return PageError.InvalidPageSize;
+
+            // Read the index page ID
+            _ = idxReader.takeInt(u64, .little) catch return PageError.InvalidPageSize;
+
+            try newBucket.ensureIndex(path_no_nul, options);
+        }
 
         while (try iterator.next()) |doc| {
             const newDoc = bson.BSONDocument.init(doc.data);
@@ -2145,6 +2284,73 @@ test "Bucket.indexed queries use indexes" {
             allocator.free(doc.buffer);
         }
         try testing.expectEqual(@as(usize, 1), count);
+    }
+
+    // Combined lower and upper bounds use range strategy and honor both filters
+    {
+        const age_range_ops = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("$gte", bson.BSONValue{ .int32 = .{ .value = 35 } }),
+            bson.BSONKeyValuePair.init("$lte", bson.BSONValue{ .int32 = .{ .value = 40 } }),
+        };
+        var age_range_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_range_ops[0..]));
+        defer age_range_doc.deinit(allocator);
+
+        const age_filter_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_range_doc }),
+        };
+        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+        defer age_filter_doc.deinit(allocator);
+
+        const root_pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+        };
+        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+        defer qdoc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, qdoc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(plan.source == .index);
+        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+        try testing.expect(plan.bounds.lower != null);
+        try testing.expect(plan.bounds.upper != null);
+        try testing.expect(plan.bounds.lower.?.filter == .gte);
+        try testing.expect(plan.bounds.upper.?.filter == .lte);
+        switch (plan.bounds.lower.?.value) {
+            .int32 => |v| try testing.expect(v.value == 35),
+            else => try testing.expect(false),
+        }
+        switch (plan.bounds.upper.?.value) {
+            .int32 => |v| try testing.expect(v.value == 40),
+            else => try testing.expect(false),
+        }
+
+        var iter = try bucket.listIterate(&arena, q);
+        defer {
+            iter.deinit() catch {};
+        }
+        var seen_dora = false;
+        var seen_bob = false;
+        var count: usize = 0;
+        while (try iter.next(iter)) |doc| {
+            const name = doc.get("name").?.string.value;
+            if (std.mem.eql(u8, name, "Dora")) {
+                try testing.expect(!seen_dora);
+                seen_dora = true;
+            } else if (std.mem.eql(u8, name, "Bob")) {
+                try testing.expect(!seen_bob);
+                seen_bob = true;
+            } else {
+                try testing.expect(false);
+            }
+            count += 1;
+            allocator.free(doc.buffer);
+        }
+        try testing.expectEqual(@as(usize, 2), count);
+        try testing.expect(seen_dora);
+        try testing.expect(seen_bob);
     }
 
     // $in uses point strategy and returns two documents
@@ -2542,4 +2748,37 @@ test "Deleted docs disappear after vacuum" {
     const afterVacuumDocCount = afterVacuumDocs.len;
 
     try std.testing.expect(afterVacuumDocCount == 1);
+}
+
+test "Bucket.dropIndex removes metadata entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const file_name = "drop-index.bucket";
+    defer std.fs.cwd().deleteFile(file_name) catch |err| {
+        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    };
+
+    {
+        var bucket = try Bucket.init(allocator, file_name);
+        defer bucket.deinit();
+
+        try bucket.ensureIndex("age", .{});
+        try testing.expect(bucket.indexes.contains("age"));
+
+        try testing.expectError(error.IndexNotFound, bucket.dropIndex("missing"));
+
+        try bucket.dropIndex("age");
+        try testing.expect(!bucket.indexes.contains("age"));
+
+        try testing.expectError(error.IndexNotFound, bucket.dropIndex("age"));
+    }
+
+    {
+        var reopened = try Bucket.init(allocator, file_name);
+        defer reopened.deinit();
+
+        try testing.expect(!reopened.indexes.contains("age"));
+        try testing.expect(reopened.indexes.contains("_id"));
+    }
 }

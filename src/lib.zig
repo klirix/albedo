@@ -18,6 +18,7 @@ const Result = enum(u8) {
     // Specific error codes
     OutOfMemory,
     FileNotFound,
+    NotFound,
     InvalidFormat,
 };
 
@@ -75,6 +76,25 @@ pub export fn albedo_ensure_index(bucket: *albedo.Bucket, path: [*:0]const u8, o
         },
         else => {
             std.debug.print("Failed to ensure index for path {s}, {any}\n", .{ path_proper, err });
+            return Result.Error;
+        },
+    };
+
+    return Result.OK;
+}
+
+pub export fn albedo_drop_index(bucket: *albedo.Bucket, path: [*:0]const u8) Result {
+    const path_proper = std.mem.span(path);
+
+    bucket.dropIndex(path_proper) catch |err| switch (err) {
+        error.IndexNotFound => {
+            return Result.NotFound;
+        },
+        error.OutOfMemory => {
+            return Result.OutOfMemory;
+        },
+        else => {
+            std.debug.print("Failed to drop index for path {s}, {any}\n", .{ path_proper, err });
             return Result.Error;
         },
     };

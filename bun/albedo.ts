@@ -30,6 +30,10 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
     args: [FFIType.pointer, FFIType.cstring, FFIType.uint8_t],
     returns: "u8",
   },
+  albedo_drop_index: {
+    args: [FFIType.pointer, FFIType.cstring],
+    returns: "u8",
+  },
   albedo_delete: {
     args: [FFIType.pointer, FFIType.pointer],
     returns: "u8",
@@ -46,11 +50,26 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
     args: [FFIType.pointer],
     returns: "u8",
   },
+  albedo_vacuum: {
+    args: [FFIType.pointer],
+    returns: "u8",
+  },
   albedo_close: {
     args: [FFIType.pointer],
     returns: "u8",
   },
 });
+
+const ResultCode = {
+  OK: 0,
+  Error: 1,
+  HasData: 2,
+  EOS: 3,
+  OutOfMemory: 4,
+  FileNotFound: 5,
+  NotFound: 6,
+  InvalidFormat: 7,
+} as const;
 
 type Path = string;
 type Scalar = string | number | Date | boolean | null | ObjectId;
@@ -58,7 +77,9 @@ type Filter =
   | Scalar
   | { $eq: Scalar }
   | { $gt: Scalar }
+  | { $gte: Scalar }
   | { $lt: Scalar }
+  | { $lte: Scalar }
   | { $ne: Scalar }
   | { $in: Scalar[] }
   | { $between: [Scalar, Scalar] };
@@ -107,6 +128,12 @@ export class Bucket {
     }
   }
 
+  vacuum() {
+    const result = albedo.albedo_vacuum(this.pointer);
+    if (result !== 0) {
+      throw new Error("Failed to vacuum Albedo database");
+    }
+  }
   static defaultIndexOptions = {
     unique: false,
     sparse: false,
@@ -126,6 +153,20 @@ export class Bucket {
     if (res !== 0) {
       throw new Error("Failed to create index in Albedo database");
     }
+  }
+
+  dropIndex(field: string) {
+    const res = albedo.albedo_drop_index(
+      this.pointer,
+      Buffer.from(`${field}\0`)
+    );
+    if (res === ResultCode.OK) {
+      return true;
+    }
+    if (res === ResultCode.NotFound) {
+      return false;
+    }
+    throw new Error("Failed to drop index in Albedo database");
   }
 
   delete(query: Query["query"], options: { sector?: Query["sector"] } = {}) {
@@ -168,10 +209,10 @@ export class Bucket {
     while (true) {
       const res = albedo.albedo_data(iterHandle, dataPtrPtr);
 
-      if (res === 3) {
+      if (res === ResultCode.EOS) {
         break;
       }
-      if (res > 1) {
+      if (res > ResultCode.Error) {
         console.log("res", res);
         throw new Error("Failed to get data from Albedo database");
       }
