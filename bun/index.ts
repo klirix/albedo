@@ -1,7 +1,7 @@
 import { ObjectId } from "bson";
 import albedo, { Bucket } from "./albedo";
 
-const bucket = Bucket.open("./test.bucket");
+const bucket = Bucket.open(":memory:");
 
 const file = Bun.file("libalbedo.dylib");
 const buffer = await file.arrayBuffer();
@@ -23,7 +23,7 @@ const buffer = await file.arrayBuffer();
 // console.timeEnd("insertion2");
 
 console.time("insertion2");
-for (let i = 0; i < 100; i++) {
+for (let i = 0; i < 100000; i++) {
   bucket.insert({ hello: `world${i}`, date: new Date() });
 }
 console.timeEnd("insertion2");

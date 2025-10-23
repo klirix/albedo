@@ -67,17 +67,22 @@ const BucketHeader = struct {
         return header;
     }
 
+    pub fn toBytes(self: *const BucketHeader) [byteSize]u8 {
+        var buffer: [byteSize]u8 = undefined;
+        std.mem.copyForwards(u8, buffer[0..6], ALBEDO_MAGIC);
+        buffer[6] = self.version;
+        buffer[7] = self.flags;
+        std.mem.writeInt(u32, buffer[8..12], self.page_size, .little);
+        std.mem.writeInt(u64, buffer[12..20], self.page_count, .little);
+        std.mem.writeInt(u64, buffer[20..28], self.doc_count, .little);
+        std.mem.writeInt(u64, buffer[28..36], self.deleted_count, .little);
+        std.mem.copyForwards(u8, buffer[36..], &self.reserved);
+        return buffer;
+    }
+
     pub fn write(self: *const BucketHeader, writer: *std.Io.Writer) !void {
-        // var buffer: [64]u8 = [_]u8{0} ** 64;
-        _ = try writer.write(ALBEDO_MAGIC);
-        _ = try writer.writeByte(self.version);
-        _ = try writer.writeByte(self.flags);
-        _ = try writer.writeInt(u32, self.page_size, .little);
-        _ = try writer.writeInt(u64, self.page_count, .little);
-        _ = try writer.writeInt(u64, self.doc_count, .little);
-        _ = try writer.writeInt(u64, self.deleted_count, .little);
-        _ = try writer.write(&self.reserved);
-        // return buffer;
+        const bytes = self.toBytes();
+        _ = try writer.write(&bytes);
     }
 };
 
@@ -274,7 +279,7 @@ const BucketInitErrors = error{
 };
 
 pub const Bucket = struct {
-    file: std.fs.File,
+    file: ?std.fs.File = null,
     path: []const u8,
     allocator: std.mem.Allocator,
     header: BucketHeader,
@@ -283,6 +288,7 @@ pub const Bucket = struct {
     indexes: std.StringHashMap(*Index),
     autoVaccuum: bool = true,
     objectIdGenerator: ObjectIdGenerator,
+    in_memory: bool = false,
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -484,8 +490,34 @@ pub const Bucket = struct {
         return bucket;
     }
 
+    fn createInMemoryBucket(ally: mem.Allocator, options: OpenBucketOptions) BucketInitErrors!Bucket {
+        var bucket = Bucket{
+            .file = null,
+            .path = ally.dupe(u8, ":memory:") catch return BucketInitErrors.OutOfMemory,
+            .header = .init(),
+            .allocator = ally,
+            .pageCache = PageCache.init(ally, std.math.maxInt(usize)),
+            .indexes = .init(ally),
+            .autoVaccuum = options.autoVaccuum,
+            .objectIdGenerator = .init(),
+            .in_memory = true,
+        };
+
+        const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
+        bucket.ensureIndex("_id", .{}) catch return BucketInitErrors.InitializationError;
+        bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
+
+        bucket.rwlock = .{};
+
+        return bucket;
+    }
+
     // Path may be relative or absolute
     pub fn openFileWithOptions(ally: std.mem.Allocator, path: []const u8, options: OpenBucketOptions) BucketInitErrors!Bucket {
+        if (mem.eql(u8, path, ":memory:")) {
+            return createInMemoryBucket(ally, options);
+        }
+
         const cwd = std.fs.cwd();
 
         var file = cwd.openFile(path, .{ .mode = if (options.mode == .ReadOnly) .read_only else .read_write }) catch |err| switch (err) {
@@ -547,20 +579,24 @@ pub const Bucket = struct {
         return bucket;
     }
 
-    fn flushHeader(self: *const Bucket) !void {
-        // Flush the header to disk
-        try self.file.seekTo(0);
+    fn flushHeader(self: *Bucket) !void {
+        if (self.in_memory) {
+            return;
+        }
 
-        var buf: [1024]u8 = undefined;
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
 
-        var writer_r = self.file.writer(&buf);
+        var buf: [BucketHeader.byteSize]u8 = undefined;
 
+        try file.seekTo(0);
+
+        var writer_r = file.writer(&buf);
         try writer_r.seekTo(0);
 
         const writer = &writer_r.interface;
         _ = try self.header.write(writer);
         try writer.flush();
-        // try self.file.sync(); // Ensure the write is flushed to disk
+        // try file.sync(); // Ensure the write is flushed to disk
     }
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
@@ -656,9 +692,15 @@ pub const Bucket = struct {
             return page;
         }
 
+        if (self.in_memory) {
+            return PageError.PageNotFound;
+        }
+
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
+
         var readerBuffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
 
-        var reader_r = self.file.reader(&readerBuffer);
+        var reader_r = file.reader(&readerBuffer);
         // const reader = &reader_r.interface;
         // std.debug.print("Reading page {} from file, {} + ({}*{})\n", .{ page_id, BucketHeader.byteSize, page_id, DEFAULT_PAGE_SIZE });
         const offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
@@ -688,14 +730,18 @@ pub const Bucket = struct {
     }
 
     pub fn writePage(self: *Bucket, page: *const Page) !void {
-        const header_size = @sizeOf(PageHeader);
-        const offset = 64 + (page.header.page_id * DEFAULT_PAGE_SIZE);
+        if (self.in_memory) {
+            return;
+        }
 
-        // Seek to the correct position
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
+
+        const header_size = @sizeOf(PageHeader);
+        const offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
 
         var writer_buffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
 
-        var writer_r = self.file.writer(&writer_buffer);
+        var writer_r = file.writer(&writer_buffer);
         const writer = &writer_r.interface;
         try writer_r.seekTo(offset);
 
@@ -707,7 +753,33 @@ pub const Bucket = struct {
         // Write the data
         _ = try writer.write(page.data);
         try writer.flush();
-        // try self.file.sync(); // Ensure the write is flushed to disk
+        // try file.sync(); // Ensure the write is flushed to disk
+    }
+
+    pub fn dump(self: *Bucket, dest_path: []const u8) !void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+
+        const fs = std.fs;
+        var out_file = if (std.fs.path.isAbsolute(dest_path))
+            try fs.createFileAbsolute(dest_path, .{ .read = true })
+        else
+            try fs.cwd().createFile(dest_path, .{ .read = true });
+        defer out_file.close();
+
+        const header_bytes = self.header.toBytes();
+        try out_file.pwriteAll(&header_bytes, 0);
+
+        var page_id: u64 = 0;
+        while (page_id < self.header.page_count) : (page_id += 1) {
+            const page = try self.loadPage(page_id);
+            const page_offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
+            const page_header_bytes = PageHeader.write(&page.header);
+            try out_file.pwriteAll(&page_header_bytes, page_offset);
+            try out_file.pwriteAll(page.data, page_offset + PageHeader.byteSize);
+        }
+
+        try out_file.sync();
     }
 
     pub fn createNewPage(self: *Bucket, page_type: PageType) !*Page {
@@ -2008,34 +2080,38 @@ pub const Bucket = struct {
         }
         self.rwlock.unlockShared();
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
-        var writerBuffer: [512]u8 = undefined;
-        var writer_r = self.file.writer(&writerBuffer);
-        const writer = &writer_r.interface;
         self.rwlock.lock();
         defer self.rwlock.unlock();
         for (locations.items) |*location| {
-            if (self.pageCache.remove(location.page_id)) |removed_page| {
-                removed_page.deinit(self.allocator);
-                self.allocator.destroy(removed_page);
+            var page = try self.loadPage(location.page_id);
+            const header_offset = location.offset;
+            if (header_offset + DocHeader.byteSize > page.data.len) {
+                return error.PageNotFound;
             }
-            location.header.is_deleted = 1;
-            const offset = BucketHeader.byteSize + @sizeOf(PageHeader) + (location.page_id * DEFAULT_PAGE_SIZE);
-            try writer_r.seekTo(offset + location.offset);
-            try location.header.write(writer);
+
+            var header = location.header;
+            header.is_deleted = 1;
+            const header_bytes = std.mem.toBytes(header);
+            @memcpy(page.data[header_offset .. header_offset + header_bytes.len], &header_bytes);
+
+            try self.writePage(page);
         }
-        try writer.flush();
 
         self.header.doc_count -= locations.items.len;
         self.header.deleted_count += locations.items.len;
         try self.flushHeader();
 
-        if (self.header.deleted_count > self.header.doc_count and self.autoVaccuum) {
+        if (!self.in_memory and self.header.deleted_count > self.header.doc_count and self.autoVaccuum) {
             // If all documents are deleted, reset the deleted count
             try self.vacuum();
         }
     }
 
     pub fn vacuum(self: *Bucket) !void {
+        if (self.in_memory) {
+            return;
+        }
+
         const tempFileName = try std.fmt.allocPrint(self.allocator, "{s}-temp", .{self.path});
         defer self.allocator.free(tempFileName);
         const cache_capacity = self.pageCache.capacity;
@@ -2099,10 +2175,12 @@ pub const Bucket = struct {
         self.file = try fs.openFileAbsolute(path, .{ .mode = .read_write });
         self.path = path;
 
-        try self.file.seekTo(0);
         var readerBuffer: [1024]u8 = undefined;
         var header_bytes: [BucketHeader.byteSize]u8 = undefined;
-        var reader = self.file.reader(&readerBuffer);
+
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
+        try file.seekTo(0);
+        var reader = file.reader(&readerBuffer);
         _ = try reader.read(&header_bytes);
         self.header = BucketHeader.read(&header_bytes);
         self.pageCache = PageCache.init(self.allocator, cache_capacity);
@@ -2113,8 +2191,12 @@ pub const Bucket = struct {
     }
 
     pub fn deinit(self: *Bucket) void {
-        self.file.close();
+        if (self.file) |*file| {
+            file.close();
+            self.file = null;
+        }
         self.allocator.free(self.path);
+        self.path = "";
         self.pageCache.clear(self.allocator);
         self.pageCache.deinit();
         // Free index values and their keys
@@ -2188,6 +2270,50 @@ test "Bucket.insert" {
     //     // const oId = item.get("_id").?.objectId.value;
     //     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
     // }
+}
+
+test "Bucket.dump supports :memory: storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var in_mem_bucket = try Bucket.init(allocator, ":memory:");
+    defer in_mem_bucket.deinit();
+
+    const doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "name": "InMemory"
+        \\}
+    );
+    _ = try in_mem_bucket.insert(doc);
+
+    const dump_path = "memory_dump.bucket";
+    defer std.fs.cwd().deleteFile(dump_path) catch |err| {
+        std.debug.print("Failed to delete dump file: {any}\n", .{err});
+    };
+
+    try in_mem_bucket.dump(dump_path);
+
+    var disk_bucket = try Bucket.init(allocator, dump_path);
+    defer disk_bucket.deinit();
+
+    const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "sector": {}
+        \\}
+    ));
+
+    var iter = try disk_bucket.listIterate(&arena, q);
+    defer {
+        iter.deinit() catch {};
+    }
+
+    const maybe_doc = try iter.next(iter);
+    try testing.expect(maybe_doc != null);
+    const stored = maybe_doc.?;
+    defer allocator.free(stored.buffer);
+
+    try testing.expectEqualStrings(stored.get("name").?.string.value, "InMemory");
 }
 
 test "Bucket.indexed queries use indexes" {

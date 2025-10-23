@@ -239,7 +239,7 @@ pub const Index = struct {
                 .offset = offset,
                 .total_size = @intCast(@as(usize, 1) + value_size + 10),
                 .value_type = type_id,
-                .value_bytes = data[value_start .. value_end],
+                .value_bytes = data[value_start..value_end],
                 .location = .{ .pageId = page_id, .offset = page_offset },
             };
         }
@@ -263,7 +263,7 @@ pub const Index = struct {
                 .offset = offset,
                 .total_size = @intCast(@as(usize, 1) + value_size + 8),
                 .value_type = type_id,
-                .value_bytes = data[value_start .. value_end],
+                .value_bytes = data[value_start..value_end],
                 .right_child = child_id,
             };
         }
@@ -414,7 +414,7 @@ pub const Index = struct {
                 );
             }
             const new_end = end - total_u;
-            @memset(self.page.data[new_end .. end], 0);
+            @memset(self.page.data[new_end..end], 0);
             self.page.header.used_size = @intCast(new_end);
         }
 
@@ -520,7 +520,7 @@ pub const Index = struct {
             }
 
             self.page.header.used_size = move_start;
-            @memset(self.page.data[move_start_u .. end], 0);
+            @memset(self.page.data[move_start_u..end], 0);
 
             const new_used = @as(usize, leaf_header_size) + move_len;
             new_page.header.used_size = @intCast(new_used);
@@ -575,7 +575,7 @@ pub const Index = struct {
             }
 
             const promote_offset_u = @as(usize, promoted_entry.offset);
-            @memset(self.page.data[promote_offset_u .. end], 0);
+            @memset(self.page.data[promote_offset_u..end], 0);
             self.page.header.used_size = promoted_entry.offset;
 
             try self.index.bucket.writePage(self.page);
