@@ -2,7 +2,9 @@ const builtin = @import("builtin");
 const wasm_impl = @import("platform/wasm.zig");
 const std_impl = @import("platform/standard.zig");
 
-const Impl = if (builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64)
+pub const isWasm = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
+
+const Impl = if (isWasm)
     wasm_impl
 else
     std_impl;

@@ -63,11 +63,44 @@ pub fn build(b: *std.Build) void {
     const buildOptions = b.addOptions();
 
     const isAndroid = b.option(bool, "android", "Build with android libc");
+    const isWasm = b.option(bool, "wasm", "Build with wasm");
 
     buildOptions.addOption(bool, "isAndroid", isAndroid orelse false);
+    buildOptions.addOption(bool, "isWasm", isWasm orelse false);
     libModule.addOptions("build_options", buildOptions);
 
-    if (buildStatic != true and buildNode != true) {
+    if (isWasm == true) {
+        libModule.single_threaded = true;
+        libModule.link_libc = false;
+        libModule.export_symbol_names = &[_][]const u8{
+            "albedo_open",
+            "albedo_close",
+            "albedo_insert",
+            "albedo_ensure_index",
+            "albedo_drop_index",
+            "albedo_delete",
+            "albedo_list",
+            "albedo_data",
+            "albedo_next",
+            "albedo_close_iterator",
+            "albedo_vacuum",
+            "albedo_version",
+            "albedo_malloc",
+            "albedo_free",
+        };
+        const wasm_module = b.addExecutable(.{
+            .name = "albedo",
+            .linkage = .static,
+            .root_module = libModule,
+        });
+
+        wasm_module.entry = .disabled;
+        wasm_module.export_table = true;
+
+        b.installArtifact(wasm_module);
+    }
+
+    if (buildStatic != true and buildNode != true and isWasm != true) {
         // Build a shared library by default
 
         const dynamic = b.addLibrary(.{
@@ -84,7 +117,7 @@ pub fn build(b: *std.Build) void {
         };
 
         if (isAndroid == true) {
-            dynamic.linkLibC();
+            dynamic.root_module.link_libc = true;
             dynamic.link_z_max_page_size = 16 << 10;
             dynamic.link_z_common_page_size = 16 << 10;
             dynamic.link_emit_relocs = true;
@@ -115,19 +148,18 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(dynamic);
     }
 
-    const nodeModule = b.createModule(.{
-        .root_source_file = b.path("src/napi.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const simple_module = b.dependency("napigen", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    libModule.addImport("napigen", simple_module.module("napigen"));
-
     if (buildNode == true) {
+        const nodeModule = b.createModule(.{
+            .root_source_file = b.path("src/napi.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const simple_module = b.dependency("napigen", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        libModule.addImport("napigen", simple_module.module("napigen"));
         const node_lib = b.addLibrary(.{
             .name = "albedo_node",
             .linkage = .dynamic,

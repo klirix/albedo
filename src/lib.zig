@@ -2,9 +2,11 @@ const std = @import("std");
 const testing = std.testing;
 const albedo = @import("./albedo.zig");
 const bson = @import("./bson.zig");
+const platform = @import("./platform.zig");
 const Query = @import("./query.zig").Query;
 const IndexOptions = @import("./bplusindex.zig").IndexOptions;
-const buildOptions = @import("build_options");
+
+const ally = if (platform.isWasm) std.heap.wasm_allocator else std.heap.smp_allocator;
 
 const Bucket = albedo.Bucket;
 
@@ -26,14 +28,8 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     const pathProper = std.mem.span(path);
     // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     // defer _ = gpa.deinit();
-    const ally = std.heap.smp_allocator;
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    db.* = albedo.Bucket.init(ally, pathProper) catch |err| switch (err) {
-        else => |dbOpenErr| {
-            std.debug.print("Failed to open db, {any}", .{dbOpenErr});
-            return Result.Error;
-        },
-    };
+    db.* = albedo.Bucket.init(ally, pathProper) catch return Result.Error;
     out.* = db;
     return Result.OK;
 }
@@ -75,7 +71,7 @@ pub export fn albedo_ensure_index(bucket: *albedo.Bucket, path: [*:0]const u8, o
             return Result.OutOfMemory;
         },
         else => {
-            std.debug.print("Failed to ensure index for path {s}, {any}\n", .{ path_proper, err });
+            // std.debug.print("Failed to ensure index for path {s}, {any}\n", .{ path_proper, err });
             return Result.Error;
         },
     };
@@ -94,7 +90,7 @@ pub export fn albedo_drop_index(bucket: *albedo.Bucket, path: [*:0]const u8) Res
             return Result.OutOfMemory;
         },
         else => {
-            std.debug.print("Failed to drop index for path {s}, {any}\n", .{ path_proper, err });
+            // std.debug.print("Failed to drop index for path {s}, {any}\n", .{ path_proper, err });
             return Result.Error;
         },
     };
@@ -142,15 +138,15 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
     // const queryArenaAllocator = queryArena.allocator();
 
     const query = Query.parseRaw(queryArena.allocator(), queryBufferProper) catch |err| switch (err) {
-        else => |qErr| {
-            std.debug.print("Failed to parse query, {any}", .{qErr});
+        else => {
+            // std.debug.print("Failed to parse query, {any}", .{qErr});
             return Result.Error;
         },
     };
 
     const iterator = bucket.listIterate(queryArena, query) catch |err| switch (err) {
-        else => |rErr| {
-            std.debug.print("Failed to list documents, {any}", .{rErr});
+        else => {
+            // std.debug.print("Failed to list documents, {any}", .{rErr});
             return Result.Error;
         },
     };
@@ -166,8 +162,8 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
 
 pub export fn albedo_data(handle: *ListHandle, outDoc: *[*]u8) Result {
     const doc = handle.iterator.next(handle.iterator) catch |err| switch (err) {
-        else => |iterErr| {
-            std.debug.print("Failed to iterate, {any}", .{iterErr});
+        else => {
+            // std.debug.print("Failed to iterate, {any}", .{iterErr});
             return Result.Error;
         },
     } orelse {
@@ -195,8 +191,8 @@ pub export fn albedo_close_iterator(iterator: *ListHandle) Result {
 }
 
 pub export fn albedo_vacuum(bucket: *Bucket) Result {
-    bucket.vacuum() catch |err| {
-        std.debug.print("Failed to vacuum bucket, {any}", .{err});
+    bucket.vacuum() catch {
+        // std.debug.print("Failed to vacuum bucket, {any}", .{err});
         return Result.Error;
     };
     return Result.OK;
@@ -204,6 +200,15 @@ pub export fn albedo_vacuum(bucket: *Bucket) Result {
 
 pub export fn albedo_version() u32 {
     return 1;
+}
+
+pub export fn albedo_malloc(size: usize) [*c]u8 {
+    const mem = ally.alloc(u8, size) catch return 0;
+    return @ptrCast(mem.ptr);
+}
+
+pub export fn albedo_free(ptr: [*c]u8, size: usize) void {
+    ally.free(ptr[0..size]);
 }
 
 // test "basic add functionality" {

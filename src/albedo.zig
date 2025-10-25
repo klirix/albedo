@@ -359,7 +359,7 @@ pub const Bucket = struct {
             const page_id = reader.takeInt(u64, .little) catch return PageError.InvalidPageSize;
 
             const idx = Index.loadWithOptions(self, page_id, options) catch {
-                std.debug.print("Failed to load index at page {d} for path {s}\n", .{ page_id, key });
+                // std.debug.print("Failed to load index at page {d} for path {s}\n", .{ page_id, key });
                 return BucketInitErrors.LoadIndexError;
             };
 
@@ -443,7 +443,7 @@ pub const Bucket = struct {
         }) catch |err| switch (err) {
             error.FileNotFound => unreachable,
             else => {
-                std.debug.print("Failed to create file: {s}, error: {any}\n", .{ path, err });
+                // std.debug.print("Failed to create file: {s}, error: {any}\n", .{ path, err });
                 return BucketInitErrors.FileOpenError;
             },
         };
@@ -1153,9 +1153,9 @@ pub const Bucket = struct {
 
             const header = std.mem.bytesToValue(DocHeader, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)]);
             if (header.reserved != 0 or header.is_deleted > 1) {
-                std.log.err("Doc header is corrupted:\nAt page: {d} position: {x} header looks like: {x}\n", .{ self.page.header.page_id, self.offset, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)] });
+                // std.log.err("Doc header is corrupted:\nAt page: {d} position: {x} header looks like: {x}\n", .{ self.page.header.page_id, self.offset, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)] });
                 // @panic("Header is corrupted");
-                std.log.err("page data: {x}\n", .{self.page.data[0..128]});
+                // std.log.err("page data: {x}\n", .{self.page.data[0..128]});
 
                 return error.InvalidHeader;
             }
@@ -2095,7 +2095,7 @@ pub const Bucket = struct {
         });
         defer newBucket.deinit();
         // defer fs.deleteFileAbsolute(tempFileName) catch |err| {
-        //     std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
+        // std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
         // };
         var iterator = try ScanIterator.init(self, self.allocator);
         // const newMeta = try newBucket.loadPage(0);
@@ -2137,11 +2137,11 @@ pub const Bucket = struct {
         self.deinit();
 
         platform.deleteFile(path) catch |err| {
-            std.debug.print("Failed to delete old file: {any}\n", .{err});
+            // std.debug.print("Failed to delete old file: {any}\n", .{err});
             return err;
         };
         platform.renameFile(tempFileName, path) catch |err| {
-            std.debug.print("Failed to rename temp file: {any}\n", .{err});
+            // std.debug.print("Failed to rename temp file: {any}\n", .{err});
             return err;
         };
 
@@ -2240,7 +2240,7 @@ test "Bucket.insert" {
 
     // for (qResult) |item| {
     //     // const oId = item.get("_id").?.objectId.value;
-    //     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
+    // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
     // }
 }
 
@@ -2294,8 +2294,8 @@ test "Bucket.indexed queries use indexes" {
     const allocator = arena.allocator();
     var bucket = try Bucket.init(allocator, "index-query.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("index-query.bucket") catch |err| {
-        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    defer platform.deleteFile("index-query.bucket") catch {
+        // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
     try bucket.ensureIndex("age", .{});
@@ -2638,8 +2638,8 @@ test "Page cache enforces capacity with LRU eviction" {
         .page_cache_capacity = 2,
     });
     defer bucket.deinit();
-    defer platform.deleteFile(bucket_path) catch |err| {
-        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    defer platform.deleteFile(bucket_path) catch {
+        // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
     _ = try bucket.loadPage(0); // meta page
@@ -2669,8 +2669,8 @@ test "Page overflow" {
     defer arena.deinit();
     var bucket = try Bucket.openFile(allocator, "overflow.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("overflow.bucket") catch |err| {
-        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    defer platform.deleteFile("overflow.bucket") catch {
+        // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
     const jsonBuf = try testing.allocator.alloc(u8, 300);
     defer testing.allocator.free(jsonBuf);
@@ -2711,8 +2711,8 @@ test "Bucket.delete" {
     const allocator = arena.allocator();
     var bucket = try Bucket.init(allocator, "DELETE.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("DELETE.bucket") catch |err| {
-        std.debug.print("Failed to delete test file: {any}\n", .{err});
+    defer platform.deleteFile("DELETE.bucket") catch {
+        // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
     // Create a new BSON document
