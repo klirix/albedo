@@ -526,13 +526,13 @@ test "Query.match matches objectId correctly" {
     const ally = arena.allocator();
     defer arena.deinit();
 
-    const objId = bson.ObjectId.init();
+    const objId = try bson.ObjectId.init();
 
     var doc = bson.BSONDocument.initEmpty();
     doc = try doc.set(ally, "_id", bson.BSONValue.init(objId));
     defer doc.deinit(ally);
 
-    const objId2 = bson.ObjectId.init();
+    const objId2 = try bson.ObjectId.init();
     var doc2 = bson.BSONDocument.initEmpty();
     doc2 = try doc.set(ally, "_id", bson.BSONValue.init(objId2));
     defer doc2.deinit(ally);

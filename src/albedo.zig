@@ -2,8 +2,8 @@ const std = @import("std");
 const bson = @import("bson.zig");
 const BSONValue = bson.BSONValue;
 const BSONDocument = bson.BSONDocument;
-const File = std.fs.File;
 const mem = std.mem;
+const platform = @import("platform.zig");
 const ObjectId = @import("object_id.zig").ObjectId;
 const ObjectIdGenerator = @import("object_id.zig").ObjectIdGenerator;
 const query = @import("query.zig");
@@ -198,7 +198,7 @@ const PageCache = struct {
 
     fn takeOldestEntry(self: *PageCache) ?*Entry {
         const node = self.lru.pop() orelse return null;
-        const entry: *Entry = @fieldParentPtr("node", node);
+        const entry: *Entry = @alignCast(@fieldParentPtr("node", node));
         _ = self.map.remove(entry.page_id);
         return entry;
     }
@@ -254,7 +254,7 @@ const PageCache = struct {
 
     pub fn clear(self: *PageCache, page_allocator: std.mem.Allocator) void {
         while (self.lru.popFirst()) |node| {
-            const entry: *Entry = @fieldParentPtr("node", node);
+            const entry: *Entry = @alignCast(@fieldParentPtr("node", node));
             _ = self.map.remove(entry.page_id);
             entry.page.deinit(page_allocator);
             page_allocator.destroy(entry.page);
@@ -279,7 +279,7 @@ const BucketInitErrors = error{
 };
 
 pub const Bucket = struct {
-    file: ?std.fs.File = null,
+    file: ?platform.FileHandle = null,
     path: []const u8,
     allocator: std.mem.Allocator,
     header: BucketHeader,
@@ -322,8 +322,7 @@ pub const Bucket = struct {
 
     // Update init to include allocator
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Bucket {
-        const bucket = try Bucket.openFile(allocator, path);
-        return bucket;
+        return Bucket.openFile(allocator, path);
     }
 
     const BucketFileMode = enum {
@@ -431,53 +430,44 @@ pub const Bucket = struct {
         self.allocator.free(@constCast(removed.key));
     }
 
-    fn resolvePath(path: []const u8, ally: std.mem.Allocator) std.fs.Dir.RealPathAllocError![]const u8 {
-        if (std.fs.path.isAbsolute(path)) {
-            const dup = try ally.dupe(u8, path);
-            return dup;
-        }
-        const cwd = std.fs.cwd();
-        const abs_path = try cwd.realpathAlloc(ally, path);
-        return abs_path;
-    }
-
     pub fn openFile(ally: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
         return Bucket.openFileWithOptions(ally, path, .{});
     }
 
     fn createEmptyDBFile(path: []const u8, ally: mem.Allocator, options: OpenBucketOptions) BucketInitErrors!Bucket {
-        const cwd = std.fs.cwd();
-        var new_file = switch (std.fs.path.isAbsolute(path)) {
-            true => std.fs.createFileAbsolute(path, .{}),
-
-            false => cwd.createFile(path, .{}),
-        } catch |err| {
-            std.debug.print("Failed to create file: {s}, error: {any}\n", .{ path, err });
-            return BucketInitErrors.FileOpenError;
+        var new_file = platform.openFile(ally, path, .{
+            .read = true,
+            .write = true,
+            .create = true,
+            .truncate = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => unreachable,
+            else => {
+                std.debug.print("Failed to create file: {s}, error: {any}\n", .{ path, err });
+                return BucketInitErrors.FileOpenError;
+            },
         };
 
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const stored_path = ally.dupe(u8, path) catch {
+            new_file.close();
+            return BucketInitErrors.OutOfMemory;
+        };
 
-        const abs_path = cwd.realpath(path, &path_buf) catch |err| {
-            std.debug.print("Failed to resolve path: {s}, error: {any}\n", .{ path, err });
+        const generator = ObjectIdGenerator.init() catch {
+            new_file.close();
+            ally.free(stored_path);
             return BucketInitErrors.UnexpectedError;
-        };
-
-        new_file.close();
-        new_file = std.fs.openFileAbsolute(abs_path, .{ .mode = .read_write }) catch |err| {
-            std.debug.print("Failed to open newly created file: {s}, error: {any}\n", .{ abs_path, err });
-            return BucketInitErrors.FileOpenError;
         };
 
         var bucket = Bucket{
             .file = new_file,
-            .path = ally.dupe(u8, abs_path[0..]) catch return BucketInitErrors.OutOfMemory,
+            .path = stored_path,
             .header = .init(),
             .allocator = ally,
             .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
             .autoVaccuum = options.autoVaccuum,
-            .objectIdGenerator = .init(),
+            .objectIdGenerator = generator,
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
@@ -491,6 +481,7 @@ pub const Bucket = struct {
     }
 
     fn createInMemoryBucket(ally: mem.Allocator, options: OpenBucketOptions) BucketInitErrors!Bucket {
+        const generator = ObjectIdGenerator.init() catch return BucketInitErrors.UnexpectedError;
         var bucket = Bucket{
             .file = null,
             .path = ally.dupe(u8, ":memory:") catch return BucketInitErrors.OutOfMemory,
@@ -499,7 +490,7 @@ pub const Bucket = struct {
             .pageCache = PageCache.init(ally, std.math.maxInt(usize)),
             .indexes = .init(ally),
             .autoVaccuum = options.autoVaccuum,
-            .objectIdGenerator = .init(),
+            .objectIdGenerator = generator,
             .in_memory = true,
         };
 
@@ -518,61 +509,59 @@ pub const Bucket = struct {
             return createInMemoryBucket(ally, options);
         }
 
-        const cwd = std.fs.cwd();
-
-        var file = cwd.openFile(path, .{ .mode = if (options.mode == .ReadOnly) .read_only else .read_write }) catch |err| switch (err) {
+        var file = platform.openFile(ally, path, .{
+            .read = true,
+            .write = options.mode == .ReadWrite,
+        }) catch |err| switch (err) {
             error.FileNotFound => {
                 if (options.mode != .ReadWrite) return BucketInitErrors.FileNotFound;
                 return createEmptyDBFile(path, ally, options);
             },
-            error.IsDir => return BucketInitErrors.InvalidPath,
             else => return BucketInitErrors.FileOpenError,
         };
 
-        var reader_buffer: [1024]u8 = undefined;
-
         var header_bytes: [BucketHeader.byteSize]u8 = undefined;
-
-        var reader_r = file.reader(&reader_buffer);
-
-        _ = reader_r.read(&header_bytes) catch |err| {
+        file.preadAll(header_bytes[0..], 0) catch |err| {
             file.close();
             return switch (err) {
-                error.EndOfStream => BucketInitErrors.FileReadError,
+                error.FileNotFound => BucketInitErrors.FileReadError,
                 else => BucketInitErrors.FileReadError,
             };
         };
 
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const stored_path = ally.dupe(u8, path) catch {
+            file.close();
+            return BucketInitErrors.OutOfMemory;
+        };
 
-        const abs_path = cwd.realpath(path, &path_buf) catch |err| {
-            std.debug.print("Failed to resolve path: {s}, error: {any}\n", .{ path, err });
+        const generator = ObjectIdGenerator.init() catch {
+            file.close();
+            ally.free(stored_path);
             return BucketInitErrors.UnexpectedError;
         };
 
         var bucket = Bucket{
             .file = file,
-            .path = ally.dupe(u8, abs_path[0..]) catch return BucketInitErrors.OutOfMemory,
-            .header = .read(header_bytes[0..BucketHeader.byteSize]),
+            .path = stored_path,
             .allocator = ally,
+            .header = .read(header_bytes[0..BucketHeader.byteSize]),
             .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
             .autoVaccuum = options.autoVaccuum,
-            .objectIdGenerator = .init(),
+            .objectIdGenerator = generator,
         };
+        errdefer {
+            if (bucket.file) |*fh| fh.close();
+            bucket.pageCache.deinit();
+            bucket.indexes.deinit();
+            ally.free(bucket.path);
+        }
 
-        const meta = bucket.loadPage(0) catch |err| {
-            file.close();
-            ally.free(abs_path);
-            return switch (err) {
-                error.EndOfStream => BucketInitErrors.FileReadError,
-                else => BucketInitErrors.FileReadError,
-            };
+        const meta = bucket.loadPage(0) catch {
+            return BucketInitErrors.FileReadError;
         };
 
         bucket.loadIndices(meta) catch {
-            file.close();
-            ally.free(abs_path);
             return BucketInitErrors.LoadIndexError;
         };
 
@@ -585,18 +574,9 @@ pub const Bucket = struct {
         }
 
         const file = if (self.file) |*f| f else return error.StorageUnavailable;
-
-        var buf: [BucketHeader.byteSize]u8 = undefined;
-
-        try file.seekTo(0);
-
-        var writer_r = file.writer(&buf);
-        try writer_r.seekTo(0);
-
-        const writer = &writer_r.interface;
-        _ = try self.header.write(writer);
-        try writer.flush();
-        // try file.sync(); // Ensure the write is flushed to disk
+        const bytes = self.header.toBytes();
+        try file.pwriteAll(bytes[0..], 0);
+        try file.sync();
     }
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
@@ -697,18 +677,16 @@ pub const Bucket = struct {
         }
 
         const file = if (self.file) |*f| f else return error.StorageUnavailable;
-
-        var readerBuffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
-
-        var reader_r = file.reader(&readerBuffer);
-        // const reader = &reader_r.interface;
-        // std.debug.print("Reading page {} from file, {} + ({}*{})\n", .{ page_id, BucketHeader.byteSize, page_id, DEFAULT_PAGE_SIZE });
         const offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
-        try reader_r.seekTo(offset);
 
         var header_bytes: [PageHeader.byteSize]u8 = undefined;
-        _ = try reader_r.read(&header_bytes);
-        const header = PageHeader.read(&header_bytes);
+        file.preadAll(header_bytes[0..], offset) catch |err| {
+            return switch (err) {
+                error.FileNotFound => PageError.PageNotFound,
+                else => PageError.PageNotFound,
+            };
+        };
+        const header = PageHeader.read(header_bytes[0..]);
 
         const page = try self.allocator.create(Page);
         page.* = try Page.init(self.allocator, self, header);
@@ -717,7 +695,14 @@ pub const Bucket = struct {
             return PageError.InvalidPageId;
         }
 
-        _ = try reader_r.read(page.data);
+        file.preadAll(page.data, offset + PageHeader.byteSize) catch |err| {
+            Page.deinit(page, self.allocator);
+            self.allocator.destroy(page);
+            return switch (err) {
+                error.FileNotFound => PageError.PageNotFound,
+                else => PageError.PageNotFound,
+            };
+        };
 
         if (try self.pageCache.put(page_id, page)) |evicted| {
             if (evicted != page) {
@@ -736,46 +721,35 @@ pub const Bucket = struct {
 
         const file = if (self.file) |*f| f else return error.StorageUnavailable;
 
-        const header_size = @sizeOf(PageHeader);
         const offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
 
-        var writer_buffer: [DEFAULT_PAGE_SIZE]u8 = undefined;
-
-        var writer_r = file.writer(&writer_buffer);
-        const writer = &writer_r.interface;
-        try writer_r.seekTo(offset);
-
-        // Write the header
-        const header_bytes: [header_size]u8 = PageHeader.write(&page.header);
-        // Ensure the header is written correctly
-        _ = try writer.write(&header_bytes);
-
-        // Write the data
-        _ = try writer.write(page.data);
-        try writer.flush();
-        // try file.sync(); // Ensure the write is flushed to disk
+        const header_bytes = PageHeader.write(&page.header);
+        try file.pwriteAll(header_bytes[0..], offset);
+        try file.pwriteAll(page.data, offset + PageHeader.byteSize);
+        try file.sync();
     }
 
     pub fn dump(self: *Bucket, dest_path: []const u8) !void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
 
-        const fs = std.fs;
-        var out_file = if (std.fs.path.isAbsolute(dest_path))
-            try fs.createFileAbsolute(dest_path, .{ .read = true })
-        else
-            try fs.cwd().createFile(dest_path, .{ .read = true });
+        var out_file = try platform.openFile(self.allocator, dest_path, .{
+            .read = true,
+            .write = true,
+            .create = true,
+            .truncate = true,
+        });
         defer out_file.close();
 
         const header_bytes = self.header.toBytes();
-        try out_file.pwriteAll(&header_bytes, 0);
+        try out_file.pwriteAll(header_bytes[0..], 0);
 
         var page_id: u64 = 0;
         while (page_id < self.header.page_count) : (page_id += 1) {
             const page = try self.loadPage(page_id);
             const page_offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
             const page_header_bytes = PageHeader.write(&page.header);
-            try out_file.pwriteAll(&page_header_bytes, page_offset);
+            try out_file.pwriteAll(page_header_bytes[0..], page_offset);
             try out_file.pwriteAll(page.data, page_offset + PageHeader.byteSize);
         }
 
@@ -2119,7 +2093,6 @@ pub const Bucket = struct {
             .page_cache_capacity = cache_capacity,
             .autoVaccuum = self.autoVaccuum,
         });
-        const fs = std.fs;
         defer newBucket.deinit();
         // defer fs.deleteFileAbsolute(tempFileName) catch |err| {
         //     std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
@@ -2163,26 +2136,25 @@ pub const Bucket = struct {
         iterator.deinit();
         self.deinit();
 
-        fs.deleteFileAbsolute(path) catch |err| {
+        platform.deleteFile(path) catch |err| {
             std.debug.print("Failed to delete old file: {any}\n", .{err});
             return err;
         };
-        fs.renameAbsolute(tempFileName, path) catch |err| {
+        platform.renameFile(tempFileName, path) catch |err| {
             std.debug.print("Failed to rename temp file: {any}\n", .{err});
             return err;
         };
 
-        self.file = try fs.openFileAbsolute(path, .{ .mode = .read_write });
+        self.file = try platform.openFile(self.allocator, path, .{
+            .read = true,
+            .write = true,
+        });
         self.path = path;
 
-        var readerBuffer: [1024]u8 = undefined;
         var header_bytes: [BucketHeader.byteSize]u8 = undefined;
-
         const file = if (self.file) |*f| f else return error.StorageUnavailable;
-        try file.seekTo(0);
-        var reader = file.reader(&readerBuffer);
-        _ = try reader.read(&header_bytes);
-        self.header = BucketHeader.read(&header_bytes);
+        try file.preadAll(header_bytes[0..], 0);
+        self.header = BucketHeader.read(header_bytes[0..]);
         self.pageCache = PageCache.init(self.allocator, cache_capacity);
         // Reinitialize and reload indexes from the meta page
         self.indexes = .init(self.allocator);
@@ -2217,7 +2189,7 @@ test "Bucket.insert" {
     const allocator = arena.allocator();
     var bucket = try Bucket.init(allocator, "test.bucket");
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile("test.bucket") catch |err| {
+    defer platform.deleteFile("test.bucket") catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -2288,7 +2260,7 @@ test "Bucket.dump supports :memory: storage" {
     _ = try in_mem_bucket.insert(doc);
 
     const dump_path = "memory_dump.bucket";
-    defer std.fs.cwd().deleteFile(dump_path) catch |err| {
+    defer platform.deleteFile(dump_path) catch |err| {
         std.debug.print("Failed to delete dump file: {any}\n", .{err});
     };
 
@@ -2322,7 +2294,7 @@ test "Bucket.indexed queries use indexes" {
     const allocator = arena.allocator();
     var bucket = try Bucket.init(allocator, "index-query.bucket");
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile("index-query.bucket") catch |err| {
+    defer platform.deleteFile("index-query.bucket") catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -2666,7 +2638,7 @@ test "Page cache enforces capacity with LRU eviction" {
         .page_cache_capacity = 2,
     });
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile(bucket_path) catch |err| {
+    defer platform.deleteFile(bucket_path) catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -2697,7 +2669,7 @@ test "Page overflow" {
     defer arena.deinit();
     var bucket = try Bucket.openFile(allocator, "overflow.bucket");
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile("overflow.bucket") catch |err| {
+    defer platform.deleteFile("overflow.bucket") catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
     const jsonBuf = try testing.allocator.alloc(u8, 300);
@@ -2739,7 +2711,7 @@ test "Bucket.delete" {
     const allocator = arena.allocator();
     var bucket = try Bucket.init(allocator, "DELETE.bucket");
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile("DELETE.bucket") catch |err| {
+    defer platform.deleteFile("DELETE.bucket") catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -2813,7 +2785,7 @@ test "Deleted docs disappear after vacuum" {
     const allocator = arena.allocator();
     var bucket = try Bucket.init(allocator, "VACUUM.bucket");
     defer bucket.deinit();
-    defer std.fs.cwd().deleteFile("VACUUM.bucket") catch |err| {
+    defer platform.deleteFile("VACUUM.bucket") catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -2881,7 +2853,7 @@ test "Bucket.dropIndex removes metadata entry" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const file_name = "drop-index.bucket";
-    defer std.fs.cwd().deleteFile(file_name) catch |err| {
+    defer platform.deleteFile(file_name) catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 

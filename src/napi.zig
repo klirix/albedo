@@ -20,7 +20,9 @@ fn oidConstructorFunction(env: napiraw.napi_env, cb_info: napiraw.napi_callback_
     };
     js.arena.inc();
     defer js.arena.dec();
-    var oid = bson.ObjectId.init();
+    var oid = bson.ObjectId.init() catch |err| {
+        return js.throw(err);
+    };
     var this: napiraw.napi_value = undefined;
     napigen.check(napiraw.napi_get_cb_info(js.env, cb_info, null, null, &this, null)) catch |e| {
         return js.throw(e);

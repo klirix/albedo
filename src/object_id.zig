@@ -1,13 +1,17 @@
 const std = @import("std");
-const crypto = std.crypto;
+const platform = @import("platform.zig");
 
 pub const ObjectIdGenerator = struct {
     machine: u40,
     counter: u24,
 
-    pub fn init() ObjectIdGenerator {
-        const machine = crypto.random.int(u40);
-        const counter = crypto.random.int(u24);
+    pub fn init() !ObjectIdGenerator {
+        var machine_bytes: [5]u8 = undefined;
+        var counter_bytes: [3]u8 = undefined;
+        try platform.randomBytes(machine_bytes[0..]);
+        try platform.randomBytes(counter_bytes[0..]);
+        const machine = std.mem.readInt(u40, machine_bytes[0..], .big);
+        const counter = std.mem.readInt(u24, counter_bytes[0..], .big);
         return ObjectIdGenerator{
             .machine = machine,
             .counter = counter,
@@ -15,10 +19,9 @@ pub const ObjectIdGenerator = struct {
     }
 
     pub fn next(self: *ObjectIdGenerator) ObjectId {
-        // self.counter +%= 1;
         const counter = @atomicRmw(u24, &self.counter, .Add, 1, .monotonic);
         var buffer: [12]u8 = undefined;
-        const time = @as(u32, (@intCast(std.time.timestamp())));
+        const time = @as(u32, @intCast(platform.nowSeconds()));
 
         std.mem.writeInt(u32, buffer[0..4], time, .big);
         std.mem.writeInt(u40, buffer[4..9], self.machine, .little);
@@ -31,10 +34,10 @@ pub const ObjectIdGenerator = struct {
 pub const ObjectId = struct {
     buffer: [12]u8, // 12
 
-    pub fn init() ObjectId {
-        const time = @as(i32, @truncate(std.time.timestamp()));
+    pub fn init() !ObjectId {
+        const time = @as(i32, @truncate(platform.nowSeconds()));
         var rand = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
-        crypto.random.bytes(&rand);
+        try platform.randomBytes(rand[0..]);
         var buffer: [12]u8 = undefined;
         std.mem.writeInt(i32, buffer[0..4], time, .big);
         @memcpy(buffer[4..], &rand);
@@ -91,7 +94,7 @@ test "test timestamp get" {
 }
 
 test "Test2" {
-    _ = ObjectId.init();
+    _ = try ObjectId.init();
 }
 
 test "test gen str" {

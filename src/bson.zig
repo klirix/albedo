@@ -1275,7 +1275,7 @@ test "BSONDoc set docs" {
 
     var doc = BSONDocument.init(obj);
 
-    const objid = ObjectId.init();
+    const objid = try ObjectId.init();
 
     doc = try doc.set(std.testing.allocator, "_id", .{ .objectId = .{ .value = objid } });
     defer doc.deinit(std.testing.allocator);
