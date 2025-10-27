@@ -21,6 +21,20 @@ pub const Index = struct {
     options: IndexOptions = .{},
     root_page_id: u64,
 
+    /// Compare two BSON values respecting the reverse flag.
+    /// When reverse=1, inverts the comparison order.
+    inline fn compare(self: *const Index, a: BSONValue, b: BSONValue) std.math.Order {
+        const order = a.order(b);
+        if (self.options.reverse == 1) {
+            return switch (order) {
+                .lt => .gt,
+                .gt => .lt,
+                .eq => .eq,
+            };
+        }
+        return order;
+    }
+
     pub const RangeBoundError = error{
         InvalidLowerBoundOperator,
         InvalidUpperBoundOperator,
@@ -332,7 +346,7 @@ pub const Index = struct {
             var offset: u16 = leaf_header_size;
             while (true) {
                 const entry = self.decodeLeafEntry(offset) orelse return offset;
-                const cmp = entry.value().order(value);
+                const cmp = self.index.compare(entry.value(), value);
                 if (cmp == .gt) return entry.offset;
                 offset = entry.offset + entry.total_size;
             }
@@ -342,7 +356,7 @@ pub const Index = struct {
             var offset: u16 = leaf_header_size;
             while (true) {
                 const entry = self.decodeLeafEntry(offset) orelse return null;
-                const cmp = entry.value().order(value);
+                const cmp = self.index.compare(entry.value(), value);
                 switch (cmp) {
                     .lt => offset = entry.offset + entry.total_size,
                     .eq => return entry.offset,
@@ -355,7 +369,7 @@ pub const Index = struct {
             var offset: u16 = leaf_header_size;
             while (true) {
                 const entry = self.decodeLeafEntry(offset) orelse return offset;
-                const cmp = entry.value().order(value);
+                const cmp = self.index.compare(entry.value(), value);
                 switch (cmp) {
                     .lt => offset = entry.offset + entry.total_size,
                     .eq => {
@@ -429,7 +443,7 @@ pub const Index = struct {
             while (true) {
                 const entry = self.decodeInternalEntry(offset) orelse return left_child;
                 const right_child = entry.right_child;
-                const cmp = entry.value().order(value);
+                const cmp = self.index.compare(entry.value(), value);
                 switch (cmp) {
                     .eq => return right_child,
                     .gt => return left_child,
@@ -445,7 +459,7 @@ pub const Index = struct {
             var offset: u16 = internal_header_size;
             while (true) {
                 const entry = self.decodeInternalEntry(offset) orelse return offset;
-                const cmp = entry.value().order(key);
+                const cmp = self.index.compare(entry.value(), key);
                 if (cmp == .gt or cmp == .eq) return entry.offset;
                 offset = entry.offset + entry.total_size;
             }
@@ -621,7 +635,7 @@ pub const Index = struct {
             if (current_end + needed_space > node.page.data.len) {
                 var payload = try node.splitLeaf();
                 const separator = payload.value();
-                if (separator.order(value) == .gt) {
+                if (self.compare(separator, value) == .gt) {
                     try node.leafInsert(value, loc);
                     try self.bucket.writePage(node.page);
                 } else {
@@ -718,7 +732,6 @@ pub const Index = struct {
         current_offset: u16,
         lower: ?RangeBound,
         upper: ?RangeBound,
-        lowerSatisfied: bool,
 
         pub fn next(self: *RangeIterator) !?DocumentLocation {
             while (true) {
@@ -730,6 +743,7 @@ pub const Index = struct {
                     continue;
                 };
 
+                // Check upper bound (always check)
                 if (self.upper) |upperBound| {
                     const cmp = entry.value().order(upperBound.value);
                     const within = switch (upperBound.filter) {
@@ -740,20 +754,24 @@ pub const Index = struct {
                     if (!within) return null;
                 }
 
-                if (!self.lowerSatisfied) {
-                    if (self.lower) |lowerBound| {
-                        const cmp = entry.value().order(lowerBound.value);
-                        const meets = switch (lowerBound.filter) {
-                            .gt => cmp == .gt,
-                            .gte => cmp != .lt,
-                            else => unreachable,
-                        };
-                        if (!meets) {
-                            self.current_offset = entry.offset + entry.total_size;
-                            continue;
+                // Check lower bound
+                if (self.lower) |lowerBound| {
+                    const cmp = entry.value().order(lowerBound.value);
+                    const meets = switch (lowerBound.filter) {
+                        .gt => cmp == .gt,
+                        .gte => cmp != .lt,
+                        else => unreachable,
+                    };
+                    if (!meets) {
+                        // For reverse indexes, if we don't meet the lower bound,
+                        // we've gone too far and should stop
+                        if (self.index.options.reverse == 1) {
+                            return null;
                         }
+                        // For normal indexes, skip this entry and continue
+                        self.current_offset = entry.offset + entry.total_size;
+                        continue;
                     }
-                    self.lowerSatisfied = true;
                 }
 
                 self.current_offset = entry.offset + entry.total_size;
@@ -773,18 +791,24 @@ pub const Index = struct {
             else => return RangeBoundError.InvalidUpperBoundOperator,
         };
 
+        // For reverse indexes, use the upper bound to find start position
+        // because values are in descending order
+        const start_bound = if (self.options.reverse == 1) upper else lower;
+
         var start_node = blk: {
-            if (lower) |bound| {
+            if (start_bound) |bound| {
                 var node = try self.descendToLeaf(bound.value);
                 while (true) {
                     const prev_id = node.leafPrevId();
                     if (prev_id == 0) break;
                     var prev_node = try self.loadNode(prev_id);
                     const last_entry = prev_node.leafLastEntry() orelse break;
-                    const order = last_entry.value().order(bound.value);
+                    const order = self.compare(last_entry.value(), bound.value);
                     const should_move = switch (bound.filter) {
                         .gte => order != .lt,
                         .gt => order == .gt,
+                        .lte => order != .lt,
+                        .lt => order == .gt,
                         else => false,
                     };
                     if (!should_move) break;
@@ -796,8 +820,8 @@ pub const Index = struct {
             }
         };
 
-        const start_offset: u16 = if (lower) |bound|
-            start_node.leafLowerBoundOffset(bound.value, bound.filter == .gte)
+        const start_offset: u16 = if (start_bound) |bound|
+            start_node.leafLowerBoundOffset(bound.value, bound.filter == .gte or bound.filter == .lte)
         else
             Node.leafDataStart();
 
@@ -807,7 +831,6 @@ pub const Index = struct {
             .current_offset = start_offset,
             .lower = lower,
             .upper = upper,
-            .lowerSatisfied = lower == null,
         };
     }
 
@@ -839,7 +862,7 @@ pub const Index = struct {
         var offset = start_offset_opt;
         while (true) {
             const entry = node.decodeLeafEntry(offset) orelse return;
-            const cmp = entry.value().order(value);
+            const cmp = self.compare(entry.value(), value);
             if (cmp != .eq) return;
             if (entry.location.equal(&loc)) {
                 node.leafRemoveAt(entry.offset, entry.total_size);
@@ -1194,4 +1217,96 @@ test "Index load from root and query" {
         count += 1;
     }
     try testing.expectEqual(@as(usize, 100), count);
+}
+
+test "reverse index orders descending" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_reverse.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("bplus_reverse.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(&bucket);
+    defer index.deinit();
+    index.options.reverse = 1;
+
+    const entries = [_]struct { value: i32, page: u64, offset: u16 }{
+        .{ .value = 5, .page = 1, .offset = 50 },
+        .{ .value = 10, .page = 2, .offset = 100 },
+        .{ .value = 15, .page = 4, .offset = 150 },
+        .{ .value = 20, .page = 5, .offset = 200 },
+        .{ .value = 25, .page = 6, .offset = 250 },
+    };
+
+    // Insert in random order
+    const insert_order = [_]usize{ 2, 0, 4, 1, 3 };
+    for (insert_order) |idx| {
+        const entry = entries[idx];
+        const value = BSONValue{ .int32 = .{ .value = entry.value } };
+        const loc = Index.DocumentLocation{ .pageId = entry.page, .offset = entry.offset };
+        try index.insert(value, loc);
+    }
+
+    // Range scan should return entries in descending order (25, 20, 15, 10, 5)
+    var iter = try index.range(null, null);
+    var offsets = std.ArrayList(u16){};
+    defer offsets.deinit(testing.allocator);
+
+    while (try iter.next()) |loc| {
+        try offsets.append(testing.allocator, loc.offset);
+    }
+
+    // Expected: reverse order (highest to lowest)
+    const expected = [_]u16{ 250, 200, 150, 100, 50 };
+    try testing.expectEqualSlices(u16, expected[0..], offsets.items);
+}
+
+test "reverse index with range bounds" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_reverse_range.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("bplus_reverse_range.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(&bucket);
+    defer index.deinit();
+    index.options.reverse = 1;
+
+    const entries = [_]struct { value: i32, page: u64, offset: u16 }{
+        .{ .value = 5, .page = 1, .offset = 50 },
+        .{ .value = 10, .page = 2, .offset = 100 },
+        .{ .value = 15, .page = 4, .offset = 150 },
+        .{ .value = 20, .page = 5, .offset = 200 },
+        .{ .value = 25, .page = 6, .offset = 250 },
+    };
+
+    for (entries) |entry| {
+        const value = BSONValue{ .int32 = .{ .value = entry.value } };
+        const loc = Index.DocumentLocation{ .pageId = entry.page, .offset = entry.offset };
+        try index.insert(value, loc);
+    }
+
+    // First verify full scan works
+    var full_iter = try index.range(null, null);
+    var full_offsets = std.ArrayList(u16){};
+    defer full_offsets.deinit(testing.allocator);
+    while (try full_iter.next()) |loc| {
+        try full_offsets.append(testing.allocator, loc.offset);
+    }
+    std.debug.print("Full scan: {any}\n", .{full_offsets.items});
+
+    // Range [10, 20] should return: 20, 15, 10 (descending)
+    const lower = BSONValue{ .int32 = .{ .value = 10 } };
+    const upper = BSONValue{ .int32 = .{ .value = 20 } };
+
+    var iter = try index.range(Index.RangeBound.gte(lower), Index.RangeBound.lte(upper));
+    var offsets = std.ArrayList(u16){};
+    defer offsets.deinit(testing.allocator);
+
+    while (try iter.next()) |loc| {
+        try offsets.append(testing.allocator, loc.offset);
+    }
+
+    const expected = [_]u16{ 200, 150, 100 };
+    try testing.expectEqualSlices(u16, expected[0..], offsets.items);
 }

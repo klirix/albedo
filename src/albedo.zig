@@ -2880,3 +2880,132 @@ test "Bucket.dropIndex removes metadata entry" {
         try testing.expect(reopened.indexes.contains("_id"));
     }
 }
+
+test "Bucket.reverse index with sort queries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var bucket = try Bucket.init(allocator, "reverse-index-sort.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("reverse-index-sort.bucket") catch {};
+
+    // Create a reverse index on the "score" field
+    try bucket.ensureIndex("score", .{ .reverse = 1 });
+
+    // Insert documents with different scores
+    const test_docs = [_]struct { name: []const u8, score: i32 }{
+        .{ .name = "Alice", .score = 10 },
+        .{ .name = "Bob", .score = 50 },
+        .{ .name = "Carol", .score = 30 },
+        .{ .name = "Dave", .score = 40 },
+        .{ .name = "Eve", .score = 20 },
+    };
+
+    for (test_docs) |td| {
+        const pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = td.name } }),
+            bson.BSONKeyValuePair.init("score", bson.BSONValue{ .int32 = .{ .value = td.score } }),
+        };
+        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs[0..]));
+        _ = try bucket.insert(doc);
+        doc.deinit(allocator);
+    }
+
+    // Test 1: Query with descending sort should use the reverse index (sort_covered = true)
+    {
+        var query_doc = try bson.BSONDocument.fromJSON(allocator,
+            \\{
+            \\  "sort": {"desc": "score"}
+            \\}
+        );
+        defer query_doc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, query_doc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(plan.sort_covered); // Reverse index should cover descending sort
+        try testing.expect(plan.source == .index);
+        try testing.expectEqualStrings("score", plan.index_path.?);
+
+        var iter = try bucket.listIterate(&arena, q);
+        defer iter.deinit() catch {};
+
+        // Should return in descending order: Bob(50), Dave(40), Carol(30), Eve(20), Alice(10)
+        const expected_scores = [_]i32{ 50, 40, 30, 20, 10 };
+        var idx: usize = 0;
+        while (try iter.next(iter)) |doc| {
+            const score = doc.get("score").?.int32.value;
+            try testing.expectEqual(expected_scores[idx], score);
+            idx += 1;
+            allocator.free(doc.buffer);
+        }
+        try testing.expectEqual(@as(usize, 5), idx);
+    }
+
+    // Test 2: Query with ascending sort should NOT use reverse index efficiently (sort_covered = false)
+    {
+        var query_doc = try bson.BSONDocument.fromJSON(allocator,
+            \\{
+            \\  "sort": {"asc": "score"}
+            \\}
+        );
+        defer query_doc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, query_doc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(!plan.sort_covered); // Reverse index doesn't cover ascending sort
+        // Results should still be correct due to manual sorting
+
+        var iter = try bucket.listIterate(&arena, q);
+        defer iter.deinit() catch {};
+
+        // Should return in ascending order: Alice(10), Eve(20), Carol(30), Dave(40), Bob(50)
+        const expected_scores = [_]i32{ 10, 20, 30, 40, 50 };
+        var idx: usize = 0;
+        while (try iter.next(iter)) |doc| {
+            const score = doc.get("score").?.int32.value;
+            try testing.expectEqual(expected_scores[idx], score);
+            idx += 1;
+            allocator.free(doc.buffer);
+        }
+        try testing.expectEqual(@as(usize, 5), idx);
+    }
+
+    // Test 3: Range query with descending sort on reverse index
+    {
+        var query_doc = try bson.BSONDocument.fromJSON(allocator,
+            \\{
+            \\  "query": {
+            \\    "score": {"$gte": 20, "$lte": 40}
+            \\  },
+            \\  "sort": {"desc": "score"}
+            \\}
+        );
+        defer query_doc.deinit(allocator);
+
+        var q = try query.Query.parse(allocator, query_doc);
+        defer q.deinit(allocator);
+
+        const plan = bucket.planQuery(&q);
+        try testing.expect(plan.sort_covered); // Should be covered by reverse index
+        try testing.expect(plan.source == .index);
+        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+
+        var iter = try bucket.listIterate(&arena, q);
+        defer iter.deinit() catch {};
+
+        // Should return in descending order: Dave(40), Carol(30), Eve(20)
+        const expected_scores = [_]i32{ 40, 30, 20 };
+        var idx: usize = 0;
+        while (try iter.next(iter)) |doc| {
+            const score = doc.get("score").?.int32.value;
+            try testing.expectEqual(expected_scores[idx], score);
+            idx += 1;
+            allocator.free(doc.buffer);
+        }
+        try testing.expectEqual(@as(usize, 3), idx);
+    }
+}
