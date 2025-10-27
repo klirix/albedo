@@ -976,44 +976,33 @@ pub const BSONDocument = struct {
         return count;
     }
 
-    fn fastMemEql(a: []const u8, b: []const u8) bool {
-
-        // Process 16 bytes at a time using vectors
-        const Vec = @Vector(16, u8);
-        var i: usize = 0;
-        while (i + 16 <= a.len) : (i += 16) {
-            const va = @as(Vec, @bitCast(a[i..][0..16].*));
-            const vb = @as(Vec, @bitCast(b[i..][0..16].*));
-            if (!@reduce(.And, va == vb)) return false;
-        }
-
-        // Handle remaining bytes
-        while (i < a.len) : (i += 1) {
-            if (a[i] != b[i]) return false;
-        }
-        return true;
-    }
-
     /// Returns the value at the key in the document.
     /// Returns null if the key is not found.
     pub fn get(self: BSONDocument, key: []const u8) ?BSONValue {
         var idx: usize = 4;
         const key_len = key.len;
         const buffer = self.buffer;
+
         while (buffer[idx] != 0) {
             const typeByte: BSONValueType = @enumFromInt(buffer[idx]);
-            const namePtr: [*:0]const u8 = @ptrCast(buffer.ptr + idx + 1);
-            const name = std.mem.span(namePtr);
-            idx += 1 + name.len + 1; // Move past type, name, and null terminator
-            // Quick length check before any other operations
+            idx += 1;
 
-            if (name.len == key_len and name[0] == key[0]) {
-                // First char check before full comparison
-                if (fastMemEql(name, key)) {
-                    return BSONValue.read(self.buffer[idx..], typeByte);
+            // Calculate name length by scanning for null terminator
+            const nameStart = idx;
+            var nameLen: usize = 0;
+            while (buffer[idx + nameLen] != 0) : (nameLen += 1) {}
+
+            const name = buffer[nameStart..][0..nameLen];
+            idx += nameLen + 1; // Move past name and null terminator
+
+            // Fast path: check first char and length before full comparison
+            if (nameLen == key_len and name[0] == key[0]) {
+                if (mem.eql(u8, name, key)) {
+                    return BSONValue.read(buffer[idx..], typeByte);
                 }
             }
-            const size = BSONValue.asessSize(self.buffer[idx..], typeByte);
+
+            const size = BSONValue.asessSize(buffer[idx..], typeByte);
             idx += size;
         }
         return null;
@@ -1075,127 +1064,121 @@ pub const BSONDocument = struct {
     }
 
     pub fn unset(self: *const BSONDocument, allocator: mem.Allocator, key: []const u8) !BSONDocument {
+        // Use ArrayList for single-pass building
+        var list = std.ArrayList(u8){};
+        defer list.deinit(allocator);
+
+        // Reserve space for size field (will be written at the end)
+        try list.resize(allocator, 4);
+
         var idx: usize = 4;
-        var newSize: u32 = 4; // Start with the size placeholder
+        var found = false;
 
-        // First pass: Assess the new size
+        // Single pass: build new document while scanning
         while (TypeNamePair.read(self.buffer[idx..])) |pair| {
             const valueSize = BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
 
-            if (!std.mem.eql(u8, pair.name, key)) {
-                newSize += 1 + @as(u32, @truncate(pair.name.len)) + 1 + valueSize; // type + key + null terminator + value
+            if (!mem.eql(u8, pair.name, key)) {
+                // Copy this element to the new document
+                try list.append(allocator, @intFromEnum(pair.type));
+                try list.appendSlice(allocator, pair.name);
+                try list.append(allocator, 0); // Null terminator for key
+                try list.appendSlice(allocator, self.buffer[idx + pair.len .. idx + pair.len + valueSize]);
+            } else {
+                found = true;
             }
 
             idx += pair.len + valueSize;
         }
 
-        newSize += 1; // Add null terminator
+        // Add document null terminator
+        try list.append(allocator, 0);
 
-        // Allocate new buffer
-        const newBuffer = try allocator.alloc(u8, newSize);
+        // Write the document size at the beginning
+        const finalBuffer = try list.toOwnedSlice(allocator);
+        std.mem.writeInt(u32, finalBuffer[0..4], @truncate(finalBuffer.len), .little);
 
-        // Second pass: Write the new document
-        idx = 4;
-        var writeIdx: usize = 4;
-        std.mem.writeInt(u32, newBuffer[0..4], newSize, .little);
-
-        while (TypeNamePair.read(self.buffer[idx..])) |pair| {
-            const valueSize = BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
-
-            if (!std.mem.eql(u8, pair.name, key)) {
-                newBuffer[writeIdx] = @intFromEnum(pair.type);
-                writeIdx += 1;
-
-                @memcpy(newBuffer[writeIdx .. writeIdx + pair.name.len], pair.name);
-                writeIdx += pair.name.len;
-
-                newBuffer[writeIdx] = 0; // Null terminator for key
-                writeIdx += 1;
-
-                @memcpy(newBuffer[writeIdx .. writeIdx + valueSize], self.buffer[idx + pair.len .. idx + pair.len + valueSize]);
-                writeIdx += valueSize;
-            }
-
-            idx += pair.len + valueSize;
-        }
-
-        newBuffer[writeIdx] = 0; // Null terminator for document
-
-        // Return the new document
-        return BSONDocument.init(newBuffer);
+        return BSONDocument.init(finalBuffer);
     }
 
     pub fn set(self: BSONDocument, allocator: mem.Allocator, key: []const u8, value: BSONValue) !BSONDocument {
-        var doc = self;
+        // Use ArrayList for single-pass building
+        var list = std.ArrayList(u8){};
+        defer list.deinit(allocator);
+
+        // Reserve space for size field (will be written at the end)
+        try list.resize(allocator, 4);
+
         var idx: usize = 4;
-        var needsUnset = false;
+        var keyFound = false;
+
+        // Single pass: copy existing elements, skip the old value if key exists
         while (TypeNamePair.read(self.buffer[idx..])) |pair| {
+            const valueSize = BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
+
             if (mem.eql(u8, pair.name, key)) {
-                needsUnset = true;
-                break;
+                // Skip the old value - we'll add the new one at the end
+                keyFound = true;
+            } else {
+                // Copy this element to the new document
+                try list.append(allocator, @intFromEnum(pair.type));
+                try list.appendSlice(allocator, pair.name);
+                try list.append(allocator, 0); // Null terminator for key
+                try list.appendSlice(allocator, self.buffer[idx + pair.len .. idx + pair.len + valueSize]);
             }
 
-            idx += pair.len + BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
+            idx += pair.len + valueSize;
         }
 
-        if (needsUnset) {
-            // Use temporary variable to avoid reassigning self
-            doc = try self.unset(allocator, key);
-        }
-        defer {
-            if (needsUnset) {
-                allocator.free(doc.buffer);
-            }
-        }
+        // Add the new/updated key-value pair
+        try list.append(allocator, @intFromEnum(value.valueType()));
+        try list.appendSlice(allocator, key);
+        try list.append(allocator, 0); // Null terminator for key
 
-        const newSize = doc.buffer.len + 1 + key.len + 1 + value.size();
-
-        const newBuffer = try allocator.alloc(u8, newSize);
-        @memset(newBuffer, 0); // TODO: Remove
-        // Copy the existing data to the new buffer
-        std.mem.writeInt(u32, newBuffer[0..4], @truncate(newSize), .little);
-        @memcpy(newBuffer[4 .. doc.buffer.len - 1], doc.buffer[4 .. doc.buffer.len - 1]);
-
-        var writeIdx: usize = doc.buffer.len - 1;
-        newBuffer[writeIdx] = @intFromEnum(value.valueType());
-        @memcpy(newBuffer[writeIdx + 1 .. writeIdx + key.len + 1], key);
-        newBuffer[writeIdx + key.len + 1] = 0; // Null terminator for key
-        writeIdx += key.len + 2;
+        // Write the value based on its type
+        const writeIdx = list.items.len;
+        try list.resize(allocator, writeIdx + value.size());
         switch (value) {
             .string => {
-                value.string.write(newBuffer[writeIdx..]);
+                value.string.write(list.items[writeIdx..]);
             },
             .double => {
-                value.double.write(newBuffer[writeIdx..]);
+                value.double.write(list.items[writeIdx..]);
             },
             .int32 => {
-                value.int32.write(newBuffer[writeIdx..]);
+                value.int32.write(list.items[writeIdx..]);
             },
             .document, .array => |writable| {
-                @memcpy(newBuffer[writeIdx .. writeIdx + writable.buffer.len], writable.buffer);
+                @memcpy(list.items[writeIdx .. writeIdx + writable.buffer.len], writable.buffer);
             },
             .datetime => {
-                value.datetime.write(newBuffer[writeIdx..]);
+                value.datetime.write(list.items[writeIdx..]);
             },
             .int64 => {
-                value.int64.write(newBuffer[writeIdx..]);
+                value.int64.write(list.items[writeIdx..]);
             },
             .binary => {
-                value.binary.write(newBuffer[writeIdx..]);
+                value.binary.write(list.items[writeIdx..]);
             },
             .boolean => {
-                newBuffer[writeIdx] = if (value.boolean.value) 0x01 else 0x00;
+                list.items[writeIdx] = if (value.boolean.value) 0x01 else 0x00;
             },
             .null => {},
             .maxKey => {},
             .minKey => {},
             .objectId => {
-                @memcpy(newBuffer[writeIdx .. writeIdx + 12], value.objectId.value.buffer[0..]);
+                @memcpy(list.items[writeIdx .. writeIdx + 12], value.objectId.value.buffer[0..]);
             },
         }
-        writeIdx += value.size();
-        newBuffer[writeIdx] = 0; // Null terminator for document
-        return BSONDocument.init(newBuffer);
+
+        // Add document null terminator
+        try list.append(allocator, 0);
+
+        // Write the document size at the beginning
+        const finalBuffer = try list.toOwnedSlice(allocator);
+        std.mem.writeInt(u32, finalBuffer[0..4], @truncate(finalBuffer.len), .little);
+
+        return BSONDocument.init(finalBuffer);
     }
 
     pub fn deinit(self: *const BSONDocument, allocator: mem.Allocator) void {

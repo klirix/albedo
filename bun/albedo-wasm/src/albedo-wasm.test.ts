@@ -15,7 +15,32 @@ describe("Albedo WASM", () => {
       bucket.close();
       const file = Bun.file("test-bucket.albedo");
       expect(await file.exists()).toBe(true);
-      // file.delete();
+      file.delete();
+    });
+  });
+
+  describe("Bucket.insert and Bucket.all", () => {
+    test("Insertion works and retrieves all items", async () => {
+      const bucket = Bucket.open("test-bucket.albedo");
+      expect(bucket).toBeInstanceOf(Bucket);
+
+      console.time("insertion");
+      for (let i = 0; i < 1000; i++) {
+        bucket.insert({ hello: `world${i}`, date: new Date() });
+      }
+      console.timeEnd("insertion");
+
+      console.time("all");
+      const allItems = Array.from(bucket.all({}, {}));
+      console.timeEnd("all");
+      console.time("all2");
+      const allItems2 = Array.from(bucket.all({}, {}));
+      console.timeEnd("all2");
+
+      bucket.close();
+      const file = Bun.file("test-bucket.albedo");
+      expect(await file.exists()).toBe(true);
+      file.delete();
     });
   });
 });

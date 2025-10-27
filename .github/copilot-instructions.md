@@ -1,110 +1,73 @@
-## Quick orientation
+# Albedo — Quick orientation for AI coding agents
 
-Albedo is a small experimental document store written in Zig with two main
-consumption paths: a C-like FFI (built as a shared/static library) and a
-Node/Bun binding. Primary storage is page-based BSON documents with B+ tree
-indexes. The codebase is intentionally small and favors explicit, manual
-memory and file layout operations.
+Albedo is a small experimental document store written in Zig with two primary consumption paths: a C-style FFI (shared/static library) and Node/Bun bindings. The codebase is intentionally compact and favors explicit, manual memory and file layout operations. This file gives the most important, discoverable facts to get productive quickly.
 
-Keep these places in mind when exploring or making changes:
-- `src/albedo.zig` — core bucket, pages, document layout, insert/list/delete,
-  meta page (page 0) stores index registry.
-- `src/lib.zig` — C-style exported API used by the Bun FFI wrapper.
-- `src/napi.zig` — Node/N-API exports via `napigen` (JavaScript bindings).
-- `src/*.zig` (other files) — `bplusindex.zig`, `bson.zig`, `query.zig`, etc.
-- `bun/` — example Bun consumer: `bun/albedo.ts` (ffi) and `albedo-napi.ts`
-  (N-API/napigen example).
+## Big-picture architecture (why & what)
 
-## Big-picture architecture
-- Storage model: fixed page size (DEFAULT_PAGE_SIZE = 8192) with a 64-byte
-  bucket header at file start and 32-byte page headers. Page types: Data,
-  Index, Free, Meta. The meta page (page 0) serializes index descriptors.
-- Indexes are loaded from the meta page and stored in `Bucket.indexes`
-  (StringHashMap). Index creation/recording flows go through `ensureIndex`
-  and `recordIndexes()`.
-- Memory model: the code uses explicit allocators (often `ArenaAllocator` or
-  the provided allocator). Many functions accept an allocator or create
-  per-request arenas — prefer preserving or forwarding the allocator.
-- Node/Bun integration: two options
-  - Direct FFI (Bun `dlopen`) that loads `libalbedo.(dylib|so)` and calls
-    `albedo_*` exported functions (see `bun/albedo.ts`).
-  - N-API binding built with `napigen` (`src/napi.zig`) and exposed as
-    `libalbedo.node` (use `zig build -Dnode=true`).
+- Storage: fixed page size (DEFAULT_PAGE_SIZE = 8192) with a 64-byte bucket header at file start and 32-byte page headers. Page types: Data, Index, Free, Meta. The meta page (page 0) is authoritative for index registration.
+  - See: `src/albedo.zig` (core bucket, pages, document layout) and `src/bplusindex.zig` (index implementation).
+- API surfaces:
+  - C-style exports for direct FFI: `src/lib.zig` (used by Bun FFI in `bun/albedo.ts`).
+  - N-API/napigen Node binding: `src/napi.zig` (build with `-Dnode=true`).
+- Memory model: explicit allocators (often `ArenaAllocator` or caller-provided allocator). Many APIs return slices backed by buffers — pay attention to ownership and use `defer allocator.free(...)` or `deinit()` where present.
+- Concurrency: `Bucket` operations use a `RwLock` for read/write safety. Follow existing lock patterns (lockShared/lock/ unlock) in `src/albedo.zig`.
 
-## Build & test commands (use these exact invocations)
-- Build default shared library (native):
+## Critical developer workflows
 
-  ```sh
+- Build native shared library:
   zig build
-  ```
-
 - Build Node (N-API) extension:
-
-  ```sh
   zig build -Dnode=true
-  ```
-
 - Build static library:
-
-  ```sh
   zig build -Dstatic=true
-  ```
-
-- Run unit tests (Zig tests are embedded in sources):
-
-  ```sh
+- Run Zig unit tests (tests are embedded in sources):
   zig test src/albedo.zig
-  # or run the build system test step:
+  or run full suite via build system:
   zig build test
-  ```
-
 - Bun example (after building shared lib):
-
-  ```sh
   cd bun
   bun install
   bun run index.ts
-  ```
 
-Artifacts appear in `zig-out/` (`zig-out/lib/libalbedo.dylib`, and
-`zig-out/bin/*` for tests). The Bun example expects `libalbedo.${suffix}` in
-`bun/` (see `bun/index.ts` and `dlopen` usage in `bun/albedo.ts`).
+Artifacts appear in `zig-out/` (`zig-out/lib/libalbedo.dylib`, and `zig-out/bin/*` for tests). The Bun example expects `libalbedo.${suffix}` in `bun/` (see `bun/albedo.ts`).
 
 ## Project-specific conventions & gotchas
-- File layout offsets matter: first 64 bytes = `BucketHeader`, pages start
-  immediately after. Be careful with read/write offsets and page boundary
-  arithmetic (see `Bucket.loadPage` / `writePage`).
-- Meta page (page id 0) is authoritative for index registration. Updates to
-  indexes must call `recordIndexes()` to persist new index metadata.
-- Do not assume automatic GC: many buffers are allocated with explicit
-  allocators and must be freed (look for `defer allocator.free(...)` patterns
-  and `deinit()` implementations). When adding APIs that return pointers to
-  internal buffers, follow existing patterns (Arena for short-lived, owned
-  buffers for long-lived results).
-- Concurrency: `Bucket` uses an `RwLock` around operations that mutate or
-  read pages — prefer using `lock()`/`unlock()` or `lockShared()` where code
-  expects it.
-- Error handling: Zig error sets are used heavily. When wrapping errors for
-  FFI/N-API consumers, map to the `Result` enum in `src/lib.zig` or follow
-  `napigen` patterns in `src/napi.zig`.
 
-## Typical tasks & where to start
-- Add a storage change (page layout, header): inspect `PageHeader`,
-  `BucketHeader` in `src/albedo.zig` and update read/write helpers and tests.
-- Add a query or index feature: update `query.zig`, ensure index metadata
-  serialization in `recordIndexes()` and loading in `loadIndices()`.
-- Add JS API surface: prefer updating `src/napi.zig` (N-API) for richer
-  ergonomics, and mirror the FFI signatures in `src/lib.zig` for Bun/FFI
-  usage.
+- File layout offsets matter: the first 64 bytes = `BucketHeader`, pages start immediately after. Be careful with offsets and page boundary arithmetic (see `Bucket.loadPage` / `writePage` in `src/albedo.zig`).
+- Meta page (page 0) serializes index descriptors and is authoritative. When adding/updating indexes call `recordIndexes()` (search for it in `src/albedo.zig`) to persist metadata.
+- Explicit memory management: prefer forwarding allocators; many functions accept an allocator or create per-request arenas. When adding APIs that return pointers to internal buffers, follow the existing pattern — use Arena for short-lived buffers and return owned buffers only when callers are expected to free them.
+- Tests: Zig tests are embedded alongside implementations (e.g., `src/bson.zig` contains many tests). Run `zig test` on the file you edit to get fast feedback.
+- Avoid implicit copying of slices that point into temporary arenas. When in doubt, search for `.deinit(` or `.free(` usage nearby.
 
-## Useful files to open when working on a change
-- `src/albedo.zig` (storage, pages, insert/list/delete, meta page)
-- `src/lib.zig` (C-compatible exports used by Bun FFI)
-- `src/napi.zig` (napigen-based Node bindings)
-- `src/bplusindex.zig` (index implementation)
-- `bun/albedo.ts`, `bun/index.ts` (how FFI/N-API is consumed)
-- `build.zig` and `build.md` (build flags and targets)
+## Integration points & cross-component communication
 
-If anything in this guide is unclear or you want more examples (for example
-concrete unit-test patterns, FFI shapes, or a checklist for adding a new
-index type), tell me which part you want expanded and I will iterate.
+- Bun FFI (dlopen) usage: `bun/albedo.ts` calls C exports from `libalbedo.dylib` (see `bun/index.ts` and `bun/albedo.ts`). The N-API binding lives in `src/napi.zig` and is produced by building with `-Dnode=true`.
+- WASM: `zig-out/bin/albedo.wasm` and `bun/albedo-wasm/` contain examples for the WASM target.
+
+## Key files to inspect (fast lookup)
+
+- `src/albedo.zig` — core bucket, pages, document layout, insert/list/delete, meta page handling.
+- `src/lib.zig` — C-compatible exported API used by Bun FFI.
+- `src/napi.zig` — Node/N-API exports (napigen) for richer JS ergonomics.
+- `src/bplusindex.zig` — index implementation and B+ tree details.
+- `src/bson.zig` — BSON parsing/serialization examples and many embedded tests (useful patterns for binary layout and tests).
+- `bun/albedo.ts`, `bun/index.ts` — how consumers load the library (dlopen) and use the FFI.
+- `build.zig` / `build.md` — useful flags and build targets.
+
+## How to add small features safely
+
+- Maintain low-level invariants: preserve page alignment, header sizes, and meta page serialization format. Add tests that construct raw page bytes if you change layout.
+- Use existing allocator patterns: prefer accepting an allocator parameter; use `ArenaAllocator` for internal short-lived allocations. Mirror `deinit()` semantics where appropriate.
+- When adding or changing indexes: update in-memory structures and also persist changes via `recordIndexes()` so the meta page reflects the change.
+
+## Quick troubleshooting tips
+
+- If a test fails with memory/offset errors, add debugging prints near `writePage`/`loadPage` and verify sizes against constants at the top of `src/albedo.zig`.
+- If Node binding fails to load, ensure you built with `-Dnode=true` and that `libalbedo.node` or `libalbedo.dylib` is placed/copied into `bun/`.
+
+## Examples to cite in PRs
+
+- To show allocator patterns: point reviewers at `src/bson.zig` tests and `BSONDocument.fromTuple`.
+- To justify low-level changes: include a small test that builds the specific page bytes and uses `zig test` on the relevant file.
+
+If anything above is unclear or you want extra examples (e.g., a small unit-test template to add, or a checklist for adding a new index type), tell me which part to expand and I will update this file.
