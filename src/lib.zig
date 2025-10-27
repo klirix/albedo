@@ -198,6 +198,13 @@ pub export fn albedo_vacuum(bucket: *Bucket) Result {
     return Result.OK;
 }
 
+pub export fn albedo_flush(bucket: *Bucket) Result {
+    bucket.flush() catch {
+        return Result.Error;
+    };
+    return Result.OK;
+}
+
 pub export fn albedo_version() u32 {
     return 1;
 }

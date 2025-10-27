@@ -289,6 +289,8 @@ pub const Bucket = struct {
     autoVaccuum: bool = true,
     objectIdGenerator: ObjectIdGenerator,
     in_memory: bool = false,
+    writes_since_sync: u32 = 0,
+    sync_threshold: u32 = 100, // Sync after every N writes
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -720,7 +722,25 @@ pub const Bucket = struct {
         const header_bytes = PageHeader.write(&page.header);
         try file.pwriteAll(header_bytes[0..], offset);
         try file.pwriteAll(page.data, offset + PageHeader.byteSize);
+        
+        // Batched sync: only sync periodically instead of every write
+        self.writes_since_sync += 1;
+        if (self.writes_since_sync >= self.sync_threshold) {
+            try file.sync();
+            self.writes_since_sync = 0;
+        }
+    }
+
+    /// Force a sync of all pending writes to disk.
+    /// Call this when you need guaranteed durability (e.g., after critical operations).
+    pub fn flush(self: *Bucket) !void {
+        if (self.in_memory) {
+            return;
+        }
+
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
         try file.sync();
+        self.writes_since_sync = 0;
     }
 
     pub fn dump(self: *Bucket, dest_path: []const u8) !void {

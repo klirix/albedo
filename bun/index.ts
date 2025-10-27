@@ -3,27 +3,32 @@ import albedo, { Bucket } from "./albedo";
 
 const bucket = Bucket.open("test-bucket.bucket");
 
-// console.time("insertion");
-// const id = new ObjectId();
-// for (let i = 0; i < 100000; i++) {
-//   bucket.insert({
-//     hello: `world${i}`,
-//     date: new Date(),
-//     _id: i == 49999 ? id : new ObjectId(),
-//   });
-// }
-// console.timeEnd("insertion");
+console.time("insertion");
+const id = new ObjectId();
+for (let i = 0; i < 10000; i++) {
+  bucket.insert({
+    hello: `world${i}`,
+    date: new Date(),
+    _id: i,
+  });
+}
+console.timeEnd("insertion");
 // console.time("insertion2");
 // for (let i = 0; i < 100; i++) {
 //   bucket.insert({ hello: `world${i}`, date: new Date() });
 // }
 // console.timeEnd("insertion2");
 
-console.time("insertion2");
-for (let i = 0; i < 10000; i++) {
-  bucket.insert({ hello: `world${i}`, _id: i, date: new Date() });
-}
-console.timeEnd("insertion2");
+const docs = Array.from({ length: 10000 }).reduce<Record<string, unknown>>(
+  (acc, _, i) => {
+    acc[i] = { hello: `world${i + 100000}`, date: new Date() };
+    return acc;
+  },
+  {}
+);
+// console.time("insertion2");
+// bucket.insertMany(docs as any);
+// console.timeEnd("insertion2");
 
 // console.time("index");
 // let res = bucket.all({ hello: { $eq: "world1" } }, {});
