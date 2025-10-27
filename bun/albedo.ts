@@ -219,7 +219,11 @@ export class Bucket {
       const ptr = read.ptr(dataPtrPtr) as Pointer;
       const size = read.u32(ptr);
       // console.log("res", dataPtrPtr.toString(16), sizeArr[0], i);
-      const shouldQuit = yield BSON.deserialize(toBuffer(ptr, 0, size));
+
+      // IMPORTANT: Copy the buffer before deserializing, since the arena will be freed
+      // when the iterator is closed. toBuffer() creates a view, not a copy.
+      const buffer = Buffer.from(toBuffer(ptr, 0, size));
+      const shouldQuit = yield BSON.deserialize(buffer);
 
       if (shouldQuit) {
         break;

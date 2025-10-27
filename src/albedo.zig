@@ -253,13 +253,20 @@ const PageCache = struct {
     }
 
     pub fn clear(self: *PageCache, page_allocator: std.mem.Allocator) void {
+        // Clear all entries from LRU list and free pages
         while (self.lru.popFirst()) |node| {
             const entry: *Entry = @alignCast(@fieldParentPtr("node", node));
             _ = self.map.remove(entry.page_id);
+
+            // Deinit and destroy page
             entry.page.deinit(page_allocator);
             page_allocator.destroy(entry.page);
+
+            // Destroy entry
             self.allocator.destroy(entry);
         }
+
+        // Reset state
         self.lru = .{};
         self.map.clearRetainingCapacity();
     }
@@ -663,7 +670,6 @@ pub const Bucket = struct {
 
     pub fn loadPage(self: *Bucket, page_id: u64) !*Page {
         // Check if the page is already in the cache
-
         if (self.pageCache.get(page_id)) |page| {
             return page;
         }
@@ -688,6 +694,8 @@ pub const Bucket = struct {
         page.* = try Page.init(self.allocator, self, header);
 
         if (page.header.page_id != page_id) {
+            Page.deinit(page, self.allocator);
+            self.allocator.destroy(page);
             return PageError.InvalidPageId;
         }
 
@@ -701,10 +709,9 @@ pub const Bucket = struct {
         };
 
         if (try self.pageCache.put(page_id, page)) |evicted| {
-            if (evicted != page) {
-                evicted.deinit(self.allocator);
-                self.allocator.destroy(evicted);
-            }
+            // Don't destroy evicted pages immediately - they may still be referenced
+            // by B+ tree Node structures. They will be freed during pageCache.clear()
+            _ = evicted;
         }
 
         return page;
@@ -722,7 +729,7 @@ pub const Bucket = struct {
         const header_bytes = PageHeader.write(&page.header);
         try file.pwriteAll(header_bytes[0..], offset);
         try file.pwriteAll(page.data, offset + PageHeader.byteSize);
-        
+
         // Batched sync: only sync periodically instead of every write
         self.writes_since_sync += 1;
         if (self.writes_since_sync >= self.sync_threshold) {
@@ -779,10 +786,9 @@ pub const Bucket = struct {
         const page = try self.allocator.create(Page);
         page.* = try Page.init(self.allocator, self, PageHeader.init(page_type, new_page_id));
         if (try self.pageCache.put(new_page_id, page)) |evicted| {
-            if (evicted != page) {
-                evicted.deinit(self.allocator);
-                self.allocator.destroy(evicted);
-            }
+            // Don't destroy evicted pages immediately - they may still be referenced
+            // by B+ tree Node structures. They will be freed during pageCache.clear()
+            _ = evicted;
         }
         return page;
     }
@@ -1134,7 +1140,6 @@ pub const Bucket = struct {
         offset: u16 = 0,
         pageIterator: PageIterator,
         readDeleted: bool = false,
-        doc_buffer: std.ArrayList(u8),
 
         fn init(bucket: *Bucket, allocator: std.mem.Allocator) !ScanIterator {
             return .{
@@ -1145,12 +1150,11 @@ pub const Bucket = struct {
                     .bucket = bucket,
                     .type = .Data,
                 },
-                .doc_buffer = std.ArrayList(u8){},
             };
         }
 
         pub fn deinit(self: *ScanIterator) void {
-            self.doc_buffer.deinit(self.allocator);
+            _ = self; // No cleanup needed when using arena allocator
         }
 
         pub fn step(self: *ScanIterator) !?DocumentMeta {
@@ -1195,33 +1199,43 @@ pub const Bucket = struct {
             // var header = location.header;
 
             while (location.header.is_deleted == 1 and !self.readDeleted) {
-
-                // Skip deleted documents
+                // Skip deleted documents without reading their data
                 const docOffset = self.page.data[self.offset..];
                 const doc_len = mem.readInt(u32, docOffset[0..4], .little);
                 const availableToSkip: u16 = @as(u16, @truncate(self.page.data.len)) - self.offset;
-                if (doc_len < availableToSkip) {
-                    self.offset += @as(u16, @truncate(doc_len)); // No more documents
+
+                if (doc_len <= availableToSkip) {
+                    // Deleted doc fits in current page, just advance offset
+                    self.offset += @as(u16, @truncate(doc_len));
                 } else {
-                    const pageDataLen = self.page.data.len;
-                    const pagesToSkip = @divFloor((doc_len - availableToSkip + pageDataLen), pageDataLen);
-                    const newOffset = @mod((doc_len - availableToSkip + pageDataLen), pageDataLen);
-                    for (0..pagesToSkip) |_| {
+                    // Deleted doc spans multiple pages
+                    // Calculate how many pages to skip without loading them
+                    var remaining: u32 = doc_len - availableToSkip;
+                    const pageDataLen: u32 = @intCast(self.page.data.len);
+
+                    // Skip full pages
+                    while (remaining > pageDataLen) {
                         self.page = try self.pageIterator.next() orelse return null;
+                        remaining -= pageDataLen;
                     }
-                    self.offset = @as(u16, @truncate(newOffset));
+
+                    // Load final page and set offset
+                    if (remaining > 0) {
+                        self.page = try self.pageIterator.next() orelse return null;
+                        self.offset = @as(u16, @truncate(remaining));
+                    } else {
+                        self.offset = 0;
+                    }
                 }
+
                 location = try self.step() orelse return null;
-                // header = location.header;
-                // std.debug.print("location header: {any}\n", .{location.header});
             }
 
             const doc_len = mem.readInt(u32, self.page.data[self.offset..][0..4], .little);
             var leftToCopy: u32 = doc_len;
 
-            // Reuse buffer if possible, otherwise resize
-            try self.doc_buffer.resize(self.allocator, doc_len);
-            var docBuffer = self.doc_buffer.items;
+            // Allocate fresh buffer from arena for this document
+            const docBuffer = try self.allocator.alloc(u8, doc_len);
 
             var writableBuffer = docBuffer[0..doc_len];
             var availableToCopy: u16 = @truncate(@min(doc_len, self.page.data.len - self.offset));
@@ -1240,14 +1254,13 @@ pub const Bucket = struct {
                 leftToCopy -= availableToCopy;
             }
 
-            // Return a copy of the buffer for the caller to own
-            const result_buffer = try self.allocator.dupe(u8, docBuffer);
-
+            // Return the arena-allocated buffer directly
+            // The buffer will be freed when the arena is freed
             return .{
                 .page_id = location.page_id,
                 .offset = location.offset,
                 .header = location.header,
-                .data = result_buffer,
+                .data = docBuffer,
             };
         }
     };
@@ -2192,21 +2205,32 @@ pub const Bucket = struct {
     }
 
     pub fn deinit(self: *Bucket) void {
+        // Flush any pending writes before cleanup
+        self.flush() catch {
+            // Ignore flush errors during cleanup
+        };
+
+        var idx_iter = self.indexes.iterator();
+        while (idx_iter.next()) |pair| {
+            const index_ptr = pair.value_ptr.*;
+            const key = pair.key_ptr.*;
+            self.allocator.destroy(index_ptr);
+            self.allocator.free(key);
+        }
+        self.indexes.deinit();
+
+        // Clear page cache (free all cached pages)
+        self.pageCache.clear(self.allocator);
+        self.pageCache.deinit();
+
+        // Free path
+        self.allocator.free(self.path);
+
+        // Close file last
         if (self.file) |*file| {
             file.close();
             self.file = null;
         }
-        self.allocator.free(self.path);
-        self.path = "";
-        self.pageCache.clear(self.allocator);
-        self.pageCache.deinit();
-        // Free index values and their keys
-        var idx_iter = self.indexes.iterator();
-        while (idx_iter.next()) |pair| {
-            pair.value_ptr.*.deinit();
-            self.allocator.free(pair.key_ptr.*);
-        }
-        self.indexes.deinit();
     }
 };
 

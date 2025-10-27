@@ -5,7 +5,7 @@ const bucket = Bucket.open("test-bucket.bucket");
 
 console.time("insertion");
 const id = new ObjectId();
-for (let i = 0; i < 10000; i++) {
+for (let i = 0; i < 50000; i++) {
   bucket.insert({
     hello: `world${i}`,
     date: new Date(),
@@ -45,6 +45,7 @@ const docs = Array.from({ length: 10000 }).reduce<Record<string, unknown>>(
 console.time("no index");
 const [doc2] = bucket.all({ hello: { $eq: "world56" } }, {});
 console.timeEnd("no index");
+console.log("Got doc, hello field length:", doc2?.hello?.length);
 
 console.time("index");
 let res2 = bucket.all({ _id: 56 }, {});
