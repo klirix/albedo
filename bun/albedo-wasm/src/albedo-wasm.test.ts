@@ -25,8 +25,8 @@ describe("Albedo WASM", () => {
       expect(bucket).toBeInstanceOf(Bucket);
 
       console.time("insertion");
-      for (let i = 0; i < 1000; i++) {
-        bucket.insert({ hello: `world${i}`, date: new Date() });
+      for (let i = 0; i < 10000; i++) {
+        bucket.insert({ hello: `world${i}`, _id: i, date: new Date() });
       }
       console.timeEnd("insertion");
 
@@ -36,6 +36,12 @@ describe("Albedo WASM", () => {
       console.time("all2");
       const allItems2 = Array.from(bucket.all({}, {}));
       console.timeEnd("all2");
+      console.time("idx");
+      const idxItems = Array.from(bucket.all({ _id: { $eq: 5555 } }, {}));
+      console.timeEnd("idx");
+      expect(allItems.length).toBe(10000);
+      expect(idxItems.length).toBe(1);
+      expect(idxItems[0]?._id).toBe(5555);
 
       bucket.close();
       const file = Bun.file("test-bucket.albedo");

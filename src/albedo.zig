@@ -589,20 +589,17 @@ pub const Bucket = struct {
             return;
         }
 
-        var owned_strings = std.ArrayList([]u8){};
-        defer {
-            for (owned_strings.items) |buf| {
-                self.allocator.free(buf);
-            }
-            owned_strings.deinit(self.allocator);
-        }
+        // Use arena allocator for all temporary allocations during index building
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp_allocator = arena.allocator();
 
         var index = try Index.create(self);
         var index_owner = true;
         defer if (index_owner) index.deinit();
         index.options = options;
 
-        var scanner = try ScanIterator.init(self, self.allocator);
+        var scanner = try ScanIterator.init(self, temp_allocator);
         defer scanner.deinit();
 
         while (true) {
@@ -610,20 +607,17 @@ pub const Bucket = struct {
             if (maybe_doc == null) break;
             const doc_result = maybe_doc.?;
 
-            defer self.allocator.free(doc_result.data);
+            defer temp_allocator.free(doc_result.data);
 
             var doc = BSONDocument{ .buffer = doc_result.data };
 
             var values = std.ArrayList(BSONValue){};
-            defer values.deinit(self.allocator);
+            defer values.deinit(temp_allocator);
 
             const has_values = try self.gatherIndexValuesForPath(&doc, path, options, &values);
             if (!has_values) continue;
 
-            for (values.items, 0..) |_, i| {
-                values.items[i] = try self.cloneIndexValue(values.items[i], &owned_strings);
-            }
-
+            // No need to clone values since they're in the arena and will be used immediately
             const location = Index.DocumentLocation{
                 .pageId = doc_result.page_id,
                 .offset = doc_result.offset,
@@ -854,10 +848,9 @@ pub const Bucket = struct {
             }
         }
 
+        // Use the document's existing buffer directly
         const doc_size = doc.buffer.len;
-        var encoded_doc = try self.allocator.alloc(u8, doc_size);
-        defer self.allocator.free(encoded_doc);
-        doc.serializeToMemory(encoded_doc);
+        const encoded_doc = doc.buffer;
         var page: *Page = undefined;
 
         self.rwlock.lock();
@@ -1121,6 +1114,7 @@ pub const Bucket = struct {
         offset: u16 = 0,
         pageIterator: PageIterator,
         readDeleted: bool = false,
+        doc_buffer: std.ArrayList(u8),
 
         fn init(bucket: *Bucket, allocator: std.mem.Allocator) !ScanIterator {
             return .{
@@ -1131,11 +1125,12 @@ pub const Bucket = struct {
                     .bucket = bucket,
                     .type = .Data,
                 },
+                .doc_buffer = std.ArrayList(u8){},
             };
         }
 
-        pub fn deinit(_: *ScanIterator) void {
-            // self.page.deinit(self.allocator);
+        pub fn deinit(self: *ScanIterator) void {
+            self.doc_buffer.deinit(self.allocator);
         }
 
         pub fn step(self: *ScanIterator) !?DocumentMeta {
@@ -1204,7 +1199,9 @@ pub const Bucket = struct {
             const doc_len = mem.readInt(u32, self.page.data[self.offset..][0..4], .little);
             var leftToCopy: u32 = doc_len;
 
-            var docBuffer = try self.allocator.alloc(u8, doc_len);
+            // Reuse buffer if possible, otherwise resize
+            try self.doc_buffer.resize(self.allocator, doc_len);
+            var docBuffer = self.doc_buffer.items;
 
             var writableBuffer = docBuffer[0..doc_len];
             var availableToCopy: u16 = @truncate(@min(doc_len, self.page.data.len - self.offset));
@@ -1223,11 +1220,14 @@ pub const Bucket = struct {
                 leftToCopy -= availableToCopy;
             }
 
+            // Return a copy of the buffer for the caller to own
+            const result_buffer = try self.allocator.dupe(u8, docBuffer);
+
             return .{
                 .page_id = location.page_id,
                 .offset = location.offset,
                 .header = location.header,
-                .data = docBuffer,
+                .data = result_buffer,
             };
         }
     };
@@ -1821,8 +1821,17 @@ pub const Bucket = struct {
                         else => return error.ScanError,
                     };
 
+                    // Pre-size the deduplication map based on expected number of documents
                     var seen = std.AutoHashMap(u128, void).init(ally);
                     defer seen.deinit();
+
+                    // Pre-allocate capacity to reduce rehashing
+                    var value_count: usize = 0;
+                    var count_iter = inFilter.value.array.iter();
+                    while (count_iter.next()) |pair| {
+                        if (isIndexableValue(pair.value)) value_count += 1;
+                    }
+                    try seen.ensureTotalCapacity(@intCast(value_count * 4)); // Estimate 4 docs per value
 
                     var value_iter = inFilter.value.array.iter();
                     while (value_iter.next()) |pair| {

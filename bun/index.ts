@@ -1,10 +1,7 @@
 import { ObjectId } from "bson";
 import albedo, { Bucket } from "./albedo";
 
-const bucket = Bucket.open(":memory:");
-
-const file = Bun.file("libalbedo.dylib");
-const buffer = await file.arrayBuffer();
+const bucket = Bucket.open("test-bucket.bucket");
 
 // console.time("insertion");
 // const id = new ObjectId();
@@ -23,8 +20,8 @@ const buffer = await file.arrayBuffer();
 // console.timeEnd("insertion2");
 
 console.time("insertion2");
-for (let i = 0; i < 100000; i++) {
-  bucket.insert({ hello: `world${i}`, date: new Date() });
+for (let i = 0; i < 10000; i++) {
+  bucket.insert({ hello: `world${i}`, _id: i, date: new Date() });
 }
 console.timeEnd("insertion2");
 
@@ -45,20 +42,20 @@ const [doc2] = bucket.all({ hello: { $eq: "world56" } }, {});
 console.timeEnd("no index");
 
 console.time("index");
-let res2 = bucket.all({ _id: doc2._id }, {});
+let res2 = bucket.all({ _id: 56 }, {});
 console.timeEnd("index");
 
-bucket.ensureIndex("hello");
+// bucket.ensureIndex("hello");
 
-let len = 0;
-for (const doc of bucket.list(
-  { hello: { $gte: "world50", $lte: "world60" } },
-  { sector: { limit: 10 } }
-))
-  console.log(doc), len++;
-console.log("len", len);
+// let len = 0;
+// for (const doc of bucket.list(
+//   { hello: { $gte: "world50", $lte: "world60" } },
+//   { sector: { limit: 10 } }
+// ))
+//   console.log(doc), len++;
+// console.log("len", len);
 
-console.log("res", res2.length);
+// console.log("res", res2.length);
 
 // console.time("vacuum");
 // bucket.vacuum();
