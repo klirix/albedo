@@ -212,7 +212,11 @@ pub const Filter = union(FilterType) {
 
     pub fn match(self: *const Filter, doc: *const bson.BSONDocument) bool {
         const valueToMatch = switch (self.*) {
-            inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between, .startsWith, .endsWith, .exists, .notExists => |e| blk: {
+            .notExists => |e| blk: {
+                // For notExists, return true if field doesn't exist, false if it exists
+                break :blk doc.getPath(e.path) orelse return true;
+            },
+            inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between, .startsWith, .endsWith, .exists => |e| blk: {
                 break :blk doc.getPath(e.path) orelse return false;
             },
         };
@@ -300,6 +304,312 @@ test "Filter.parse handles lte" {
         },
         else => unreachable,
     }
+}
+
+test "Filter.parse handles startsWith" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$startsWith", .value = .{ .string = bson.BSONString{ .value = "prefix" } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "name", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(filters.len, 1);
+    switch (filters[0]) {
+        .startsWith => |*startsWithFilter| {
+            try std.testing.expectEqualSlices(u8, "name", startsWithFilter.path);
+            try std.testing.expectEqualStrings("prefix", startsWithFilter.value.string.value);
+        },
+        else => unreachable,
+    }
+}
+
+test "Filter.matchValue startsWith matches correctly" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$startsWith", .value = .{ .string = bson.BSONString{ .value = "hello" } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "message", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // Test positive cases
+    const matchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "hello world" } };
+    try std.testing.expect(filter.matchValue(matchingValue1));
+
+    const matchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "hello" } };
+    try std.testing.expect(filter.matchValue(matchingValue2));
+
+    // Test negative cases
+    const nonMatchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "world hello" } };
+    try std.testing.expect(!filter.matchValue(nonMatchingValue1));
+
+    const nonMatchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "hel" } };
+    try std.testing.expect(!filter.matchValue(nonMatchingValue2));
+
+    // Test non-string value
+    const nonStringValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
+    try std.testing.expect(!filter.matchValue(nonStringValue));
+}
+
+test "Filter.parse handles endsWith" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$endsWith", .value = .{ .string = bson.BSONString{ .value = "suffix" } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "filename", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(filters.len, 1);
+    switch (filters[0]) {
+        .endsWith => |*endsWithFilter| {
+            try std.testing.expectEqualSlices(u8, "filename", endsWithFilter.path);
+            try std.testing.expectEqualStrings("suffix", endsWithFilter.value.string.value);
+        },
+        else => unreachable,
+    }
+}
+
+test "Filter.matchValue endsWith matches correctly" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$endsWith", .value = .{ .string = bson.BSONString{ .value = ".txt" } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "filename", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // Test positive cases
+    const matchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "document.txt" } };
+    try std.testing.expect(filter.matchValue(matchingValue1));
+
+    const matchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = ".txt" } };
+    try std.testing.expect(filter.matchValue(matchingValue2));
+
+    // Test negative cases
+    const nonMatchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "document.pdf" } };
+    try std.testing.expect(!filter.matchValue(nonMatchingValue1));
+
+    const nonMatchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "txt" } };
+    try std.testing.expect(!filter.matchValue(nonMatchingValue2));
+
+    // Test non-string value
+    const nonStringValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
+    try std.testing.expect(!filter.matchValue(nonStringValue));
+}
+
+test "Filter.parse handles exists" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$exists", .value = .{ .boolean = .{ .value = true } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "email", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(filters.len, 1);
+    switch (filters[0]) {
+        .exists => |*existsFilter| {
+            try std.testing.expectEqualSlices(u8, "email", existsFilter.path);
+        },
+        else => unreachable,
+    }
+}
+
+test "Filter.matchValue exists always returns true" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$exists", .value = .{ .boolean = .{ .value = true } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "field", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // Exists filter should always return true for any value when field exists
+    const stringValue = bson.BSONValue{ .string = bson.BSONString{ .value = "test" } };
+    try std.testing.expect(filter.matchValue(stringValue));
+
+    const intValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
+    try std.testing.expect(filter.matchValue(intValue));
+
+    const boolValue = bson.BSONValue{ .boolean = .{ .value = false } };
+    try std.testing.expect(filter.matchValue(boolValue));
+}
+
+test "Filter.match exists checks field presence in document" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$exists", .value = .{ .boolean = .{ .value = true } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "email", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // Document with the field should match
+    var docWithField = bson.BSONDocument.initEmpty();
+    docWithField = try docWithField.set(ally, "email", bson.BSONValue{ .string = bson.BSONString{ .value = "test@example.com" } });
+    defer docWithField.deinit(ally);
+    try std.testing.expect(filter.match(&docWithField));
+
+    // Document without the field should not match
+    var docWithoutField = bson.BSONDocument.initEmpty();
+    docWithoutField = try docWithoutField.set(ally, "name", bson.BSONValue{ .string = bson.BSONString{ .value = "John" } });
+    defer docWithoutField.deinit(ally);
+    try std.testing.expect(!filter.match(&docWithoutField));
+}
+
+test "Filter.parse handles notExists" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$notExists", .value = .{ .boolean = .{ .value = true } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "deletedAt", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(filters.len, 1);
+    switch (filters[0]) {
+        .notExists => |*notExistsFilter| {
+            try std.testing.expectEqualSlices(u8, "deletedAt", notExistsFilter.path);
+        },
+        else => unreachable,
+    }
+}
+
+test "Filter.matchValue notExists always returns false" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$notExists", .value = .{ .boolean = .{ .value = true } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "field", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // notExists filter should always return false when a value exists
+    const stringValue = bson.BSONValue{ .string = bson.BSONString{ .value = "test" } };
+    try std.testing.expect(!filter.matchValue(stringValue));
+
+    const intValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
+    try std.testing.expect(!filter.matchValue(intValue));
+
+    const boolValue = bson.BSONValue{ .boolean = .{ .value = false } };
+    try std.testing.expect(!filter.matchValue(boolValue));
+}
+
+test "Filter.match notExists checks field absence in document" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$notExists", .value = .{ .boolean = .{ .value = true } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "deletedAt", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // Document with the field should not match
+    var docWithField = bson.BSONDocument.initEmpty();
+    docWithField = try docWithField.set(ally, "deletedAt", bson.BSONValue{ .string = bson.BSONString{ .value = "2024-01-01" } });
+    defer docWithField.deinit(ally);
+    try std.testing.expect(!filter.match(&docWithField));
+
+    // Document without the field should match (returns true when field doesn't exist)
+    var docWithoutField = bson.BSONDocument.initEmpty();
+    docWithoutField = try docWithoutField.set(ally, "createdAt", bson.BSONValue{ .string = bson.BSONString{ .value = "2024-01-01" } });
+    defer docWithoutField.deinit(ally);
+    try std.testing.expect(filter.match(&docWithoutField));
 }
 
 const SortType = enum {
