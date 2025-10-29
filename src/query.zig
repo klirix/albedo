@@ -19,16 +19,7 @@ const Allocator = std.mem.Allocator;
 
 const Path = [][]const u8; // "field.subfield".split('.')
 
-pub const FilterType = enum {
-    eq,
-    ne,
-    lt,
-    lte,
-    gt,
-    gte,
-    in,
-    between,
-};
+pub const FilterType = enum { eq, ne, lt, lte, gt, gte, in, between, startsWith, endsWith, exists, notExists };
 
 pub const PathValuePair = struct {
     path: []const u8,
@@ -63,6 +54,10 @@ pub const Filter = union(FilterType) {
     gte: PathValuePair,
     in: PathValuePair,
     between: PathValuePair,
+    startsWith: PathValuePair,
+    endsWith: PathValuePair,
+    exists: PathValuePair,
+    notExists: PathValuePair,
 
     pub fn deinit(self: *Filter, ally: Allocator) void {
         switch (self.*) {
@@ -72,7 +67,7 @@ pub const Filter = union(FilterType) {
             .between => |*betweenFilter| {
                 ally.free(betweenFilter.path);
             },
-            .eq, .ne, .lt, .gt, .lte, .gte => |*filter| {
+            .eq, .ne, .lt, .gt, .lte, .gte, .startsWith, .endsWith, .exists, .notExists => |*filter| {
                 ally.free(filter.path);
             },
         }
@@ -91,6 +86,20 @@ pub const Filter = union(FilterType) {
     };
 
     fn parseDoc(ally: Allocator, doc: bson.BSONDocument) FilterParsingErrors![]Filter {
+        const filterNameMap = comptime std.StaticStringMap(FilterType).initComptime(.{
+            .{ "$eq", .eq },
+            .{ "$ne", .ne },
+            .{ "$lt", .lt },
+            .{ "$lte", .lte },
+            .{ "$gt", .gt },
+            .{ "$gte", .gte },
+            .{ "$in", .in },
+            .{ "$between", .between },
+            .{ "$startsWith", .startsWith },
+            .{ "$endsWith", .endsWith },
+            .{ "$exists", .exists },
+            .{ "$notExists", .notExists },
+        });
         var filters = std.ArrayListUnmanaged(Filter){};
         defer filters.deinit(ally);
 
@@ -105,52 +114,24 @@ pub const Filter = union(FilterType) {
                     var matched = false;
                     while (op_iter.next()) |op_pair| {
                         const operand = op_pair.value;
-                        if (std.mem.eql(u8, op_pair.key, "$eq")) {
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .eq = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else if (std.mem.eql(u8, op_pair.key, "$in")) {
-                            if (operand != .array) return FilterParsingErrors.InvalidInOperatorValue;
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .in = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else if (std.mem.eql(u8, op_pair.key, "$ne")) {
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .ne = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else if (std.mem.eql(u8, op_pair.key, "$lt")) {
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .lt = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else if (std.mem.eql(u8, op_pair.key, "$lte")) {
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .lte = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else if (std.mem.eql(u8, op_pair.key, "$gt")) {
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .gt = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else if (std.mem.eql(u8, op_pair.key, "$gte")) {
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .gte = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else if (std.mem.eql(u8, op_pair.key, "$between")) {
-                            if (operand != .array) return FilterParsingErrors.InvalidQueryOperatorParameter;
-                            if (operand.array.keyNumber() != 2) return FilterParsingErrors.InvalidQueryOperatorBetweenSize;
-                            const path_copy = try ally.dupe(u8, path);
-                            errdefer ally.free(path_copy);
-                            try filters.append(ally, .{ .between = .{ .path = path_copy, .value = operand } });
-                            matched = true;
-                        } else {
-                            return FilterParsingErrors.InvalidQueryOperator;
+                        const operator = filterNameMap.get(op_pair.key) orelse return FilterParsingErrors.InvalidQueryOperator;
+                        switch (operator) {
+                            inline .eq, .in, .ne, .lt, .lte, .gt, .gte, .startsWith, .endsWith, .exists, .notExists => |op| {
+                                const path_copy = try ally.dupe(u8, path);
+                                errdefer ally.free(path_copy);
+                                const filter = @unionInit(Filter, @tagName(op), PathValuePair{ .path = path_copy, .value = operand });
+
+                                try filters.append(ally, filter);
+                            },
+                            .between => {
+                                if (operand != .array) return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                if (operand.array.keyNumber() != 2) return FilterParsingErrors.InvalidQueryOperatorBetweenSize;
+                                const path_copy = try ally.dupe(u8, path);
+                                errdefer ally.free(path_copy);
+                                try filters.append(ally, .{ .between = .{ .path = path_copy, .value = operand } });
+                            },
                         }
+                        matched = true;
                     }
 
                     if (!matched) return FilterParsingErrors.InvalidQueryOperator;
@@ -203,14 +184,37 @@ pub const Filter = union(FilterType) {
             .between => |betweenFilter| {
                 const lowerBound = betweenFilter.value.array.get("0") orelse unreachable;
                 const upperBound = betweenFilter.value.array.get("1") orelse unreachable;
+
                 return valueToMatch.order(lowerBound) == .gt and valueToMatch.order(upperBound) == .lt;
+            },
+            .startsWith => |startsWithFilter| {
+                if (valueToMatch != bson.BSONValueType.string) return false;
+                const strValue = valueToMatch.string.value;
+                const prefix = startsWithFilter.value.string.value;
+                if (strValue.len < prefix.len) return false;
+                return std.mem.eql(u8, strValue[0..prefix.len], prefix);
+            },
+            .endsWith => |endsWithFilter| {
+                if (valueToMatch != bson.BSONValueType.string) return false;
+                const strValue = valueToMatch.string.value;
+                const suffix = endsWithFilter.value.string.value;
+                if (strValue.len < suffix.len) return false;
+                return std.mem.eql(u8, strValue[strValue.len - suffix.len ..], suffix);
+            },
+            .exists => |_| {
+                return true;
+            },
+            .notExists => |_| {
+                return false;
             },
         }
     }
 
     pub fn match(self: *const Filter, doc: *const bson.BSONDocument) bool {
         const valueToMatch = switch (self.*) {
-            inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between => |e| doc.getPath(e.path) orelse return false,
+            inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between, .startsWith, .endsWith, .exists, .notExists => |e| blk: {
+                break :blk doc.getPath(e.path) orelse return false;
+            },
         };
         return matchValue(self, valueToMatch);
     }
