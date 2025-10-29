@@ -366,9 +366,39 @@ test "Filter.matchValue startsWith matches correctly" {
     const nonMatchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "hel" } };
     try std.testing.expect(!filter.matchValue(nonMatchingValue2));
 
+    const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
+    try std.testing.expect(!filter.matchValue(emptyString));
+
     // Test non-string value
     const nonStringValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
     try std.testing.expect(!filter.matchValue(nonStringValue));
+}
+
+test "Filter.matchValue startsWith with empty prefix" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$startsWith", .value = .{ .string = bson.BSONString{ .value = "" } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "message", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // Empty prefix should match any string
+    const anyString = bson.BSONValue{ .string = bson.BSONString{ .value = "anything" } };
+    try std.testing.expect(filter.matchValue(anyString));
+
+    const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
+    try std.testing.expect(filter.matchValue(emptyString));
 }
 
 test "Filter.parse handles endsWith" {
@@ -431,9 +461,39 @@ test "Filter.matchValue endsWith matches correctly" {
     const nonMatchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "txt" } };
     try std.testing.expect(!filter.matchValue(nonMatchingValue2));
 
+    const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
+    try std.testing.expect(!filter.matchValue(emptyString));
+
     // Test non-string value
     const nonStringValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
     try std.testing.expect(!filter.matchValue(nonStringValue));
+}
+
+test "Filter.matchValue endsWith with empty suffix" {
+    const ally = std.testing.allocator;
+    var opPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$endsWith", .value = .{ .string = bson.BSONString{ .value = "" } } },
+    };
+    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
+    defer opDoc.deinit(ally);
+    var filterPairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "filename", .value = .{ .document = opDoc } },
+    };
+    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    const filter = &filters[0];
+
+    // Empty suffix should match any string
+    const anyString = bson.BSONValue{ .string = bson.BSONString{ .value = "anything" } };
+    try std.testing.expect(filter.matchValue(anyString));
+
+    const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
+    try std.testing.expect(filter.matchValue(emptyString));
 }
 
 test "Filter.parse handles exists" {
