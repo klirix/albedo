@@ -2392,6 +2392,8 @@ pub const Bucket = struct {
         self.pageCache = PageCache.init(self.allocator, cache_capacity);
         // Reinitialize and reload indexes from the meta page
         self.indexes = .init(self.allocator);
+        // Reinitialize dirty_pages for replication tracking
+        self.dirty_pages = std.AutoHashMap(u64, void).init(self.allocator);
         const meta = try self.loadPage(0);
         try self.loadIndices(meta);
     }
@@ -3289,21 +3291,21 @@ test "Bucket.replication with page streaming" {
     const replicationCallback = struct {
         fn callback(
             context: ?*anyopaque,
-            page_id: u64,
             page_data: [*]const u8,
-            page_size: u32,
-        ) callconv(.c) void {
+            data_size: u32,
+            page_count: u32,
+        ) callconv(.c) u8 {
             const self: *ReplicationContext = @ptrCast(@alignCast(context.?));
-            const page_slice = page_data[0..page_size];
+            const page_slice = page_data[0..data_size];
 
             // Apply page to replica
-            self.replica_bucket.applyReplicatedPage(page_id, page_slice) catch |err| {
+            self.replica_bucket.applyReplicatedBatch(page_slice, page_count) catch |err| {
                 std.debug.print("Failed to apply replicated page: {any}\n", .{err});
-                return;
+                return 1;
             };
 
-            self.pages_replicated += 1;
-            self.last_page_id = page_id;
+            self.pages_replicated += page_count;
+            return 0;
         }
     }.callback;
 
