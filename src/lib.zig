@@ -205,6 +205,31 @@ pub export fn albedo_flush(bucket: *Bucket) Result {
     return Result.OK;
 }
 
+/// Set a callback to be notified of page changes for replication
+pub export fn albedo_set_replication_callback(
+    bucket: *Bucket,
+    callback: albedo.PageChangeCallback,
+    context: ?*anyopaque,
+) Result {
+    bucket.replication_callback = callback;
+    bucket.replication_context = context;
+    return Result.OK;
+}
+
+/// Apply a replicated page to this bucket (for replicas)
+pub export fn albedo_apply_batch(
+    bucket: *Bucket,
+    data: [*]const u8,
+    data_size: u32,
+    page_count: u32,
+) Result {
+    bucket.applyReplicatedBatch(data[0..data_size], page_count) catch {
+        return Result.Error;
+    };
+
+    return Result.OK;
+}
+
 pub export fn albedo_version() u32 {
     return 1;
 }

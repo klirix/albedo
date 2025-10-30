@@ -14,7 +14,7 @@ const IndexOptions = bindex.IndexOptions;
 const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
 const ALBEDO_FLAGS = 0;
-const DEFAULT_PAGE_SIZE = 8192; // 8kB, or up to 64kB
+pub const DEFAULT_PAGE_SIZE = 8192; // 8kB, or up to 64kB
 const DEFAULT_PAGE_CACHE_CAPACITY: usize = 256 * 64; // 64MB cache
 const MAX_INDEX_STRING_BYTES: usize = 256;
 const DoublyLinkedList = std.DoublyLinkedList;
@@ -285,6 +285,30 @@ const BucketInitErrors = error{
     UnexpectedError,
 };
 
+/// Callback function type for page replication
+/// Called after pages are written and synced to disk
+/// The data buffer contains a batch: [BucketHeader (64 bytes)][Page1 (8192 bytes)][Page2 (8192 bytes)]...
+/// Page IDs can be extracted by reading the page headers within the buffer
+/// Each page in the buffer is at offset: 64 + (page_index * 8192)
+/// Returns 0 on success, non-zero error code on failure (will retry on next sync)
+pub const PageChangeCallback = ?*const fn (
+    context: ?*anyopaque, // User-provided context
+    data: [*]const u8, // Raw data: header (64 bytes) + N pages (8192 bytes each)
+    data_size: u32, // Total size of data (BucketHeader.byteSize + page_count * DEFAULT_PAGE_SIZE)
+    page_count: u32, // Number of pages in the batch
+) callconv(.c) u8;
+
+/// Error codes returned by replication callback
+pub const ReplicationError = enum(u8) {
+    OK = 0,
+    NetworkError = 1,
+    DiskFull = 2,
+    InvalidFormat = 3,
+    ReplicaUnavailable = 4,
+    TimeoutError = 5,
+    UnknownError = 255,
+};
+
 pub const Bucket = struct {
     file: ?platform.FileHandle = null,
     path: []const u8,
@@ -298,6 +322,11 @@ pub const Bucket = struct {
     in_memory: bool = false,
     writes_since_sync: u32 = 0,
     sync_threshold: u32 = 100, // Sync after every N writes
+    replication_callback: PageChangeCallback = null,
+    replication_context: ?*anyopaque = null,
+    dirty_pages: std.AutoHashMap(u64, void),
+    replication_retry_count: u32 = 0,
+    max_replication_retries: u32 = 3,
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -477,6 +506,7 @@ pub const Bucket = struct {
             .indexes = .init(ally),
             .autoVaccuum = options.autoVaccuum,
             .objectIdGenerator = generator,
+            .dirty_pages = std.AutoHashMap(u64, void).init(ally),
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
@@ -501,6 +531,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.autoVaccuum,
             .objectIdGenerator = generator,
             .in_memory = true,
+            .dirty_pages = std.AutoHashMap(u64, void).init(ally),
         };
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
@@ -558,6 +589,7 @@ pub const Bucket = struct {
             .indexes = .init(ally),
             .autoVaccuum = options.autoVaccuum,
             .objectIdGenerator = generator,
+            .dirty_pages = std.AutoHashMap(u64, void).init(ally),
         };
         errdefer {
             if (bucket.file) |*fh| fh.close();
@@ -730,11 +762,87 @@ pub const Bucket = struct {
         try file.pwriteAll(header_bytes[0..], offset);
         try file.pwriteAll(page.data, offset + PageHeader.byteSize);
 
+        // Track dirty page for replication (set automatically handles duplicates)
+        if (self.replication_callback != null) {
+            try self.dirty_pages.put(page.header.page_id, {});
+        }
+
         // Batched sync: only sync periodically instead of every write
         self.writes_since_sync += 1;
         if (self.writes_since_sync >= self.sync_threshold) {
             try file.sync();
             self.writes_since_sync = 0;
+
+            // Trigger replication callback after sync (non-fatal)
+            self.notifyDirtyPages() catch {
+                // Replication error - will retry on next sync
+            };
+        }
+    }
+
+    /// Notify replication callback of dirty pages and clear the list
+    fn notifyDirtyPages(self: *Bucket) !void {
+        if (self.replication_callback == null or self.dirty_pages.count() == 0) {
+            return;
+        }
+
+        const callback = self.replication_callback.?;
+        const page_count = self.dirty_pages.count();
+
+        // Calculate total buffer size: header + all dirty pages
+        const total_size = BucketHeader.byteSize + (page_count * DEFAULT_PAGE_SIZE);
+
+        // Allocate buffer for batched replication
+        const buffer = try self.allocator.alloc(u8, total_size);
+        defer self.allocator.free(buffer);
+
+        // First 64 bytes: bucket header
+        const header_bytes = self.header.toBytes();
+        @memcpy(buffer[0..BucketHeader.byteSize], &header_bytes);
+
+        // Pack all dirty pages into buffer
+        var iterator = self.dirty_pages.keyIterator();
+        var i: usize = 0;
+        while (iterator.next()) |page_id_ptr| : (i += 1) {
+            const page = try self.loadPage(page_id_ptr.*);
+            const offset = BucketHeader.byteSize + (i * DEFAULT_PAGE_SIZE);
+
+            // Write page header (32 bytes)
+            const page_header_bytes = PageHeader.write(&page.header);
+            @memcpy(buffer[offset .. offset + PageHeader.byteSize], &page_header_bytes);
+
+            // Write page data
+            @memcpy(buffer[offset + PageHeader.byteSize .. offset + DEFAULT_PAGE_SIZE], page.data);
+        }
+
+        // Call the callback once with all pages and check acknowledgement
+        const result = callback(
+            self.replication_context,
+            buffer.ptr,
+            @intCast(total_size),
+            @intCast(page_count),
+        );
+
+        // Handle callback result
+        if (result == @intFromEnum(ReplicationError.OK)) {
+            // Success: clear dirty pages and reset retry counter
+            self.dirty_pages.clearRetainingCapacity();
+            self.replication_retry_count = 0;
+        } else {
+            // Failure: keep dirty pages for retry
+            self.replication_retry_count += 1;
+
+            // Check if we've exceeded max retries
+            if (self.replication_retry_count >= self.max_replication_retries) {
+                // Log or handle max retries exceeded
+                // For now, clear pages to prevent infinite retry
+                // (application can implement custom logic via error codes)
+                self.dirty_pages.clearRetainingCapacity();
+                self.replication_retry_count = 0;
+                return error.ReplicationMaxRetriesExceeded;
+            }
+
+            return error.ReplicationFailed;
         }
     }
 
@@ -745,9 +853,93 @@ pub const Bucket = struct {
             return;
         }
 
-        const file = if (self.file) |*f| f else return error.StorageUnavailable;
-        try file.sync();
+        if (self.file) |*f| {
+            try f.sync();
+        }
+
         self.writes_since_sync = 0;
+
+        // Trigger replication callback after flush
+        // Note: Replication errors are non-fatal - dirty pages kept for retry
+        self.notifyDirtyPages() catch {
+            // Replication failed, but data is safely on disk
+            // Dirty pages will be retried on next sync
+        };
+    }
+
+    /// Apply replicated pages to this bucket (for replicas)
+    /// This writes raw page data directly to disk and invalidates the cache
+    /// Buffer format: [BucketHeader (64 bytes)][Page1 (8192)][Page2 (8192)]...
+    pub fn applyReplicatedBatch(self: *Bucket, data: []const u8, page_count: u32) !void {
+        if (self.in_memory) {
+            return error.ReplicationNotSupported;
+        }
+
+        const expected_size = BucketHeader.byteSize + (@as(usize, page_count) * DEFAULT_PAGE_SIZE);
+        if (data.len != expected_size) {
+            return error.InvalidBatchSize;
+        }
+
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
+
+        // Extract and apply bucket header (first 64 bytes)
+        const header_data = data[0..BucketHeader.byteSize];
+        const new_header = BucketHeader.read(header_data);
+
+        // Update our header with the replicated values
+        self.header = new_header;
+        try self.flushHeader();
+
+        var meta_page_replicated = false;
+
+        // Process each page in the batch
+        var i: u32 = 0;
+        while (i < page_count) : (i += 1) {
+            const page_data_start = BucketHeader.byteSize + (@as(usize, i) * DEFAULT_PAGE_SIZE);
+            const page_data_end = page_data_start + DEFAULT_PAGE_SIZE;
+            const page_data = data[page_data_start..page_data_end];
+
+            // Parse page header to get page_id
+            const page_header = PageHeader.read(page_data[0..PageHeader.byteSize]);
+            const page_id = page_header.page_id;
+
+            // Calculate file offset for this page
+            const page_offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
+
+            // Write page data directly to file
+            try file.pwriteAll(page_data, page_offset);
+
+            // Invalidate page cache entry if it exists
+            if (self.pageCache.remove(page_id)) |old_page| {
+                old_page.deinit(self.allocator);
+                self.allocator.destroy(old_page);
+            }
+
+            // Track if meta page was replicated
+            if (page_id == 0) {
+                meta_page_replicated = true;
+            }
+        }
+
+        // Sync all changes to disk
+        try file.sync();
+
+        // Special handling for page 0 (meta page): reload indexes
+        if (meta_page_replicated) {
+            // Clear existing indexes
+            var idx_iter = self.indexes.iterator();
+            while (idx_iter.next()) |pair| {
+                const index_ptr = pair.value_ptr.*;
+                const key = pair.key_ptr.*;
+                self.allocator.destroy(index_ptr);
+                self.allocator.free(key);
+            }
+            self.indexes.clearRetainingCapacity();
+
+            // Reload indexes from the newly written meta page
+            const meta_page = try self.loadPage(0);
+            try self.loadIndices(meta_page);
+        }
     }
 
     pub fn dump(self: *Bucket, dest_path: []const u8) !void {
@@ -2223,6 +2415,10 @@ pub const Bucket = struct {
         self.pageCache.clear(self.allocator);
         self.pageCache.deinit();
 
+        // Free dirty pages list (only if it has been allocated)
+        // Cleanup dirty pages set
+        self.dirty_pages.deinit();
+
         // Free path
         self.allocator.free(self.path);
 
@@ -3061,4 +3257,166 @@ test "Bucket.reverse index with sort queries" {
         }
         try testing.expectEqual(@as(usize, 3), idx);
     }
+}
+
+test "Bucket.replication with page streaming" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Create primary bucket
+    var primary = try Bucket.init(allocator, "replication-primary.bucket");
+    defer primary.deinit();
+    defer platform.deleteFile("replication-primary.bucket") catch {};
+
+    // Create replica bucket
+    var replica = try Bucket.init(allocator, "replication-replica.bucket");
+    defer replica.deinit();
+    defer platform.deleteFile("replication-replica.bucket") catch {};
+
+    // Context to track replicated pages
+    const ReplicationContext = struct {
+        replica_bucket: *Bucket,
+        pages_replicated: usize = 0,
+        last_page_id: u64 = 0,
+    };
+
+    var ctx = ReplicationContext{
+        .replica_bucket = &replica,
+    };
+
+    // Define callback that applies pages to replica
+    const replicationCallback = struct {
+        fn callback(
+            context: ?*anyopaque,
+            page_id: u64,
+            page_data: [*]const u8,
+            page_size: u32,
+        ) callconv(.c) void {
+            const self: *ReplicationContext = @ptrCast(@alignCast(context.?));
+            const page_slice = page_data[0..page_size];
+
+            // Apply page to replica
+            self.replica_bucket.applyReplicatedPage(page_id, page_slice) catch |err| {
+                std.debug.print("Failed to apply replicated page: {any}\n", .{err});
+                return;
+            };
+
+            self.pages_replicated += 1;
+            self.last_page_id = page_id;
+        }
+    }.callback;
+
+    // Set replication callback on primary
+    primary.replication_callback = replicationCallback;
+    primary.replication_context = &ctx;
+
+    // Insert documents into primary
+    const test_docs = [_]struct { name: []const u8, age: i32 }{
+        .{ .name = "Alice", .age = 30 },
+        .{ .name = "Bob", .age = 25 },
+        .{ .name = "Carol", .age = 35 },
+    };
+
+    for (test_docs) |td| {
+        const pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = td.name } }),
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = td.age } }),
+        };
+        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs[0..]));
+        _ = try primary.insert(doc);
+        doc.deinit(allocator);
+    }
+
+    // Force flush to trigger replication
+    try primary.flush();
+
+    // Verify pages were replicated
+    try testing.expect(ctx.pages_replicated > 0);
+    std.debug.print("Replicated {d} pages\n", .{ctx.pages_replicated});
+
+    // Clear replica's cache to force reading from disk
+    replica.pageCache.clear(allocator);
+
+    // Query replica to verify data was replicated
+    var query_doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "sector": {}
+        \\}
+    );
+    defer query_doc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, query_doc);
+    defer q.deinit(allocator);
+
+    var iter = try replica.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+
+    var docs_found: usize = 0;
+    var alice_found = false;
+    var bob_found = false;
+    var carol_found = false;
+
+    while (try iter.next(iter)) |doc| {
+        const name = doc.get("name").?.string.value;
+        const age = doc.get("age").?.int32.value;
+
+        std.debug.print("Found in replica: {s}, age: {d}\n", .{ name, age });
+
+        // Check names before freeing the buffer
+        if (std.mem.eql(u8, name, "Alice")) alice_found = true;
+        if (std.mem.eql(u8, name, "Bob")) bob_found = true;
+        if (std.mem.eql(u8, name, "Carol")) carol_found = true;
+
+        docs_found += 1;
+        allocator.free(doc.buffer);
+    }
+
+    // Verify all documents were replicated
+    try testing.expectEqual(@as(usize, 3), docs_found);
+
+    // Verify expected names exist
+    try testing.expect(alice_found);
+    try testing.expect(bob_found);
+    try testing.expect(carol_found);
+
+    // Test incremental replication: insert more docs
+    ctx.pages_replicated = 0; // Reset counter
+
+    const more_docs = [_]struct { name: []const u8, age: i32 }{
+        .{ .name = "Dave", .age = 28 },
+        .{ .name = "Eve", .age = 32 },
+    };
+
+    for (more_docs) |td| {
+        const pairs = [_]bson.BSONKeyValuePair{
+            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = td.name } }),
+            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = td.age } }),
+        };
+        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs[0..]));
+        _ = try primary.insert(doc);
+        doc.deinit(allocator);
+    }
+
+    try primary.flush();
+
+    // Verify incremental pages were replicated
+    try testing.expect(ctx.pages_replicated > 0);
+    std.debug.print("Incrementally replicated {d} more pages\n", .{ctx.pages_replicated});
+
+    // Clear cache again
+    replica.pageCache.clear(allocator);
+
+    // Query replica again to verify all 5 documents exist
+    var iter2 = try replica.listIterate(&arena, q);
+    defer iter2.deinit() catch {};
+
+    docs_found = 0;
+    while (try iter2.next(iter2)) |doc| {
+        docs_found += 1;
+        allocator.free(doc.buffer);
+    }
+
+    try testing.expectEqual(@as(usize, 5), docs_found);
+    std.debug.print("Replication test completed successfully!\n", .{});
 }

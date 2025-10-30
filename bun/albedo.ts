@@ -3,6 +3,7 @@ import {
   ptr,
   suffix,
   FFIType,
+  JSCallback,
   type Pointer,
   read,
   toBuffer,
@@ -58,6 +59,18 @@ const { symbols: albedo } = dlopen(`${__dirname}/libalbedo.${suffix}`, {
     args: [FFIType.pointer],
     returns: "u8",
   },
+  albedo_flush: {
+    args: [FFIType.pointer],
+    returns: "u8",
+  },
+  albedo_set_replication_callback: {
+    args: [FFIType.pointer, FFIType.function, FFIType.pointer],
+    returns: "u8",
+  },
+  albedo_apply_batch: {
+    args: [FFIType.pointer, FFIType.pointer, FFIType.u32, FFIType.u32],
+    returns: "u8",
+  },
 });
 
 const ResultCode = {
@@ -70,6 +83,18 @@ const ResultCode = {
   NotFound: 6,
   InvalidFormat: 7,
 } as const;
+
+const ReplicationError = {
+  OK: 0,
+  NetworkError: 1,
+  DiskFull: 2,
+  InvalidFormat: 3,
+  ReplicaUnavailable: 4,
+  TimeoutError: 5,
+  UnknownError: 255,
+} as const;
+
+export { ReplicationError };
 
 type Path = string;
 type Scalar = string | number | Date | boolean | null | ObjectId;
@@ -134,6 +159,111 @@ export class Bucket {
       throw new Error("Failed to vacuum Albedo database");
     }
   }
+
+  flush() {
+    const result = albedo.albedo_flush(this.pointer);
+    if (result !== 0) {
+      throw new Error("Failed to flush Albedo database");
+    }
+  }
+
+  /**
+   * Set a replication callback to receive page changes from this bucket.
+   * The callback receives batches of changed pages after each flush.
+   *
+   * @param callback - Function called with batched page data: (data: Uint8Array, pageCount: number) => void
+   *                   Buffer format: [BucketHeader (64 bytes)][Page1 (8192)][Page2 (8192)]...
+   */
+  /**
+   * Set a replication callback to receive page changes from this bucket.
+   * The callback receives batches of changed pages after each flush.
+   *
+   * @param callback - Function called with batched page data that returns an error code
+   *                   - (data: Uint8Array, pageCount: number) => number
+   *                   - Return 0 for success, non-zero error code for failure
+   *                   - On failure, pages will be retried on next sync
+   *                   Buffer format: [BucketHeader (64 bytes)][Page1 (8192)][Page2 (8192)]...
+   */
+  setReplicationCallback(
+    callback: (data: Uint8Array, pageCount: number) => number
+  ) {
+    // Create a JSCallback that matches the C signature:
+    // fn(context: ?*anyopaque, data: [*]const u8, data_size: u32, page_count: u32) u8
+    const jsCallback = new JSCallback(
+      (
+        contextPtr: any,
+        dataPtr: any,
+        dataSize: number,
+        pageCount: number
+      ): number => {
+        try {
+          // Convert raw pointer to Uint8Array
+          const data = toBuffer(dataPtr, 0, dataSize);
+          const errorCode = callback(data, pageCount);
+          return errorCode; // 0 = success, >0 = error
+        } catch (err) {
+          console.error("Replication callback error:", err);
+          return ReplicationError.UnknownError;
+        }
+      },
+      {
+        args: [FFIType.pointer, FFIType.pointer, FFIType.u32, FFIType.u32],
+        returns: FFIType.u8, // Changed from void to u8
+      }
+    );
+
+    // Store reference to prevent GC
+    (this as any)._replicationCallback = jsCallback;
+
+    const result = albedo.albedo_set_replication_callback(
+      this.pointer,
+      jsCallback,
+      null
+    );
+
+    if (result !== 0) {
+      throw new Error("Failed to set replication callback");
+    }
+  }
+
+  /**
+   * Apply a batch of replicated pages to this bucket (for replicas).
+   * This is used to receive page changes from a primary bucket.
+   *
+   * @param data - Raw data: BucketHeader (64 bytes) + N pages (8192 bytes each)
+   * @param pageCount - Number of pages in the batch
+   */
+  applyReplicatedBatch(data: Uint8Array, pageCount: number) {
+    const expectedSize = 64 + pageCount * 8192; // BucketHeader.byteSize + (page_count * DEFAULT_PAGE_SIZE)
+    if (data.length !== expectedSize) {
+      throw new Error(
+        `Data must be exactly ${expectedSize} bytes (64 byte header + ${pageCount} pages), got ${data.length}`
+      );
+    }
+
+    const dataPtr = ptr(data);
+    const result = albedo.albedo_apply_batch(
+      this.pointer,
+      dataPtr,
+      data.length,
+      pageCount
+    );
+
+    if (result === ResultCode.InvalidFormat) {
+      throw new Error("Invalid data format");
+    }
+    if (result !== ResultCode.OK) {
+      throw new Error("Failed to apply replicated batch");
+    }
+  }
+
+  /**
+   * Apply a replicated page to this bucket (for replicas).
+   * This is used to receive page changes from a primary bucket.
+   *
+   * @param pageId - The page ID to apply
+   * @param data - Raw data: BucketHeader (64 bytes) + Page (8192 bytes) = 8256 bytes
+   */
   static defaultIndexOptions = {
     unique: false,
     sparse: false,
