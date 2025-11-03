@@ -1139,6 +1139,15 @@ pub const Bucket = struct {
             .offset = page.header.used_size,
         };
 
+        // If this page doesn't yet have a recorded first readable byte,
+        // set it to the offset where we're about to write the document.
+        // This marks the start of readable data for the page (useful for
+        // future scans/compaction).
+        if (page.header.first_readable_byte == 0) {
+            @branchHint(.unlikely);
+            page.header.first_readable_byte = result.offset;
+        }
+
         var offset = &page.header.used_size;
         @memcpy(page.data[offset.* .. offset.* + @sizeOf(DocHeader)], &std.mem.toBytes(doc_header));
         offset.* += @intCast(DocHeader.byteSize);
@@ -2291,18 +2300,61 @@ pub const Bucket = struct {
         self.rwlock.lock();
         defer self.rwlock.unlock();
         for (locations.items) |*location| {
+            // Read the full document first so we can compute indexed values
+            // before tombstoning it.
+            var doc = try self.readDocAt(allocator, .{ .page_id = location.page_id, .offset = location.offset });
+
+            // Gather all per-index values to delete (mirrors insert path)
+            var planned_index_deletes = std.ArrayList(PlannedIndexInsert){};
+            defer {
+                for (planned_index_deletes.items) |*plan| {
+                    plan.values.deinit(self.allocator);
+                }
+                planned_index_deletes.deinit(self.allocator);
+            }
+
+            var idx_iter = self.indexes.iterator();
+            while (idx_iter.next()) |pair| {
+                const index_ptr = pair.value_ptr.*;
+                const path = pair.key_ptr.*;
+
+                var values = std.ArrayList(BSONValue){};
+                var retain_values = false;
+                defer {
+                    if (!retain_values) values.deinit(self.allocator);
+                }
+
+                self.bindIndex(index_ptr);
+                const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values);
+                if (!has_values) continue; // sparse index missing field => nothing was inserted
+
+                try planned_index_deletes.append(self.allocator, PlannedIndexInsert{
+                    .index = index_ptr,
+                    .values = values,
+                });
+                retain_values = true;
+            }
+
+            // Mark the document as deleted on its page (once per doc)
             var page = try self.loadPage(location.page_id);
             const header_offset = location.offset;
             if (header_offset + DocHeader.byteSize > page.data.len) {
                 return error.PageNotFound;
             }
-
             var header = location.header;
             header.is_deleted = 1;
             const header_bytes = std.mem.toBytes(header);
             @memcpy(page.data[header_offset .. header_offset + header_bytes.len], &header_bytes);
-
             try self.writePage(page);
+
+            // Remove all corresponding index entries for this doc/location
+            const loc = Index.DocumentLocation{ .pageId = location.page_id, .offset = location.offset };
+            for (planned_index_deletes.items) |plan| {
+                self.bindIndex(plan.index);
+                for (plan.values.items) |val| {
+                    try plan.index.delete(val, loc);
+                }
+            }
         }
 
         self.header.doc_count -= locations.items.len;
@@ -2393,7 +2445,7 @@ pub const Bucket = struct {
         // Reinitialize and reload indexes from the meta page
         self.indexes = .init(self.allocator);
         // Reinitialize dirty_pages for replication tracking
-        self.dirty_pages = std.AutoHashMap(u64, void).init(self.allocator);
+        self.dirty_pages = .init(self.allocator);
         const meta = try self.loadPage(0);
         try self.loadIndices(meta);
     }
@@ -3421,4 +3473,86 @@ test "Bucket.replication with page streaming" {
 
     try testing.expectEqual(@as(usize, 5), docs_found);
     std.debug.print("Replication test completed successfully!\n", .{});
+}
+
+test "Deleting removes index entries for scalar field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const file_name = "index-delete.bucket";
+    var bucket = try Bucket.init(allocator, file_name);
+    defer bucket.deinit();
+    defer platform.deleteFile(file_name) catch {};
+
+    try bucket.ensureIndex("age", .{});
+
+    // Insert two docs; only one matches age = 42
+    const pairs_a = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Zed" } }),
+        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 42 } }),
+    };
+    var doc_a = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs_a[0..]));
+    _ = try bucket.insert(doc_a);
+    doc_a.deinit(allocator);
+
+    const pairs_b = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Other" } }),
+        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
+    };
+    var doc_b = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs_b[0..]));
+    _ = try bucket.insert(doc_b);
+    doc_b.deinit(allocator);
+
+    // Build equality query on age to ensure index plan
+    const age_eq_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 42 } }),
+    };
+    var age_eq_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_eq_pairs[0..]));
+    defer age_eq_doc.deinit(allocator);
+
+    const root_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_eq_doc }),
+    };
+    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    var plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+
+    // Count index entries before delete (directly via index iterator)
+    var iter_before = try bucket.initIndexIterator(&plan);
+    var count_before: usize = 0;
+    while (try iter_before.next()) |_| {
+        count_before += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count_before);
+
+    // Delete the matching document by name
+    const del_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Zed" } }),
+    };
+    var del_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(del_pairs[0..]));
+    defer del_doc.deinit(allocator);
+    const del_root_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = del_doc }),
+    };
+    var del_qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(del_root_pairs[0..]));
+    defer del_qdoc.deinit(allocator);
+    var del_q = try query.Query.parse(allocator, del_qdoc);
+    defer del_q.deinit(allocator);
+    try bucket.delete(del_q);
+
+    // Rebuild plan and iterate index again; it should yield zero entries
+    plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    var iter_after = try bucket.initIndexIterator(&plan);
+    var count_after: usize = 0;
+    while (try iter_after.next()) |_| {
+        count_after += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), count_after);
 }
