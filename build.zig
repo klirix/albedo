@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .Debug,
+        .preferred_optimize_mode = .ReleaseFast,
     });
 
     const buildStatic = b.option(bool, "static", "Build static library");
@@ -113,6 +113,8 @@ pub fn build(b: *std.Build) void {
             .x86_64 => "x86_64-linux-android",
             .aarch64 => "aarch64-linux-android",
             .arm => "arm-linux-androideabi",
+            .wasm32 => "wasm32",
+            .wasm64 => "wasm64",
             else => @panic("Unsupported architecture"),
         };
 

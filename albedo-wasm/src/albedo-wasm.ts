@@ -1,4 +1,4 @@
-import { BSON, type ObjectId } from "bson";
+import { serialize, deserialize, type ObjectId } from "./bson";
 import { createNodeEnvImports } from "./node-imports";
 import type { NodeEnvHelpers, NodeEnvImports } from "./node-imports";
 import { createBrowserEnvImports } from "./browser-imports";
@@ -230,7 +230,6 @@ function freeAlloc(ptr: number, len: number): void {
   exports.albedo_free(ptr, len);
 }
 
-
 const envHelpers: EnvHelpers = {
   getMemoryBuffer,
   writeHandleStruct,
@@ -290,9 +289,9 @@ export type Query = {
 export class Bucket {
   constructor(private pointer: number) {}
 
-  insert(data: BSON.Document) {
+  insert(data: any) {
     const exports = requireExports();
-    const dataBuf = BSON.serialize(data);
+    const dataBuf = serialize(data);
     const dataBytes =
       dataBuf instanceof Uint8Array ? dataBuf : new Uint8Array(dataBuf);
     const dataPtr = allocHandleBytes(dataBytes);
@@ -390,7 +389,7 @@ export class Bucket {
 
   delete(query: Query["query"], _options: { sector?: Query["sector"] } = {}) {
     const exports = requireExports();
-    const queryBuf = BSON.serialize({ query });
+    const queryBuf = serialize({ query });
     const queryBytes =
       queryBuf instanceof Uint8Array ? queryBuf : new Uint8Array(queryBuf);
     if (queryBytes.length > 0xffff) {
@@ -418,14 +417,14 @@ export class Bucket {
       sector?: Query["sector"];
       projection?: Query["projection"];
     } = {}
-  ): Generator<BSON.Document, void, boolean | undefined> {
+  ): Generator<any, void, boolean | undefined> {
     const exports = requireExports();
     const finalQuery: Query = { query };
     if (options.sort) finalQuery.sort = options.sort;
     if (options.sector) finalQuery.sector = options.sector;
     if (options.projection) finalQuery.projection = options.projection;
 
-    const queryBuf = BSON.serialize(finalQuery);
+    const queryBuf = serialize(finalQuery);
     const queryBytes =
       queryBuf instanceof Uint8Array ? queryBuf : new Uint8Array(queryBuf);
     const queryAlloc = allocHandleBytes(queryBytes);
@@ -461,7 +460,7 @@ export class Bucket {
         }
         const docLen = readU32(docPtr);
         const docBytes = cloneFromWasm(docPtr, docLen);
-        const shouldQuit = yield BSON.deserialize(docBytes);
+        const shouldQuit = yield deserialize(docBytes);
         if (shouldQuit) {
           break;
         }
@@ -475,11 +474,7 @@ export class Bucket {
   }
 
   all(query: Query["query"] = {}, options: Query = {}) {
-    const result: BSON.Document[] = [];
-    for (const doc of this.list(query, options)) {
-      result.push(doc);
-    }
-    return result;
+    return this.list(query, options).toArray();
   }
 
   get(query: Query["query"], options: Query = {}) {
@@ -488,16 +483,6 @@ export class Bucket {
       return null;
     }
     return result.value;
-  }
-
-  update(
-    query: Query["query"],
-    updateFunc: (doc: BSON.Document) => BSON.Document
-  ) {
-    for (const doc of this.list(query, {})) {
-      this.delete({ _id: doc._id });
-      this.insert(updateFunc(doc));
-    }
   }
 }
 
