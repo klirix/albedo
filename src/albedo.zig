@@ -1001,7 +1001,7 @@ pub const Bucket = struct {
                 return error.InvalidDocId;
             }
             if (header.reserved != 0) {
-                std.debug.print("Header is correpted: {any} \n", .{header});
+                // std.debug.print("Header is correpted: {any} \n", .{header});
                 // @breakpoint();
                 return error.InvalidHeader;
             }
