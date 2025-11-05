@@ -205,6 +205,73 @@ pub export fn albedo_flush(bucket: *Bucket) Result {
     return Result.OK;
 }
 
+pub export fn albedo_transform(
+    bucket: *Bucket,
+    queryBuffer: [*c]u8,
+    iteratorOut: **Bucket.TransformIterator,
+) Result {
+    const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
+    const queryBufProper = queryBuffer[0..queryLen];
+
+    const query = Query.parseRaw(bucket.allocator, queryBufProper) catch |err| switch (err) {
+        Query.QueryParsingErrors.OutOfMemory => {
+            return Result.OutOfMemory;
+        },
+        else => {
+            return Result.Error;
+        },
+    };
+
+    iteratorOut.* = bucket.transformIterate(query) catch |err| switch (err) {
+        else => {
+            return Result.Error;
+        },
+    };
+    return Result.OK;
+}
+
+pub export fn albedo_transform_data(
+    iterator: *Bucket.TransformIterator,
+    outDoc: *[*c]u8,
+) Result {
+    const doc = iterator.data() catch |err| switch (err) {
+        else => {
+            return Result.Error;
+        },
+    } orelse {
+        return Result.EOS;
+    };
+
+    outDoc.* = @constCast(doc.buffer.ptr);
+    return Result.OK;
+}
+
+pub export fn albedo_transform_apply(
+    iterator: *Bucket.TransformIterator,
+    transformBuffer: [*c]u8,
+) Result {
+    const doc = if (transformBuffer != null) blk: {
+        const docSize = std.mem.readInt(u32, transformBuffer[0..4], .little);
+        const transformBufProper = transformBuffer[0..docSize];
+        break :blk &bson.BSONDocument.init(transformBufProper);
+    } else null;
+
+    iterator.transform(doc) catch |err| switch (err) {
+        else => {
+            return Result.Error;
+        },
+    };
+
+    return Result.OK;
+}
+
+pub export fn albedo_transform_close(iterator: *Bucket.TransformIterator) Result {
+    iterator.close() catch {
+        return Result.Error;
+    };
+    return Result.OK;
+}
+
 /// Set a callback to be notified of page changes for replication
 pub export fn albedo_set_replication_callback(
     bucket: *Bucket,
@@ -228,6 +295,10 @@ pub export fn albedo_apply_batch(
     };
 
     return Result.OK;
+}
+
+pub export fn albedo_bitsize() u32 {
+    return @sizeOf(usize) * 8;
 }
 
 pub export fn albedo_version() u32 {

@@ -90,6 +90,14 @@ type WasmExports = WebAssembly.Exports & {
   ) => number;
   albedo_data: (iterHandle: number, outDocPtr: number) => number;
   albedo_close_iterator: (iterHandle: number) => number;
+  albedo_transform: (
+    bucketHandle: number,
+    queryPtr: number,
+    outIterPtr: number
+  ) => number;
+  albedo_transform_data: (iterHandle: number, outDocPtr: number) => number;
+  albedo_transform_apply: (iterHandle: number, transformPtr: number) => number;
+  albedo_transform_close: (iterHandle: number) => number;
   albedo_version: () => number;
 };
 
@@ -287,21 +295,32 @@ export type Query = {
 /// }
 
 export class Bucket {
-  constructor(private pointer: number) {}
+  exports: WasmExports;
+
+  constructor(private pointer: number) {
+    this.exports = requireExports();
+  }
+
+  get memory() {
+    const dv = new DataView(this.exports.memory.buffer);
+    return dv;
+  }
 
   insert(data: any) {
-    const exports = requireExports();
     const dataBuf = serialize(data);
     const dataBytes =
       dataBuf instanceof Uint8Array ? dataBuf : new Uint8Array(dataBuf);
-    const dataPtr = allocHandleBytes(dataBytes);
+    const dataPtr = this.exports.albedo_malloc(dataBytes.length);
+    new Uint8Array(this.exports.memory.buffer, dataPtr, dataBytes.length).set(
+      dataBytes
+    );
     try {
-      const result = exports.albedo_insert(this.pointer, dataPtr.ptr);
+      const result = this.exports.albedo_insert(this.pointer, dataPtr);
       if (result !== ResultCode.OK) {
         throw new Error("Failed to insert into Albedo database");
       }
     } finally {
-      freeAlloc(dataPtr.ptr, dataPtr.len);
+      freeAlloc(dataPtr, dataBytes.length);
     }
   }
 
@@ -388,25 +407,25 @@ export class Bucket {
   }
 
   delete(query: Query["query"], _options: { sector?: Query["sector"] } = {}) {
-    const exports = requireExports();
+    const exports = this.exports;
     const queryBuf = serialize({ query });
     const queryBytes =
       queryBuf instanceof Uint8Array ? queryBuf : new Uint8Array(queryBuf);
     if (queryBytes.length > 0xffff) {
       throw new Error("Query payload too large for WASM bridge");
     }
-    const queryPtr = allocHandleBytes(queryBytes);
+    const len = queryBytes.length;
+    const queryPtr = exports.albedo_malloc(len);
+
+    new Uint8Array(this.memory.buffer, queryPtr, len).set(queryBytes);
+
     try {
-      const result = exports.albedo_delete(
-        this.pointer,
-        queryPtr.ptr,
-        queryBytes.length
-      );
+      const result = exports.albedo_delete(this.pointer, queryPtr, len);
       if (result !== ResultCode.OK) {
         throw new Error("Failed to delete from Albedo database");
       }
     } finally {
-      freeAlloc(queryPtr.ptr, queryPtr.len);
+      exports.albedo_free(queryPtr, len);
     }
   }
 
@@ -418,7 +437,7 @@ export class Bucket {
       projection?: Query["projection"];
     } = {}
   ): Generator<any, void, boolean | undefined> {
-    const exports = requireExports();
+    const exports = this.exports;
     const finalQuery: Query = { query };
     if (options.sort) finalQuery.sort = options.sort;
     if (options.sector) finalQuery.sector = options.sector;
@@ -427,24 +446,27 @@ export class Bucket {
     const queryBuf = serialize(finalQuery);
     const queryBytes =
       queryBuf instanceof Uint8Array ? queryBuf : new Uint8Array(queryBuf);
-    const queryAlloc = allocHandleBytes(queryBytes);
-    const iterPtrPtr = mallocZero(4);
+    const len = queryBytes.length;
+    const queryPtr = exports.albedo_malloc(len);
+
+    new Uint8Array(this.memory.buffer, queryPtr, len).set(queryBytes);
+    const iterPtrPtr = this.exports.albedo_malloc(4);
     let iterHandle = 0;
     try {
-      const res = exports.albedo_list(this.pointer, queryAlloc.ptr, iterPtrPtr);
+      const res = exports.albedo_list(this.pointer, queryPtr, iterPtrPtr);
       if (res !== ResultCode.OK) {
         throw new Error("Failed to list Albedo database");
       }
-      iterHandle = readPtr(iterPtrPtr);
+      iterHandle = this.memory.getUint32(iterPtrPtr, true);
       if (iterHandle === 0) {
         throw new Error("Received null iterator handle from WASM module");
       }
     } finally {
-      freeAlloc(queryAlloc.ptr, queryAlloc.len);
-      freeAlloc(iterPtrPtr, 4);
+      exports.albedo_free(queryPtr, len);
+      exports.albedo_free(iterPtrPtr, 4);
     }
 
-    const dataPtrPtr = mallocZero(4);
+    const dataPtrPtr = this.exports.albedo_malloc(4);
     try {
       while (true) {
         const res = exports.albedo_data(iterHandle, dataPtrPtr);
@@ -454,13 +476,14 @@ export class Bucket {
         if (res !== ResultCode.OK) {
           throw new Error("Failed to get data from Albedo database");
         }
-        const docPtr = readPtr(dataPtrPtr);
+        const docPtr = this.memory.getUint32(dataPtrPtr, true);
         if (docPtr === 0) {
           throw new Error("Received null document pointer from WASM module");
         }
-        const docLen = readU32(docPtr);
-        const docBytes = cloneFromWasm(docPtr, docLen);
-        const shouldQuit = yield deserialize(docBytes);
+        const docLen = this.memory.getInt32(docPtr, true);
+        const shouldQuit = yield deserialize(
+          new Uint8Array(this.memory.buffer, docPtr, docLen)
+        );
         if (shouldQuit) {
           break;
         }
@@ -469,7 +492,7 @@ export class Bucket {
       if (iterHandle !== 0) {
         exports.albedo_close_iterator(iterHandle);
       }
-      freeAlloc(dataPtrPtr, 4);
+      exports.albedo_free(dataPtrPtr, 4);
     }
   }
 
@@ -483,6 +506,118 @@ export class Bucket {
       return null;
     }
     return result.value;
+  }
+
+  *transformCursor(
+    query: Query["query"] = {}
+  ): Generator<any, void, any | null | undefined> {
+    const exports = this.exports;
+    const finalQuery: Query = { query };
+
+    const queryBuf = serialize(finalQuery);
+    const queryBytes =
+      queryBuf instanceof Uint8Array ? queryBuf : new Uint8Array(queryBuf);
+    const len = queryBytes.length;
+    const queryPtr = exports.albedo_malloc(len);
+
+    new Uint8Array(this.memory.buffer, queryPtr, len).set(queryBytes);
+    const iterPtrPtr = this.exports.albedo_malloc(4);
+    let iterHandle = 0;
+    try {
+      const res = exports.albedo_transform(this.pointer, queryPtr, iterPtrPtr);
+      if (res !== ResultCode.OK) {
+        throw new Error("Failed to create transform iterator");
+      }
+      iterHandle = this.memory.getUint32(iterPtrPtr, true);
+      if (iterHandle === 0) {
+        throw new Error("Received null iterator handle from WASM module");
+      }
+    } finally {
+      exports.albedo_free(queryPtr, len);
+      exports.albedo_free(iterPtrPtr, 4);
+    }
+
+    const dataPtrPtr = this.exports.albedo_malloc(4);
+    try {
+      while (true) {
+        // Get the current document
+        const res = exports.albedo_transform_data(iterHandle, dataPtrPtr);
+        if (res === ResultCode.EOS) {
+          break;
+        }
+        if (res !== ResultCode.OK) {
+          throw new Error("Failed to get data from transform iterator");
+        }
+        const docPtr = this.memory.getUint32(dataPtrPtr, true);
+        if (docPtr === 0) {
+          throw new Error("Received null document pointer from WASM module");
+        }
+        const docLen = this.memory.getInt32(docPtr, true);
+        const currentDoc = deserialize(
+          new Uint8Array(this.memory.buffer, docPtr, docLen)
+        );
+
+        // Yield the document and get the transformation from the user
+        const transformDoc = yield currentDoc;
+
+        // Apply the transformation based on what the user provided
+        let transformPtr = 0;
+        let transformLen = 0;
+
+        if (transformDoc === undefined) {
+          // Pass the existing document pointer
+          transformPtr = docPtr;
+        } else if (transformDoc === null) {
+          // Pass null pointer (0)
+          transformPtr = 0;
+        } else {
+          // Serialize the new document and allocate memory for it
+          const transformBuf = serialize(transformDoc);
+          const transformBytes =
+            transformBuf instanceof Uint8Array
+              ? transformBuf
+              : new Uint8Array(transformBuf);
+          transformLen = transformBytes.length;
+          transformPtr = exports.albedo_malloc(transformLen);
+          new Uint8Array(this.memory.buffer, transformPtr, transformLen).set(
+            transformBytes
+          );
+        }
+
+        // Apply the transformation
+        try {
+          const applyRes = exports.albedo_transform_apply(
+            iterHandle,
+            transformPtr
+          );
+          if (applyRes !== ResultCode.OK) {
+            throw new Error("Failed to apply transformation");
+          }
+        } finally {
+          // Free allocated memory for new document (but not for null or undefined cases)
+          if (transformDoc !== undefined && transformDoc !== null) {
+            exports.albedo_free(transformPtr, transformLen);
+          }
+        }
+      }
+    } finally {
+      if (iterHandle !== 0) {
+        exports.albedo_transform_close(iterHandle);
+      }
+      exports.albedo_free(dataPtrPtr, 4);
+    }
+  }
+
+  transform(
+    query: Query["query"] = {},
+    mutator: (doc: any) => any | null | undefined
+  ) {
+    const cursor = this.transformCursor(query);
+    let doc = cursor.next().value;
+    while (doc) {
+      const transformed = mutator(doc);
+      doc = cursor.next(transformed).value;
+    }
   }
 }
 

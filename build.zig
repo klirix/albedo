@@ -1,5 +1,6 @@
 const std = @import("std");
 const napigen = @import("napigen");
+const lib_mod = @import("./src/lib.zig");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -63,10 +64,10 @@ pub fn build(b: *std.Build) void {
     const buildOptions = b.addOptions();
 
     const isAndroid = b.option(bool, "android", "Build with android libc");
-    const isWasm = b.option(bool, "wasm", "Build with wasm");
+    const isWasm = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
 
     buildOptions.addOption(bool, "isAndroid", isAndroid orelse false);
-    buildOptions.addOption(bool, "isWasm", isWasm orelse false);
+    buildOptions.addOption(bool, "isWasm", isWasm);
     libModule.addOptions("build_options", buildOptions);
 
     if (isWasm == true) {
@@ -87,6 +88,11 @@ pub fn build(b: *std.Build) void {
             "albedo_version",
             "albedo_malloc",
             "albedo_free",
+            "albedo_transform",
+            "albedo_transform_close",
+            "albedo_transform_data",
+            "albedo_transform_apply",
+            "albedo_bitsize",
         };
         const wasm_module = b.addExecutable(.{
             .name = "albedo",

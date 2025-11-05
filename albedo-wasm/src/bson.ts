@@ -32,7 +32,7 @@ export class ObjectId {
     } else if (input && (input as any).length === 12) {
       // copy
       const arr = new Uint8Array(12);
-      for (let i = 0; i < 12; i++) arr[i] = (input as ArrayLike<number>)[i];
+      for (let i = 0; i < 12; i++) arr[i] = (input as ArrayLike<number>)[i]!;
       this.id = arr;
     } else if (input === undefined) {
       // generate: 4 bytes timestamp (big-endian) + 8 random bytes
@@ -55,7 +55,7 @@ export class ObjectId {
       // fallback: try to fill 12 bytes and pad with zeros
       const arr = new Uint8Array(12);
       const src = input as ArrayLike<number>;
-      for (let i = 0; i < Math.min(12, src.length); i++) arr[i] = src[i];
+      for (let i = 0; i < Math.min(12, src.length); i++) arr[i] = src[i]!;
       this.id = arr;
     }
   }
@@ -64,8 +64,8 @@ export class ObjectId {
     if (hex.length !== 24) throw new Error("ObjectId hex must be 24 hex chars");
     const arr = new Uint8Array(12);
     for (let i = 0; i < 12; i++) {
-      const hi = parseInt(hex[2 * i], 16);
-      const lo = parseInt(hex[2 * i + 1], 16);
+      const hi = parseInt(hex[2 * i]!, 16);
+      const lo = parseInt(hex[2 * i + 1]!, 16);
       if (Number.isNaN(hi) || Number.isNaN(lo))
         throw new Error("Invalid hex string for ObjectId");
       arr[i] = (hi << 4) | lo;
@@ -76,7 +76,7 @@ export class ObjectId {
   toString(): string {
     let s = "";
     for (let i = 0; i < 12; i++) {
-      const v = this.id[i];
+      const v = this.id[i]!;
       s += (v >>> 4).toString(16);
       s += (v & 0xf).toString(16);
     }
@@ -471,7 +471,7 @@ function decodeDocument(
       }
       default: {
         // unknown type: skip remaining document to avoid infinite loop
-        throw new Error("Unsupported BSON type: 0x" + type.toString(16));
+        throw new Error("Unsupported BSON type: 0x" + type!.toString(16));
       }
     }
   }
