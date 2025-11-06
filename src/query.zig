@@ -113,7 +113,10 @@ pub const Filter = union(FilterType) {
                     var op_iter = operatorDoc.iter();
                     var matched = false;
                     while (op_iter.next()) |op_pair| {
-                        const operand = op_pair.value;
+                        const operand: bson.BSONValue = if (op_pair.value == .string)
+                            bson.BSONValue{ .string = .{ .value = try ally.dupe(u8, op_pair.value.string.value) } }
+                        else
+                            op_pair.value;
                         const operator = filterNameMap.get(op_pair.key) orelse return FilterParsingErrors.InvalidQueryOperator;
                         switch (operator) {
                             inline .eq, .in, .ne, .lt, .lte, .gt, .gte, .startsWith, .endsWith, .exists, .notExists => |op| {
