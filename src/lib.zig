@@ -130,11 +130,14 @@ const ListHandle = struct {
 
 pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterator: **ListHandle) Result {
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
-    const queryBufferProper = queryBuffer[0..queryLen];
+    var queryBufferProper = queryBuffer[0..queryLen];
 
     var arena = std.heap.ArenaAllocator.init(bucket.allocator);
-    const queryArena = arena.allocator().create(std.heap.ArenaAllocator) catch return Result.OutOfMemory;
+    const local_ally = arena.allocator();
+    queryBufferProper = local_ally.dupe(u8, queryBufferProper) catch return Result.OutOfMemory;
+    const queryArena = local_ally.create(std.heap.ArenaAllocator) catch return Result.OutOfMemory;
     queryArena.* = arena;
+
     // const queryArenaAllocator = queryArena.allocator();
 
     const query = Query.parseRaw(queryArena.allocator(), queryBufferProper) catch |err| switch (err) {
@@ -213,7 +216,18 @@ pub export fn albedo_transform(
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
     const queryBufProper = queryBuffer[0..queryLen];
 
-    const query = Query.parseRaw(bucket.allocator, queryBufProper) catch |err| switch (err) {
+    const arena_ptr = bucket.allocator.create(std.heap.ArenaAllocator) catch {
+        return Result.OutOfMemory;
+    };
+    errdefer bucket.allocator.destroy(arena_ptr);
+    arena_ptr.* = std.heap.ArenaAllocator.init(bucket.allocator);
+
+    const query = Query.parseRaw(
+        bucket.allocator,
+        arena_ptr.allocator().dupe(u8, queryBufProper) catch {
+            return Result.OutOfMemory;
+        },
+    ) catch |err| switch (err) {
         Query.QueryParsingErrors.OutOfMemory => {
             return Result.OutOfMemory;
         },
@@ -222,11 +236,20 @@ pub export fn albedo_transform(
         },
     };
 
-    iteratorOut.* = bucket.transformIterate(query) catch |err| switch (err) {
+    // Create an arena for the iterator and mark it as owned
+
+    const iter = bucket.transformIterate(arena_ptr, query) catch |err| switch (err) {
         else => {
+            arena_ptr.deinit();
+            bucket.allocator.destroy(arena_ptr);
             return Result.Error;
         },
     };
+
+    // Mark the arena as owned by the iterator so it will be cleaned up in close()
+    iter.owns_arena = true;
+    iteratorOut.* = iter;
+
     return Result.OK;
 }
 

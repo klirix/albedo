@@ -2358,6 +2358,7 @@ pub const Bucket = struct {
         targets: []DocumentLocation,
         index: usize = 0,
         current_doc: ?BSONDocument = null,
+        owns_arena: bool = false,
 
         pub const IteratorError = error{
             OutOfMemory,
@@ -2365,8 +2366,8 @@ pub const Bucket = struct {
             IteratorDrained,
         };
 
-        pub fn init(bucket: *Bucket, q: query.Query) !*TransformIterator {
-            return bucket.transformIterate(q);
+        pub fn init(bucket: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
+            return bucket.transformIterate(arena, q);
         }
 
         fn ensureDoc(self: *TransformIterator) IteratorError!BSONDocument {
@@ -2540,7 +2541,6 @@ pub const Bucket = struct {
 
         pub fn close(self: *TransformIterator) !void {
             const allocator = self.bucket.allocator;
-            const arena_ptr = self.arena;
 
             if (!self.bucket.in_memory and self.bucket.autoVaccuum and self.bucket.header.deleted_count > self.bucket.header.doc_count) {
                 self.bucket.vacuum() catch |err| switch (err) {
@@ -2548,26 +2548,25 @@ pub const Bucket = struct {
                     else => return error.ScanError,
                 };
             }
-            arena_ptr.deinit();
-            allocator.destroy(arena_ptr);
+            // If we own the arena, clean it up
+            if (self.owns_arena) {
+                self.arena.deinit();
+                allocator.destroy(self.arena);
+            }
             allocator.free(self.targets);
             allocator.destroy(self);
         }
     };
 
-    pub fn transformIterate(self: *Bucket, q: query.Query) !*TransformIterator {
+    pub fn transformIterate(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
         var plan = self.planQuery(&q);
 
-        const arena_ptr = try self.allocator.create(std.heap.ArenaAllocator);
-        errdefer self.allocator.destroy(arena_ptr);
-        arena_ptr.* = std.heap.ArenaAllocator.init(self.allocator);
-
         var target_list = std.ArrayList(DocumentLocation){};
-        defer target_list.deinit(arena_ptr.allocator());
+        defer target_list.deinit(arena.allocator());
 
         self.rwlock.lockShared();
         defer self.rwlock.unlockShared();
-        try self.collectTargets(&plan, &q, &target_list, arena_ptr);
+        try self.collectTargets(&plan, &q, &target_list, arena);
 
         const raw_len = target_list.items.len;
         var targets_buf = try self.allocator.alloc(DocumentLocation, raw_len);
@@ -2601,13 +2600,14 @@ pub const Bucket = struct {
         errdefer self.allocator.destroy(iter);
         iter.* = .{
             .bucket = self,
-            .arena = arena_ptr,
-            .ally = arena_ptr.allocator(),
+            .arena = arena,
+            .ally = arena.allocator(),
             .query = q,
             .plan = plan,
             .targets = targets_slice,
             .index = 0,
             .current_doc = null,
+            .owns_arena = false,
         };
 
         return iter;
@@ -2948,7 +2948,10 @@ test "Bucket.TransformIterator updates document" {
     var q = try query.Query.parse(q_alloc, query_doc);
     defer q.deinit(q_alloc);
 
-    var iter = try bucket.transformIterate(q);
+    var iter_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer iter_arena.deinit();
+
+    var iter = try bucket.transformIterate(&iter_arena, q);
     defer iter.close() catch unreachable;
 
     const maybe_doc = try iter.data();
@@ -3043,7 +3046,10 @@ test "Bucket.TransformIterator deletes document when null transform" {
     var q = try query.Query.parse(q_alloc, query_doc);
     defer q.deinit(q_alloc);
 
-    var iter = try bucket.transformIterate(q);
+    var iter_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer iter_arena.deinit();
+
+    var iter = try bucket.transformIterate(&iter_arena, q);
     defer iter.close() catch unreachable;
 
     try iter.transform(null);
