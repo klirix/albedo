@@ -115,3 +115,7 @@ pub fn randomBytes(dest: []u8) PlatformError!void {
 pub fn nowSeconds() i64 {
     return std.time.timestamp();
 }
+
+pub fn log(msg: []const u8) void {
+    std.debug.print("{s}\n", .{msg});
+}

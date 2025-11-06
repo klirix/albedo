@@ -22,3 +22,4 @@ pub const deleteFile = Impl.deleteFile;
 pub const renameFile = Impl.renameFile;
 pub const randomBytes = Impl.randomBytes;
 pub const nowSeconds = Impl.nowSeconds;
+pub const log = Impl.log;

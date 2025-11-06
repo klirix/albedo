@@ -48,6 +48,7 @@ extern fn wasm_delete_file(path_ptr: [*]const u8, path_len: usize) callconv(.c) 
 extern fn wasm_rename_file(old_ptr: [*]const u8, old_len: usize, new_ptr: [*]const u8, new_len: usize) callconv(.c) i32;
 extern fn wasm_random_bytes(dest_ptr: [*]u8, dest_len: usize) callconv(.c) i32;
 extern fn wasm_now_seconds(out: *i64) callconv(.c) i32;
+extern fn wasm_log(msg_ptr: [*]const u8, msg_len: usize) callconv(.c) void;
 
 fn mapStatus(code: i32) PlatformError {
     return switch (code) {
@@ -153,4 +154,8 @@ pub fn nowSeconds() i64 {
         return 0;
     }
     return out;
+}
+
+pub fn log(msg: []const u8) void {
+    wasm_log(msg.ptr, msg.len);
 }
