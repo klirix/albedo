@@ -2480,8 +2480,14 @@ pub const Bucket = struct {
                 return error.ScanError;
             }
 
+            const loc = Index.DocumentLocation{
+                .pageId = target.page_id,
+                .offset = target.offset,
+            };
+
             var header = std.mem.bytesToValue(DocHeader, page.data[header_offset .. header_offset + DocHeader.byteSize]);
             if (header.is_deleted == 1) {
+                std.debug.print("Document at {any} is already deleted", .{loc});
                 return error.IteratorDrained;
             }
 
@@ -2491,11 +2497,6 @@ pub const Bucket = struct {
             self.bucket.writePage(page) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.ScanError,
-            };
-
-            const loc = Index.DocumentLocation{
-                .pageId = target.page_id,
-                .offset = target.offset,
             };
 
             for (planned_index_deletes.items) |plan| {

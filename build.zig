@@ -63,10 +63,10 @@ pub fn build(b: *std.Build) void {
 
     const buildOptions = b.addOptions();
 
-    const isAndroid = b.option(bool, "android", "Build with android libc");
+    const isAndroid = target.result.abi == .android;
     const isWasm = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
 
-    buildOptions.addOption(bool, "isAndroid", isAndroid orelse false);
+    buildOptions.addOption(bool, "isAndroid", isAndroid);
     buildOptions.addOption(bool, "isWasm", isWasm);
     libModule.addOptions("build_options", buildOptions);
 
