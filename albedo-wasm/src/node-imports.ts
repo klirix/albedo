@@ -252,6 +252,11 @@ export function createNodeEnvImports(helpers: NodeEnvHelpers) {
       const seconds = BigInt(Math.floor(Date.now() / 1000));
       return helpers.writeI64(outPtr, seconds) ? ERROR_OK : ERROR_UNEXPECTED;
     },
+
+    wasm_log(msgPtr: number, msgLen: number): void {
+      const msg = decodeString(msgPtr, msgLen);
+      console.log(`[WASM]: ${msg}`);
+    },
   };
 }
 

@@ -1,10 +1,32 @@
 /// <reference lib="dom" />
 
+/**
+ * Browser environment imports for Albedo WASM using localStorage
+ *
+ * This implementation uses localStorage instead of OPFS, making it:
+ * - ✅ Synchronous (no async/await needed)
+ * - ✅ Works on main thread (no Web Worker required)
+ * - ✅ No SharedArrayBuffer or Atomics needed
+ * - ✅ Works in all modern browsers
+ *
+ * Limitations:
+ * - localStorage typically has ~5-10MB limit per origin
+ * - Slower than OPFS for large files
+ * - Data stored as base64 (slightly larger)
+ * - Best for small databases or development/testing
+ *
+ * Storage format:
+ * - Files stored as base64 strings in localStorage
+ * - Key format: "albedo_file:{path}"
+ * - Each file stored as a single item
+ */
+
 type WasmHandleInfo = {
-  handle: any;
   path: string;
+  data: Uint8Array;
   wasmPtr: number;
   wasmLen: number;
+  dirty: boolean;
 };
 
 const ERROR_OK = 0;
@@ -12,6 +34,8 @@ const ERROR_NOT_FOUND = 1;
 const ERROR_PERMISSION = 2;
 const ERROR_ALREADY_EXISTS = 3;
 const ERROR_UNEXPECTED = 4;
+
+const STORAGE_PREFIX = "albedo_file:";
 
 export type BrowserEnvHelpers = {
   getMemoryBuffer: () => ArrayBuffer | null;
@@ -32,78 +56,56 @@ function throwUnexpected(err: unknown): number {
     switch (err.name) {
       case "NotFoundError":
         return ERROR_NOT_FOUND;
-      case "NotAllowedError":
+      case "QuotaExceededError":
+        console.error("localStorage quota exceeded");
+        return ERROR_UNEXPECTED;
       case "SecurityError":
         return ERROR_PERMISSION;
       default:
+        console.error("localStorage error:", err);
         return ERROR_UNEXPECTED;
     }
   }
+  console.error("Unexpected error:", err);
   return ERROR_UNEXPECTED;
 }
 
-function splitPath(path: string): string[] {
-  return path
-    .split("/")
-    .map((segment) => segment.trim())
-    .filter((segment) => segment.length > 0 && segment !== ".");
+function storageKey(path: string): string {
+  return STORAGE_PREFIX + path;
 }
 
-async function resolveDirectory(
-  root: FileSystemDirectoryHandle,
-  segments: string[],
-  options: { create: boolean }
-): Promise<FileSystemDirectoryHandle> {
-  let current = root;
-  for (const segment of segments) {
-    current = await current.getDirectoryHandle(segment, {
-      create: options.create,
-    });
-  }
-  return current;
+function fileExists(path: string): boolean {
+  return localStorage.getItem(storageKey(path)) !== null;
 }
 
-async function resolveFileHandle(
-  root: FileSystemDirectoryHandle,
-  path: string,
-  options: { create: boolean }
-): Promise<FileSystemFileHandle> {
-  const segments = splitPath(path);
-  if (segments.length === 0) {
-    throw new DOMException("Invalid path", "SyntaxError");
+function readFile(path: string): Uint8Array | null {
+  const base64 = localStorage.getItem(storageKey(path));
+  if (base64 === null) return null;
+
+  // Decode base64 to Uint8Array
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
   }
-  const filename = segments.pop()!;
-  const directory = await resolveDirectory(root, segments, {
-    create: options.create,
-  });
-  return directory.getFileHandle(filename, { create: options.create });
+  return bytes;
 }
 
-function runBlocking<T>(operation: () => Promise<T>): T {
-  const shared = new SharedArrayBuffer(4);
-  const view = new Int32Array(shared);
-  let result: T | undefined;
-  let error: unknown;
-
-  operation()
-    .then((value) => {
-      result = value;
-      Atomics.store(view, 0, 1);
-      Atomics.notify(view, 0);
-    })
-    .catch((err) => {
-      error = err;
-      Atomics.store(view, 0, 2);
-      Atomics.notify(view, 0);
-    });
-
-  Atomics.wait(view, 0, 0);
-
-  const status = Atomics.load(view, 0);
-  if (status === 2) {
-    throw error ?? new Error("Unknown OPFS error");
+function writeFile(path: string, data: Uint8Array): void {
+  // Encode Uint8Array to base64
+  let binaryString = "";
+  for (let i = 0; i < data.length; i++) {
+    const byte = data[i];
+    if (byte !== undefined) {
+      binaryString += String.fromCharCode(byte);
+    }
   }
-  return result as T;
+  const base64 = btoa(binaryString);
+  localStorage.setItem(storageKey(path), base64);
+}
+
+function deleteFile(path: string): void {
+  localStorage.removeItem(storageKey(path));
 }
 
 function decodeString(
@@ -127,21 +129,11 @@ function memorySlice(
   return new Uint8Array(buffer, ptr, len);
 }
 
-export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
-  const root = await navigator.storage.getDirectory();
+export function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
   const handles = new Map<string, WasmHandleInfo>();
   let nextHandleId = 1;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-
-  function withFileHandle<T>(
-    pathPtr: number,
-    pathLen: number,
-    fn: (path: string) => T
-  ): T {
-    const path = decodeString(helpers, pathPtr, pathLen, decoder);
-    return fn(path);
-  }
 
   return {
     wasm_open_file(
@@ -154,38 +146,48 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
       outHandlePtr: number
     ): number {
       try {
-        return withFileHandle(pathPtr, pathLen, (path) => {
-          const create = Boolean(createFlag);
-          const handle = runBlocking(async () => {
-            const fileHandle = await resolveFileHandle(root, path, {
-              create,
-            });
-            const access = await fileHandle.createSyncAccessHandle();
-            if (!create && Boolean(readFlag) && !Boolean(writeFlag)) {
-              // ensure file exists when read only
-            }
-            if (Boolean(truncateFlag)) {
-              access.truncate(0);
-            }
-            return access;
-          });
+        const path = decodeString(helpers, pathPtr, pathLen, decoder);
+        const create = Boolean(createFlag);
+        const truncate = Boolean(truncateFlag);
+        const exists = fileExists(path);
 
-          const handleId = `h${nextHandleId++}`;
-          const bytes = encoder.encode(handleId);
-          const alloc = helpers.allocHandleBytes(bytes);
-          if (!helpers.writeHandleStruct(outHandlePtr, alloc.ptr, alloc.len)) {
-            handle.close();
-            helpers.freeAlloc(alloc.ptr, alloc.len);
-            return ERROR_UNEXPECTED;
+        if (!exists && !create) {
+          return ERROR_NOT_FOUND;
+        }
+
+        if (exists && !create && truncate) {
+          // Truncate existing file
+          writeFile(path, new Uint8Array(0));
+        }
+
+        let data: Uint8Array;
+        if (!exists || truncate) {
+          data = new Uint8Array(0);
+          if (create) {
+            writeFile(path, data);
           }
-          handles.set(handleId, {
-            handle,
-            path,
-            wasmPtr: alloc.ptr,
-            wasmLen: alloc.len,
-          });
-          return ERROR_OK;
+        } else {
+          data = readFile(path) || new Uint8Array(0);
+        }
+
+        const handleId = `h${nextHandleId++}`;
+        const bytes = encoder.encode(handleId);
+        const alloc = helpers.allocHandleBytes(bytes);
+
+        if (!helpers.writeHandleStruct(outHandlePtr, alloc.ptr, alloc.len)) {
+          helpers.freeAlloc(alloc.ptr, alloc.len);
+          return ERROR_UNEXPECTED;
+        }
+
+        handles.set(handleId, {
+          path,
+          data,
+          wasmPtr: alloc.ptr,
+          wasmLen: alloc.len,
+          dirty: false,
         });
+
+        return ERROR_OK;
       } catch (err) {
         return throwUnexpected(err);
       }
@@ -196,7 +198,12 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
         const handleId = decodeString(helpers, handlePtr, handleLen, decoder);
         const info = handles.get(handleId);
         if (!info) return ERROR_NOT_FOUND;
-        info.handle.close();
+
+        // Write back to localStorage if dirty
+        if (info.dirty) {
+          writeFile(info.path, info.data);
+        }
+
         helpers.freeAlloc(info.wasmPtr, info.wasmLen);
         handles.delete(handleId);
         return ERROR_OK;
@@ -217,12 +224,20 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
         const handleId = decodeString(helpers, handlePtr, handleLen, decoder);
         const info = handles.get(handleId);
         if (!info) return ERROR_NOT_FOUND;
+
         const dest = memorySlice(helpers, destPtr, destLen);
         if (!dest) return ERROR_UNEXPECTED;
-        const bytesRead = info.handle.read(dest, {
-          at: helpers.toNumber(offset),
-        });
-        if (!helpers.writeUsize(outReadPtr, bytesRead)) return ERROR_UNEXPECTED;
+
+        const offsetNum = helpers.toNumber(offset);
+        const availableBytes = Math.max(0, info.data.length - offsetNum);
+        const bytesToRead = Math.min(destLen, availableBytes);
+
+        if (bytesToRead > 0) {
+          dest.set(info.data.subarray(offsetNum, offsetNum + bytesToRead));
+        }
+
+        if (!helpers.writeUsize(outReadPtr, bytesToRead))
+          return ERROR_UNEXPECTED;
         return ERROR_OK;
       } catch (err) {
         return throwUnexpected(err);
@@ -241,13 +256,25 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
         const handleId = decodeString(helpers, handlePtr, handleLen, decoder);
         const info = handles.get(handleId);
         if (!info) return ERROR_NOT_FOUND;
+
         const src = memorySlice(helpers, srcPtr, srcLen);
         if (!src) return ERROR_UNEXPECTED;
-        const bytesWritten = info.handle.write(src, {
-          at: helpers.toNumber(offset),
-        });
-        if (!helpers.writeUsize(outWrittenPtr, bytesWritten))
-          return ERROR_UNEXPECTED;
+
+        const offsetNum = helpers.toNumber(offset);
+        const requiredSize = offsetNum + srcLen;
+
+        // Resize data array if necessary
+        if (info.data.length < requiredSize) {
+          const newData = new Uint8Array(requiredSize);
+          newData.set(info.data);
+          info.data = newData;
+        }
+
+        // Copy data
+        info.data.set(src, offsetNum);
+        info.dirty = true;
+
+        if (!helpers.writeUsize(outWrittenPtr, srcLen)) return ERROR_UNEXPECTED;
         return ERROR_OK;
       } catch (err) {
         return throwUnexpected(err);
@@ -259,7 +286,12 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
         const handleId = decodeString(helpers, handlePtr, handleLen, decoder);
         const info = handles.get(handleId);
         if (!info) return ERROR_NOT_FOUND;
-        info.handle.flush();
+
+        if (info.dirty) {
+          writeFile(info.path, info.data);
+          info.dirty = false;
+        }
+
         return ERROR_OK;
       } catch (err) {
         return throwUnexpected(err);
@@ -268,20 +300,12 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
 
     wasm_delete_file(pathPtr: number, pathLen: number): number {
       try {
-        return withFileHandle(pathPtr, pathLen, (path) => {
-          runBlocking(async () => {
-            const segments = splitPath(path);
-            if (segments.length === 0) {
-              throw new DOMException("Invalid path", "SyntaxError");
-            }
-            const filename = segments.pop()!;
-            const directory = await resolveDirectory(root, segments, {
-              create: false,
-            });
-            await directory.removeEntry(filename);
-          });
-          return ERROR_OK;
-        });
+        const path = decodeString(helpers, pathPtr, pathLen, decoder);
+        if (!fileExists(path)) {
+          return ERROR_NOT_FOUND;
+        }
+        deleteFile(path);
+        return ERROR_OK;
       } catch (err) {
         return throwUnexpected(err);
       }
@@ -296,32 +320,19 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
       try {
         const oldPath = decodeString(helpers, oldPtr, oldLen, decoder);
         const newPath = decodeString(helpers, newPtr, newLen, decoder);
-        runBlocking(async () => {
-          const oldHandle = await resolveFileHandle(root, oldPath, {
-            create: false,
-          });
-          const file = await oldHandle.getFile();
-          const data = new Uint8Array(await file.arrayBuffer());
 
-          const newHandle = await resolveFileHandle(root, newPath, {
-            create: true,
-          });
-          const syncHandle = await newHandle.createSyncAccessHandle();
-          try {
-            syncHandle.truncate(0);
-            syncHandle.write(data, { at: 0 });
-            syncHandle.flush();
-          } finally {
-            syncHandle.close();
-          }
+        if (!fileExists(oldPath)) {
+          return ERROR_NOT_FOUND;
+        }
 
-          const oldSegments = splitPath(oldPath);
-          const oldFile = oldSegments.pop()!;
-          const oldDir = await resolveDirectory(root, oldSegments, {
-            create: false,
-          });
-          await oldDir.removeEntry(oldFile);
-        });
+        const data = readFile(oldPath);
+        if (data === null) {
+          return ERROR_NOT_FOUND;
+        }
+
+        writeFile(newPath, data);
+        deleteFile(oldPath);
+
         return ERROR_OK;
       } catch (err) {
         return throwUnexpected(err);
@@ -339,9 +350,59 @@ export async function createBrowserEnvImports(helpers: BrowserEnvHelpers) {
       const seconds = BigInt(Math.floor(Date.now() / 1000));
       return helpers.writeI64(outPtr, seconds) ? ERROR_OK : ERROR_UNEXPECTED;
     },
+
+    wasm_log(msgPtr: number, msgLen: number): void {
+      const msg = decodeString(helpers, msgPtr, msgLen, decoder);
+      console.log(`[WASM]: ${msg}`);
+    },
   };
 }
 
-export type BrowserEnvImports = Awaited<
-  ReturnType<typeof createBrowserEnvImports>
->;
+export type BrowserEnvImports = ReturnType<typeof createBrowserEnvImports>;
+
+/**
+ * Utility function to clear all Albedo files from localStorage
+ */
+export function clearAlbedoFiles(): void {
+  const keysToRemove: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith(STORAGE_PREFIX)) {
+      keysToRemove.push(key);
+    }
+  }
+  keysToRemove.forEach((key) => localStorage.removeItem(key));
+}
+
+/**
+ * Utility function to list all Albedo files in localStorage
+ */
+export function listAlbedoFiles(): string[] {
+  const files: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith(STORAGE_PREFIX)) {
+      files.push(key.substring(STORAGE_PREFIX.length));
+    }
+  }
+  return files;
+}
+
+/**
+ * Utility function to get storage usage
+ */
+export function getStorageUsage(): { used: number; files: number } {
+  let used = 0;
+  let files = 0;
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith(STORAGE_PREFIX)) {
+      const value = localStorage.getItem(key);
+      if (value) {
+        used += value.length;
+        files++;
+      }
+    }
+  }
+  return { used, files };
+}

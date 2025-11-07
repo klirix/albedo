@@ -1,12 +1,61 @@
 {
   "name": "albedo-wasm",
-  "module": "index.ts",
+  "version": "0.1.0",
+  "description": "WASM bindings for Albedo document store",
   "type": "module",
-  "private": true,
-  "devDependencies": {
-    "@types/bun": "latest"
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./bson": {
+      "types": "./dist/bson.d.ts",
+      "import": "./dist/bson.js"
+    },
+    "./inline": {
+      "types": "./dist/albedo-wasm-inline.d.ts",
+      "import": "./dist/albedo-wasm-inline.js"
+    },
+    "./browser-imports": {
+      "types": "./dist/browser-imports.d.ts",
+      "import": "./dist/browser-imports.js"
+    },
+    "./node-imports": {
+      "types": "./dist/node-imports.d.ts",
+      "import": "./dist/node-imports.js"
+    },
+    "./albedo.wasm": "./dist/albedo.wasm"
   },
-  "peerDependencies": {
+  "typesVersions": {
+    "*": {
+      "*": [
+        "./dist/index.d.ts",
+        "./dist/*"
+      ]
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc && cp src/albedo.wasm dist/",
+    "build:inline": "tsc && node scripts/inline-wasm.js",
+    "test": "bun test",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
     "typescript": "^5"
-  }
+  },
+  "keywords": [
+    "wasm",
+    "database",
+    "document-store",
+    "zig"
+  ],
+  "author": "",
+  "license": "MIT"
 }

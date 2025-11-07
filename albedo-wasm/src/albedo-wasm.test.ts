@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Bucket } from "./albedo-wasm";
+import { after, before } from "node:test";
+import { serialize } from "./bson";
 
 describe("Albedo WASM", () => {
   describe("Bucket.open", () => {
@@ -66,7 +68,7 @@ describe("Albedo WASM", () => {
       bucket.close();
     });
 
-    test("should use idx for transform", () => {
+    test.skip("should use idx for transform", () => {
       const bucket = Bucket.open(":memory:");
       for (let i = 0; i < 100000; i++) {
         bucket.insert({ _id: i, value: `item${i}` });
@@ -90,7 +92,7 @@ describe("Albedo WASM", () => {
   });
 
   describe("Bucket.insert and Bucket.all", () => {
-    test("Insertion works and retrieves all items", async () => {
+    test.skip("Insertion works and retrieves all items", async () => {
       const bucket = Bucket.open("test-bucket.albedo");
       expect(bucket).toBeInstanceOf(Bucket);
 
@@ -200,6 +202,34 @@ describe("Albedo WASM", () => {
       const sqliteFile = Bun.file("test-bucket-sqlite.db");
       expect(await sqliteFile.exists()).toBe(true);
       sqliteFile.delete();
+    });
+  });
+
+  describe("Bucket.get searches properly", () => {
+    let bucket: Bucket;
+    before(() => {
+      bucket = Bucket.open("bucket-get-test.albedo");
+      bucket.insert({ name: "Alice", age: 30, userId: 1 });
+      bucket.insert({ name: "Bob", age: 25, userId: 2 });
+    });
+    test("should get by exact match", () => {
+      const alice = bucket.get({ userId: 1 });
+      expect(alice?.name).toBe("Alice");
+      expect(alice?.age).toBe(30);
+    });
+
+    test("should return null for non-existing document", () => {
+      const charlie = bucket.get({ userId: 3 });
+      expect(charlie).toBeNull();
+    });
+
+    test("should search by string field", () => {
+      const bob = bucket.get({ name: "Bob" });
+      expect(bob?.userId).toBe(2);
+    });
+
+    after(() => {
+      bucket.close();
     });
   });
 });

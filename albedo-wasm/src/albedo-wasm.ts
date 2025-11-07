@@ -1,16 +1,15 @@
 import { serialize, deserialize, type ObjectId } from "./bson";
-import { createNodeEnvImports } from "./node-imports";
 import type { NodeEnvHelpers, NodeEnvImports } from "./node-imports";
-import { createBrowserEnvImports } from "./browser-imports";
 import type { BrowserEnvHelpers, BrowserEnvImports } from "./browser-imports";
+export * from "./bson";
 
 const wasmUrl = new URL("./albedo.wasm", import.meta.url);
 
-async function loadWasmBytes(url: URL): Promise<ArrayBuffer> {
+async function loadWasmBytes(url: URL | string): Promise<ArrayBuffer> {
   if (typeof Bun !== "undefined" && typeof Bun.file === "function") {
-    return Bun.file(url).arrayBuffer();
+    return Bun.file(wasmUrl).arrayBuffer();
   }
-  if (typeof fetch === "function") {
+  if (isBrowserEnvironment() && typeof fetch === "function") {
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch WASM module (${response.status})`);
@@ -25,42 +24,28 @@ async function loadWasmBytes(url: URL): Promise<ArrayBuffer> {
   );
 }
 
-async function compileWasmModule(url: URL): Promise<WebAssembly.Module> {
-  if (
-    typeof WebAssembly.compileStreaming === "function" &&
-    typeof fetch === "function"
-  ) {
-    try {
-      return await WebAssembly.compileStreaming(fetch(url));
-    } catch (err) {
-      if (!(err instanceof TypeError)) {
-        throw err;
-      }
-      // Fallback to buffered compilation below.
-    }
-  }
-  const bytes = await loadWasmBytes(url);
-  return WebAssembly.compile(bytes);
-}
-
 function isBrowserEnvironment(): boolean {
-  return (
-    typeof navigator !== "undefined" &&
-    typeof navigator.storage?.getDirectory === "function"
-  );
+  return typeof window !== "undefined" && typeof localStorage !== "undefined";
 }
 
 type EnvHelpers = NodeEnvHelpers & BrowserEnvHelpers;
 type EnvImports = NodeEnvImports | BrowserEnvImports;
 
 async function resolveEnvImports(helpers: EnvHelpers): Promise<EnvImports> {
+  console.log(
+    isBrowserEnvironment() ? "Browser environment" : "Node.js environment"
+  );
   if (isBrowserEnvironment()) {
-    return await createBrowserEnvImports(helpers);
+    return import("./browser-imports").then(({ createBrowserEnvImports }) => {
+      return createBrowserEnvImports(helpers);
+    });
   }
-  return createNodeEnvImports(helpers);
+  return import("./node-imports").then(({ createNodeEnvImports }) => {
+    return createNodeEnvImports(helpers);
+  });
 }
 
-const wasmModule = await compileWasmModule(wasmUrl);
+let wasmModule;
 
 const encoder = new TextEncoder();
 
@@ -185,13 +170,6 @@ function readPtr(ptr: number): number {
   return view.getUint32(ptr, true);
 }
 
-function readU32(ptr: number): number {
-  const buffer = getMemoryBuffer();
-  if (!buffer) return 0;
-  const view = new DataView(buffer);
-  return view.getUint32(ptr, true);
-}
-
 function mallocZero(size: number): number {
   const exports = requireExports();
   const ptr = exports.albedo_malloc(size);
@@ -204,15 +182,6 @@ function mallocZero(size: number): number {
   }
   new Uint8Array(buffer, ptr, size).fill(0);
   return ptr;
-}
-
-function cloneFromWasm(ptr: number, len: number): Uint8Array {
-  const buffer = getMemoryBuffer();
-  if (!buffer) {
-    throw new Error("WASM memory unavailable");
-  }
-  const view = new Uint8Array(buffer, ptr, len);
-  return new Uint8Array(view);
 }
 
 function toNumber(value: number | bigint): number {
@@ -250,10 +219,36 @@ const envHelpers: EnvHelpers = {
 
 const envImports = await resolveEnvImports(envHelpers);
 
-const instance = await WebAssembly.instantiate(wasmModule, { env: envImports });
-wasmInstance = instance;
-wasmExports = wasmInstance.exports as WasmExports;
-wasmMemory = wasmExports.memory;
+export async function compileWasmModule(
+  url?: string | URL
+): Promise<WebAssembly.Module> {
+  url = url || wasmUrl;
+  if (
+    typeof WebAssembly.compileStreaming === "function" &&
+    typeof fetch === "function"
+  ) {
+    try {
+      wasmModule = await WebAssembly.compileStreaming(fetch(url));
+      wasmInstance = await WebAssembly.instantiate(wasmModule, {
+        env: envImports,
+      });
+      return wasmModule;
+    } catch (err) {
+      if (!(err instanceof TypeError)) {
+        throw err;
+      }
+      // Fallback to buffered compilation below.
+    }
+  }
+  const bytes = await loadWasmBytes(url);
+  wasmModule = await WebAssembly.compile(bytes);
+  wasmInstance = await WebAssembly.instantiate(wasmModule, { env: envImports });
+  return wasmModule;
+}
+
+if (!isBrowserEnvironment()) {
+  wasmModule = await compileWasmModule(wasmUrl);
+}
 
 export { wasmInstance };
 
@@ -279,7 +274,11 @@ type Filter =
   | { $lte: Scalar }
   | { $ne: Scalar }
   | { $in: Scalar[] }
-  | { $between: [Scalar, Scalar] };
+  | { $between: [Scalar, Scalar] }
+  | { $startsWith: string }
+  | { $endsWith: string }
+  | { $exists: any }
+  | { $notExists: any };
 
 export type Query = {
   query?: Record<Path, Filter>;
@@ -501,7 +500,9 @@ export class Bucket {
   }
 
   get(query: Query["query"], options: Query = {}) {
-    const result = this.list(query, options).next(true);
+    const iter = this.list(query, options);
+    const result = iter.next(true);
+    iter.next(true);
     if (result.done) {
       return null;
     }
@@ -627,8 +628,3 @@ export default {
     return requireExports().albedo_version();
   },
 };
-
-export { createNodeEnvImports } from "./node-imports";
-export type { NodeEnvHelpers, NodeEnvImports } from "./node-imports";
-export { createBrowserEnvImports } from "./browser-imports";
-export type { BrowserEnvHelpers, BrowserEnvImports } from "./browser-imports";
