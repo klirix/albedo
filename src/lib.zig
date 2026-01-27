@@ -281,7 +281,7 @@ pub export fn albedo_transform_apply(
 
     iterator.transform(doc) catch |err| switch (err) {
         else => {
-            std.debug.print("Failed to transform document, {any}", .{err});
+            // std.debug.print("Failed to transform document, {any}", .{err});
             return Result.Error;
         },
     };
