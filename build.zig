@@ -106,8 +106,6 @@ fn buildSharedLibrary(b: *std.Build, libModule: *std.Build.Module, target: std.B
         .x86_64 => "x86_64-linux-android",
         .aarch64 => "aarch64-linux-android",
         .arm => "arm-linux-androideabi",
-        .wasm32 => "wasm32",
-        .wasm64 => "wasm64",
         else => @panic("Unsupported architecture"),
     };
 
@@ -212,8 +210,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const buildStatic = b.option(bool, "static", "Build static library") orelse false;
-    const buildNode = b.option(bool, "node", "Build node extension") orelse false;
-    const buildClient = b.option(bool, "client", "Build CLI client") orelse true;
+    // const buildNode = b.option(bool, "node", "Build node extension") orelse false;
+    // const buildClient = b.option(bool, "client", "Build CLI client") orelse true;
     const outputName = b.option([]const u8, "output", "Output file name");
 
     const isAndroid = target.result.abi == .android;
@@ -224,16 +222,10 @@ pub fn build(b: *std.Build) void {
     if (isWasm) {
         buildWasmTarget(b, libModule);
     } else {
-        if (!buildStatic and !buildNode) {
+        if (!buildStatic) {
             buildSharedLibrary(b, libModule, target, isAndroid);
-        }
-
-        if (buildStatic) {
+        } else {
             buildStaticLibrary(b, libModule, outputName);
-        }
-
-        if (buildClient) {
-            buildClientTarget(b, libModule, target, optimize);
         }
     }
 
