@@ -123,7 +123,7 @@ pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen
 
 const ListIterator = albedo.Bucket.ListIterator;
 
-const ListHandle = struct {
+pub const ListHandle = struct {
     iterator: *ListIterator,
     arena: *std.heap.ArenaAllocator,
 };

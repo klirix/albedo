@@ -10,6 +10,166 @@ const ndkBase = "/Users/askhat/Library/Android/sdk/ndk/27.0.12077973/toolchains/
 const include_dir = ndkBase ++ "/include";
 const lib_dir = ndkBase ++ "/lib";
 
+fn createLibModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    isAndroid: bool,
+    isWasm: bool,
+) *std.Build.Module {
+    const libModule = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const buildOptions = b.addOptions();
+    buildOptions.addOption(bool, "isAndroid", isAndroid);
+    buildOptions.addOption(bool, "isWasm", isWasm);
+    libModule.addOptions("build_options", buildOptions);
+
+    return libModule;
+}
+
+fn buildWasmTarget(b: *std.Build, libModule: *std.Build.Module) void {
+    libModule.single_threaded = true;
+    libModule.link_libc = false;
+    libModule.export_symbol_names = &[_][]const u8{
+        "albedo_open",
+        "albedo_close",
+        "albedo_insert",
+        "albedo_ensure_index",
+        "albedo_drop_index",
+        "albedo_delete",
+        "albedo_list",
+        "albedo_data",
+        "albedo_next",
+        "albedo_close_iterator",
+        "albedo_vacuum",
+        "albedo_version",
+        "albedo_malloc",
+        "albedo_free",
+        "albedo_transform",
+        "albedo_transform_close",
+        "albedo_transform_data",
+        "albedo_transform_apply",
+        "albedo_bitsize",
+    };
+
+    const wasm_module = b.addExecutable(.{
+        .name = "albedo",
+        .linkage = .static,
+        .root_module = libModule,
+    });
+
+    wasm_module.entry = .disabled;
+    wasm_module.export_table = true;
+
+    b.installArtifact(wasm_module);
+}
+
+fn configureAndroidDynamic(b: *std.Build, dynamic: *std.Build.Step.Compile, arch: []const u8) void {
+    dynamic.root_module.link_libc = true;
+    dynamic.link_z_max_page_size = 16 << 10;
+    dynamic.link_z_common_page_size = 16 << 10;
+    dynamic.link_emit_relocs = true;
+    dynamic.link_eh_frame_hdr = true;
+    dynamic.link_function_sections = true;
+    dynamic.bundle_compiler_rt = true;
+
+    const libs = [_][]const u8{ "GLESv2", "EGL", "android", "log", "aaudio" };
+    for (libs) |lib| {
+        dynamic.linkSystemLibrary2(lib, .{ .weak = true });
+    }
+
+    dynamic.addIncludePath(.{ .cwd_relative = b.fmt("{s}", .{include_dir}) });
+    dynamic.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}/35", .{ lib_dir, arch }) });
+    dynamic.export_table = true;
+    dynamic.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}", .{ lib_dir, arch }) });
+    dynamic.setLibCFile(.{ .cwd_relative = b.fmt("android-confs/{s}.conf", .{arch}) });
+
+    dynamic.libc_file.?.addStepDependencies(&dynamic.step);
+
+    if (dynamic.root_module.resolved_target.?.result.cpu.arch == .x86) {
+        dynamic.link_z_notext = true;
+    }
+}
+
+fn buildSharedLibrary(b: *std.Build, libModule: *std.Build.Module, target: std.Build.ResolvedTarget, isAndroid: bool) void {
+    const dynamic = b.addLibrary(.{
+        .name = "albedo",
+        .linkage = .dynamic,
+        .root_module = libModule,
+    });
+
+    const arch = switch (target.result.cpu.arch) {
+        .x86_64 => "x86_64-linux-android",
+        .aarch64 => "aarch64-linux-android",
+        .arm => "arm-linux-androideabi",
+        .wasm32 => "wasm32",
+        .wasm64 => "wasm64",
+        else => @panic("Unsupported architecture"),
+    };
+
+    if (isAndroid) {
+        configureAndroidDynamic(b, dynamic, arch);
+    }
+
+    b.installArtifact(dynamic);
+}
+
+fn buildStaticLibrary(b: *std.Build, libModule: *std.Build.Module, outputName: ?[]const u8) void {
+    const static = b.addLibrary(.{
+        .name = outputName orelse "albedo",
+        .linkage = .static,
+        .root_module = libModule,
+    });
+
+    static.bundle_compiler_rt = true;
+
+    b.installArtifact(static);
+}
+
+fn buildClientTarget(
+    b: *std.Build,
+    libModule: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const clientModule = b.createModule(.{
+        .root_source_file = b.path("src/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    clientModule.addImport("albedo", libModule);
+
+    const client_exe = b.addExecutable(.{
+        .name = "albedo-cli",
+        .root_module = clientModule,
+    });
+
+    b.installArtifact(client_exe);
+
+    const run_cmd = b.addRunArtifact(client_exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+
+    const run_step = b.step("run", "Run the CLI client");
+    run_step.dependOn(&run_cmd.step);
+}
+
+fn addTests(b: *std.Build, libModule: *std.Build.Module) void {
+    const lib_unit_tests = b.addTest(.{ .root_module = libModule });
+    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_lib_unit_tests.step);
+}
+
 fn createLibCFile(b: *std.Build, arch: []const u8) ![]const u8 {
     const fname = b.fmt("android-{s}.conf", .{arch});
 
@@ -51,168 +211,31 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseFast,
     });
 
-    const buildStatic = b.option(bool, "static", "Build static library");
-    const buildNode = b.option(bool, "node", "Build node extension");
-    // if (b.)
-
-    const libModule = b.createModule(.{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const buildOptions = b.addOptions();
+    const buildStatic = b.option(bool, "static", "Build static library") orelse false;
+    const buildNode = b.option(bool, "node", "Build node extension") orelse false;
+    const buildClient = b.option(bool, "client", "Build CLI client") orelse true;
+    const outputName = b.option([]const u8, "output", "Output file name");
 
     const isAndroid = target.result.abi == .android;
     const isWasm = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
 
-    buildOptions.addOption(bool, "isAndroid", isAndroid);
-    buildOptions.addOption(bool, "isWasm", isWasm);
-    libModule.addOptions("build_options", buildOptions);
+    const libModule = createLibModule(b, target, optimize, isAndroid, isWasm);
 
-    if (isWasm == true) {
-        libModule.single_threaded = true;
-        libModule.link_libc = false;
-        libModule.export_symbol_names = &[_][]const u8{
-            "albedo_open",
-            "albedo_close",
-            "albedo_insert",
-            "albedo_ensure_index",
-            "albedo_drop_index",
-            "albedo_delete",
-            "albedo_list",
-            "albedo_data",
-            "albedo_next",
-            "albedo_close_iterator",
-            "albedo_vacuum",
-            "albedo_version",
-            "albedo_malloc",
-            "albedo_free",
-            "albedo_transform",
-            "albedo_transform_close",
-            "albedo_transform_data",
-            "albedo_transform_apply",
-            "albedo_bitsize",
-        };
-        const wasm_module = b.addExecutable(.{
-            .name = "albedo",
-            .linkage = .static,
-            .root_module = libModule,
-        });
-
-        wasm_module.entry = .disabled;
-        wasm_module.export_table = true;
-
-        b.installArtifact(wasm_module);
-    }
-
-    if (buildStatic != true and buildNode != true and isWasm != true) {
-        // Build a shared library by default
-
-        const dynamic = b.addLibrary(.{
-            .name = "albedo",
-            .linkage = .dynamic,
-            .root_module = libModule,
-        });
-
-        const arch = switch (target.result.cpu.arch) {
-            .x86_64 => "x86_64-linux-android",
-            .aarch64 => "aarch64-linux-android",
-            .arm => "arm-linux-androideabi",
-            .wasm32 => "wasm32",
-            .wasm64 => "wasm64",
-            else => @panic("Unsupported architecture"),
-        };
-
-        if (isAndroid == true) {
-            dynamic.root_module.link_libc = true;
-            dynamic.link_z_max_page_size = 16 << 10;
-            dynamic.link_z_common_page_size = 16 << 10;
-            dynamic.link_emit_relocs = true;
-            dynamic.link_eh_frame_hdr = true;
-            dynamic.link_function_sections = true;
-            dynamic.bundle_compiler_rt = true;
-            // dynamic.strip = (mode == .ReleaseSmall);
-            const libs = [_][]const u8{ "GLESv2", "EGL", "android", "log", "aaudio" };
-            for (libs) |lib| {
-                dynamic.linkSystemLibrary2(lib, .{ .weak = true });
-            }
-
-            dynamic.addIncludePath(.{ .cwd_relative = b.fmt("{s}", .{include_dir}) });
-            dynamic.addLibraryPath(.{
-                .cwd_relative = b.fmt("{s}/{s}/35", .{ lib_dir, arch }),
-            });
-            dynamic.export_table = true;
-            dynamic.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}", .{ lib_dir, arch }) });
-            dynamic.setLibCFile(.{ .cwd_relative = b.fmt("android-confs/{s}.conf", .{arch}) });
-
-            dynamic.libc_file.?.addStepDependencies(&dynamic.step);
-
-            if (target.result.cpu.arch == .x86) {
-                dynamic.link_z_notext = true;
-            }
+    if (isWasm) {
+        buildWasmTarget(b, libModule);
+    } else {
+        if (!buildStatic and !buildNode) {
+            buildSharedLibrary(b, libModule, target, isAndroid);
         }
 
-        b.installArtifact(dynamic);
+        if (buildStatic) {
+            buildStaticLibrary(b, libModule, outputName);
+        }
+
+        if (buildClient) {
+            buildClientTarget(b, libModule, target, optimize);
+        }
     }
 
-    if (buildNode == true) {
-        const nodeModule = b.createModule(.{
-            .root_source_file = b.path("src/napi.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-
-        const simple_module = b.dependency("napigen", .{
-            .target = target,
-            .optimize = optimize,
-        });
-        libModule.addImport("napigen", simple_module.module("napigen"));
-        const node_lib = b.addLibrary(.{
-            .name = "albedo_node",
-            .linkage = .dynamic,
-            .root_module = nodeModule,
-        });
-
-        napigen.setup(node_lib);
-
-        b.installArtifact(node_lib);
-
-        const copy_node_step = b.addInstallLibFile(node_lib.getEmittedBin(), "libalbedo.node");
-        b.getInstallStep().dependOn(&copy_node_step.step);
-    }
-
-    const d = b.option([]const u8, "output", "Output file name");
-
-    if (buildStatic == true) {
-        const static = b.addLibrary(.{
-            .name = d orelse "albedo",
-            .linkage = .static,
-
-            .root_module = libModule,
-        });
-
-        static.bundle_compiler_rt = true;
-
-        b.installArtifact(static);
-    }
-
-    const lib_unit_tests = b.addTest(.{
-        .root_module = libModule,
-    });
-
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-
-    // const exe_unit_tests = b.addTest(.{
-    //     .root_module = exeModule,
-    // });
-
-    // const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
-
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
-    // test_step.dependOn(&run_exe_unit_tests.step);
+    addTests(b, libModule);
 }

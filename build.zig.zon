@@ -23,12 +23,7 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{
-        .napigen = .{
-            .url = "git+https://github.com/cztomsik/napigen?ref=main#007b4bc8751cf78879288048013fbb62e050a072",
-            .hash = "napigen-0.1.0-YpiIus97AADwFfVGGwPnrN3khPQKeKz1BPExTpR3TkCy",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
