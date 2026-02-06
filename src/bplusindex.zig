@@ -726,6 +726,11 @@ pub const Index = struct {
         return null;
     }
 
+    pub fn hasValue(self: *Index, value: BSONValue) !bool {
+        var iter = try self.point(value);
+        return (try iter.next()) != null;
+    }
+
     pub const RangeIterator = struct {
         index: *Index,
         current_node: Node,
@@ -841,6 +846,11 @@ pub const Index = struct {
     }
 
     pub fn insert(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
+        if (self.options.unique == 1) {
+            if (try self.hasValue(value)) {
+                return error.DuplicateKey;
+            }
+        }
         var root_node = try self.loadNode(self.root_page_id);
         if (try self.insertRecursive(&root_node, value, loc)) |payload| {
             defer payload.deinit(self.allocator);
@@ -991,6 +1001,22 @@ test "range handles duplicates" {
     }
 
     try testing.expectEqualSlices(u16, duplicates[0..], results.items);
+}
+
+test "unique index rejects duplicates" {
+    var bucket = try Bucket.openFile(testing.allocator, "bplus_unique.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("bplus_unique.bucket") catch |err| {
+        std.debug.print("Error deleting file: {}\n", .{err});
+    };
+
+    var index = try Index.create(&bucket);
+    defer index.deinit();
+    index.options.unique = 1;
+
+    const key = BSONValue{ .int32 = .{ .value = 42 } };
+    try index.insert(key, .{ .pageId = 1, .offset = 100 });
+    try testing.expectError(error.DuplicateKey, index.insert(key, .{ .pageId = 2, .offset = 200 }));
 }
 
 test "range respects bounds" {

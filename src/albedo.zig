@@ -1052,6 +1052,10 @@ pub const Bucket = struct {
         return null;
     }
 
+    pub const InsertError = error{
+        DuplicateKey,
+    };
+
     pub fn insert(self: *Bucket, insertable: bson.BSONDocument) !DocInsertResult {
         var doc = insertable;
         const docId = self.objectIdGenerator.next();
@@ -1190,7 +1194,10 @@ pub const Bucket = struct {
         for (planned_index_inserts.items) |plan| {
             self.bindIndex(plan.index);
             for (plan.values.items) |value| {
-                try plan.index.insert(value, index_location);
+                plan.index.insert(value, index_location) catch |err| switch (err) {
+                    error.DuplicateKey => return error.DuplicateKey,
+                    else => return err,
+                };
             }
         }
 
@@ -2364,6 +2371,7 @@ pub const Bucket = struct {
             OutOfMemory,
             ScanError,
             IteratorDrained,
+            DuplicateKey,
         };
 
         pub fn init(bucket: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
@@ -2531,6 +2539,7 @@ pub const Bucket = struct {
 
                 _ = self.bucket.insert(insert_doc) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
+                    error.DuplicateKey => return error.DuplicateKey,
                     else => return error.ScanError,
                 };
             }

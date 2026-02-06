@@ -22,6 +22,7 @@ const Result = enum(u8) {
     FileNotFound,
     NotFound,
     InvalidFormat,
+    DuplicateKey,
 };
 
 pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
@@ -47,6 +48,9 @@ pub export fn albedo_insert(bucket: *albedo.Bucket, docBuffer: [*]u8) Result {
     const doc = bson.BSONDocument.init(docBufferProper);
 
     _ = bucket.insert(doc) catch |err| switch (err) {
+        error.DuplicateKey => {
+            return Result.DuplicateKey;
+        },
         else => {
             return Result.Error;
         },
