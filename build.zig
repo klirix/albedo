@@ -36,6 +36,7 @@ fn buildWasmTarget(b: *std.Build, libModule: *std.Build.Module) void {
     libModule.link_libc = false;
     libModule.export_symbol_names = &[_][]const u8{
         "albedo_open",
+        "albedo_open_with_passphrase",
         "albedo_close",
         "albedo_insert",
         "albedo_ensure_index",

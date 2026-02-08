@@ -29,6 +29,10 @@ const Result = enum(u8) {
     NotFound,
     InvalidFormat,
     DuplicateKey,
+
+    // Encryption-specific
+    EncryptionKeyRequired,
+    EncryptionAuthFailed,
 };
 
 pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
@@ -40,6 +44,25 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
         ally.destroy(db);
         return Result.Error;
     };
+    out.* = db;
+    return Result.OK;
+}
+
+pub export fn albedo_open_with_passphrase(path: [*:0]u8, passphrase: [*:0]u8, out: **albedo.Bucket) Result {
+    const pathProper = std.mem.span(path);
+    const passphraseProper = std.mem.span(passphrase);
+
+    const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
+    db.* = albedo.Bucket.initWithPassphrase(ally, pathProper, passphraseProper) catch |err| {
+        ally.destroy(db);
+        return switch (err) {
+            error.FileNotFound => Result.FileNotFound,
+            error.MissingEncryptionKey => Result.EncryptionKeyRequired,
+            error.EncryptionAuthenticationFailed => Result.EncryptionAuthFailed,
+            else => Result.Error,
+        };
+    };
+
     out.* = db;
     return Result.OK;
 }
