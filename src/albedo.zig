@@ -511,7 +511,7 @@ pub const Bucket = struct {
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
-        bucket.ensureIndex("_id", .{}) catch return BucketInitErrors.InitializationError;
+        bucket.ensureIndex("_id", .{ .unique = 1 }) catch return BucketInitErrors.InitializationError;
 
         bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
         bucket.rwlock = .{};
@@ -535,7 +535,7 @@ pub const Bucket = struct {
         };
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
-        bucket.ensureIndex("_id", .{}) catch return BucketInitErrors.InitializationError;
+        bucket.ensureIndex("_id", .{ .unique = 1 }) catch return BucketInitErrors.InitializationError;
         bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
 
         bucket.rwlock = .{};

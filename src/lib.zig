@@ -151,9 +151,14 @@ pub const ListHandle = struct {
 pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterator: **ListHandle) Result {
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
     const queryArena = ally.create(std.heap.ArenaAllocator) catch return Result.OutOfMemory;
-    errdefer ally.destroy(queryArena);
     queryArena.* = std.heap.ArenaAllocator.init(ally);
-    errdefer queryArena.deinit();
+    var arena_owned_by_handle = false;
+    defer {
+        if (!arena_owned_by_handle) {
+            queryArena.deinit();
+            ally.destroy(queryArena);
+        }
+    }
 
     const local_ally = queryArena.allocator();
     const queryBufferProper = local_ally.dupe(u8, queryBuffer[0..queryLen]) catch return Result.OutOfMemory;
@@ -176,6 +181,7 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
         .iterator = iterator,
         .arena = queryArena,
     };
+    arena_owned_by_handle = true;
     outIterator.* = listHandle;
 
     return Result.OK;
@@ -231,8 +237,14 @@ pub export fn albedo_transform(
     const arena_ptr = ally.create(std.heap.ArenaAllocator) catch {
         return Result.OutOfMemory;
     };
-    errdefer ally.destroy(arena_ptr);
     arena_ptr.* = std.heap.ArenaAllocator.init(ally);
+    var arena_owned_by_iterator = false;
+    defer {
+        if (!arena_owned_by_iterator) {
+            arena_ptr.deinit();
+            ally.destroy(arena_ptr);
+        }
+    }
 
     const query = Query.parseRaw(
         arena_ptr.allocator(),
@@ -252,14 +264,13 @@ pub export fn albedo_transform(
 
     const iter = bucket.transformIterate(arena_ptr, query) catch |err| switch (err) {
         else => {
-            arena_ptr.deinit();
-            ally.destroy(arena_ptr);
             return Result.Error;
         },
     };
 
     // Mark the arena as owned by the iterator so it will be cleaned up in close()
     iter.owns_arena = true;
+    arena_owned_by_iterator = true;
     iteratorOut.* = iter;
 
     return Result.OK;
@@ -529,4 +540,147 @@ test "lib API transform updates matching doc" {
         else => return error.TestExpectedEqual,
     };
     try testing.expectEqual(@as(i64, 21), age_num);
+}
+
+test "lib API returns errors for invalid query payloads" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-invalid-query-payloads");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var bad_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": {
+        \\      "$nope": "Alice"
+        \\    }
+        \\  }
+        \\}
+    );
+    defer bad_query.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.Error, albedo_list(bucket, @constCast(bad_query.buffer.ptr), &handle));
+    try testing.expectEqual(
+        Result.Error,
+        albedo_delete(bucket, @constCast(bad_query.buffer.ptr), @intCast(bad_query.buffer.len)),
+    );
+
+    var transform_iterator: *Bucket.TransformIterator = undefined;
+    try testing.expectEqual(
+        Result.Error,
+        albedo_transform(bucket, @constCast(bad_query.buffer.ptr), &transform_iterator),
+    );
+}
+
+test "lib API insert reports duplicate key" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-insert-duplicate-key");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    // unique bit is options byte bit 0
+    try testing.expectEqual(Result.OK, albedo_ensure_index(bucket, "email", 0x01));
+
+    var first = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "email": "same@example.com",
+        \\  "name": "First"
+        \\}
+    );
+    defer first.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(first.buffer.ptr)));
+
+    var duplicate = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "email": "same@example.com",
+        \\  "name": "Second"
+        \\}
+    );
+    defer duplicate.deinit(allocator);
+    try testing.expectEqual(Result.DuplicateKey, albedo_insert(bucket, @constCast(duplicate.buffer.ptr)));
+}
+
+test "lib API default _id index is unique" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-default-id-index-unique");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var first = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "_id": "same-id",
+        \\  "name": "First"
+        \\}
+    );
+    defer first.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(first.buffer.ptr)));
+
+    var duplicate = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "_id": "same-id",
+        \\  "name": "Second"
+        \\}
+    );
+    defer duplicate.deinit(allocator);
+    try testing.expectEqual(Result.DuplicateKey, albedo_insert(bucket, @constCast(duplicate.buffer.ptr)));
+}
+
+test "lib API drop index returns not found for missing path" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-drop-index-not-found");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    try testing.expectEqual(Result.NotFound, albedo_drop_index(bucket, "does.not.exist"));
+}
+
+test "lib API apply batch rejects invalid payload size" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-apply-batch-invalid-size");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    const bad = [_]u8{ 1, 2, 3, 4 };
+    try testing.expectEqual(Result.Error, albedo_apply_batch(bucket, bad[0..].ptr, bad.len, 1));
 }
