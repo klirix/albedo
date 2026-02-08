@@ -798,8 +798,6 @@ test "Sector.parse" {
 }
 
 pub const Query = struct {
-    const defaultFilters = [0]Filter{};
-
     filters: []Filter,
     sortConfig: ?SortConfig,
     sector: ?Sector,
@@ -817,7 +815,7 @@ pub const Query = struct {
 
     pub fn parse(ally: Allocator, queryDoc: bson.BSONDocument) QueryParsingErrors!Query {
         const filterDoc = queryDoc.get("query");
-        const filters = if (filterDoc) |doc| try Filter.parse(ally, doc) else @constCast(defaultFilters[0..]);
+        const filters = if (filterDoc) |doc| try Filter.parse(ally, doc) else try ally.alloc(Filter, 0);
         const sortDoc = queryDoc.get("sort");
         const sortConfig = if (sortDoc) |doc| try SortConfig.parse(doc) else null;
         const sectorDoc = queryDoc.get("sector");

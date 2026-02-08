@@ -1114,6 +1114,26 @@ pub const Bucket = struct {
             retain_values = true;
         }
 
+        // Preflight unique indexes before writing any document bytes.
+        // This avoids partial writes when duplicate key errors occur.
+        for (planned_index_inserts.items) |plan| {
+            if (plan.index.options.unique != 1) continue;
+
+            for (plan.values.items, 0..) |value, value_idx| {
+                var prior_idx: usize = 0;
+                while (prior_idx < value_idx) : (prior_idx += 1) {
+                    if (plan.values.items[prior_idx].eql(&value)) {
+                        return error.DuplicateKey;
+                    }
+                }
+
+                self.bindIndex(plan.index);
+                if (try plan.index.hasValue(value)) {
+                    return error.DuplicateKey;
+                }
+            }
+        }
+
         // If no pages exist yet, create one
         if (try findLastDataPage(self)) |p| {
             page = p;
@@ -1803,7 +1823,7 @@ pub const Bucket = struct {
             return value;
         }
 
-        fn deinit(self: *ListIterator) !void {
+        pub fn deinit(self: *ListIterator) !void {
             if (self.plan.source == .full_scan) {
                 self.scanner.deinit();
             }
@@ -1992,6 +2012,34 @@ pub const Bucket = struct {
                         plan.sort_covered = false;
                         plan.index_strategy = .points;
                     }
+                },
+                .startsWith => |data| {
+                    if (data.value != bson.BSONValueType.string) continue;
+                    if (!isIndexableValue(data.value)) continue;
+
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    const candidate_bounds = QueryPlan.IndexBounds{
+                        .lower = Index.RangeBound.gte(data.value),
+                    };
+                    const score: u8 = 70;
+                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = index_ptr;
+                        plan.filter_index = idx;
+                        plan.index_path = data.path;
+                        plan.bounds = candidate_bounds;
+                        plan.sort_covered = false;
+                        plan.index_strategy = .range;
+                    } else if (matches_current) {
+                        if (candidate_bounds.lower) |lower| {
+                            tightenLowerBound(&plan.bounds.lower, lower);
+                        }
+                    }
+                },
+                .endsWith => |_| {
+                    // No indexable strategy for suffix matching.
                 },
                 else => {},
             }
@@ -3197,18 +3245,10 @@ test "Bucket.dump supports :memory: storage" {
     try testing.expectEqualStrings(stored.get("name").?.string.value, "InMemory");
 }
 
-test "Bucket.indexed queries use indexes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var bucket = try Bucket.init(allocator, "index-query.bucket");
-    defer bucket.deinit();
-    defer platform.deleteFile("index-query.bucket") catch {
-        // std.debug.print("Failed to delete test file: {any}\n", .{err});
-    };
-
+fn setupIndexQueryBucket(bucket: *Bucket, allocator: std.mem.Allocator) !void {
     try bucket.ensureIndex("age", .{});
     try bucket.ensureIndex("scores", .{ .sparse = 1 });
+    try bucket.ensureIndex("name", .{});
 
     const alice_scores_pairs = [_]bson.BSONKeyValuePair{
         bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 5 } }),
@@ -3256,285 +3296,359 @@ test "Bucket.indexed queries use indexes" {
         _ = try bucket.insert(doc);
         doc.deinit(allocator);
     }
+}
 
-    // Equality uses range strategy
-    {
-        const age_filter_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
-        };
-        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-        defer age_filter_doc.deinit(allocator);
+test "Bucket.indexed query equality uses range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-eq.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-eq.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-eq.bucket") catch {};
 
-        const root_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-        };
-        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
-        defer qdoc.deinit(allocator);
+    const age_filter_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
+    };
+    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+    defer age_filter_doc.deinit(allocator);
 
-        var q = try query.Query.parse(allocator, qdoc);
-        defer q.deinit(allocator);
+    const root_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+    };
+    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    defer qdoc.deinit(allocator);
 
-        const plan = bucket.planQuery(&q);
-        try testing.expect(plan.source == .index);
-        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
-        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
 
-        var iter = try bucket.listIterate(&arena, q);
-        defer {
-            iter.deinit() catch {};
-        }
-        var count: usize = 0;
-        while (try iter.next(iter)) |doc| {
-            const name = doc.get("name").?.string.value;
-            try testing.expect(std.mem.eql(u8, name, "Alice"));
-            count += 1;
-            // allocator.free(doc.buffer);
-        }
-        try testing.expectEqual(@as(usize, 1), count);
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var count: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const name = doc.get("name").?.string.value;
+        try testing.expect(std.mem.eql(u8, name, "Alice"));
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "Bucket.indexed query startsWith uses range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-startswith.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-startswith.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-startswith.bucket") catch {};
+
+    const name_prefix_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("$startsWith", bson.BSONValue{ .string = .{ .value = "A" } }),
+    };
+    var name_prefix_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(name_prefix_pairs[0..]));
+    defer name_prefix_doc.deinit(allocator);
+
+    const name_filter_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .document = name_prefix_doc }),
+    };
+    var name_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(name_filter_pairs[0..]));
+    defer name_filter_doc.deinit(allocator);
+
+    const root_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = name_filter_doc }),
+    };
+    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    defer qdoc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "name"));
+    try testing.expect(plan.bounds.lower != null);
+    try testing.expect(plan.bounds.upper == null);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var count: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const name = doc.get("name").?.string.value;
+        try testing.expect(std.mem.eql(u8, name, "Alice"));
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "Bucket.indexed query range bounds combine" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-range.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-range.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-range.bucket") catch {};
+
+    const age_range_ops = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("$gte", bson.BSONValue{ .int32 = .{ .value = 35 } }),
+        bson.BSONKeyValuePair.init("$lte", bson.BSONValue{ .int32 = .{ .value = 40 } }),
+    };
+    var age_range_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_range_ops[0..]));
+    defer age_range_doc.deinit(allocator);
+
+    const age_filter_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_range_doc }),
+    };
+    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+    defer age_filter_doc.deinit(allocator);
+
+    const root_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+    };
+    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    defer qdoc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+    try testing.expect(plan.bounds.lower != null);
+    try testing.expect(plan.bounds.upper != null);
+    try testing.expect(plan.bounds.lower.?.filter == .gte);
+    try testing.expect(plan.bounds.upper.?.filter == .lte);
+    switch (plan.bounds.lower.?.value) {
+        .int32 => |v| try testing.expect(v.value == 35),
+        else => try testing.expect(false),
+    }
+    switch (plan.bounds.upper.?.value) {
+        .int32 => |v| try testing.expect(v.value == 40),
+        else => try testing.expect(false),
     }
 
-    // Combined lower and upper bounds use range strategy and honor both filters
-    {
-        const age_range_ops = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("$gte", bson.BSONValue{ .int32 = .{ .value = 35 } }),
-            bson.BSONKeyValuePair.init("$lte", bson.BSONValue{ .int32 = .{ .value = 40 } }),
-        };
-        var age_range_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_range_ops[0..]));
-        defer age_range_doc.deinit(allocator);
-
-        const age_filter_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_range_doc }),
-        };
-        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-        defer age_filter_doc.deinit(allocator);
-
-        const root_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-        };
-        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
-        defer qdoc.deinit(allocator);
-
-        var q = try query.Query.parse(allocator, qdoc);
-        defer q.deinit(allocator);
-
-        const plan = bucket.planQuery(&q);
-        try testing.expect(plan.source == .index);
-        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
-        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
-        try testing.expect(plan.bounds.lower != null);
-        try testing.expect(plan.bounds.upper != null);
-        try testing.expect(plan.bounds.lower.?.filter == .gte);
-        try testing.expect(plan.bounds.upper.?.filter == .lte);
-        switch (plan.bounds.lower.?.value) {
-            .int32 => |v| try testing.expect(v.value == 35),
-            else => try testing.expect(false),
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var seen_dora = false;
+    var seen_bob = false;
+    var count: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const name = doc.get("name").?.string.value;
+        if (std.mem.eql(u8, name, "Dora")) {
+            try testing.expect(!seen_dora);
+            seen_dora = true;
+        } else if (std.mem.eql(u8, name, "Bob")) {
+            try testing.expect(!seen_bob);
+            seen_bob = true;
+        } else {
+            try testing.expect(false);
         }
-        switch (plan.bounds.upper.?.value) {
-            .int32 => |v| try testing.expect(v.value == 40),
-            else => try testing.expect(false),
-        }
-
-        var iter = try bucket.listIterate(&arena, q);
-        defer {
-            iter.deinit() catch {};
-        }
-        var seen_dora = false;
-        var seen_bob = false;
-        var count: usize = 0;
-        while (try iter.next(iter)) |doc| {
-            const name = doc.get("name").?.string.value;
-            if (std.mem.eql(u8, name, "Dora")) {
-                try testing.expect(!seen_dora);
-                seen_dora = true;
-            } else if (std.mem.eql(u8, name, "Bob")) {
-                try testing.expect(!seen_bob);
-                seen_bob = true;
-            } else {
-                try testing.expect(false);
-            }
-            count += 1;
-            // allocator.free(doc.buffer);
-        }
-        try testing.expectEqual(@as(usize, 2), count);
-        try testing.expect(seen_dora);
-        try testing.expect(seen_bob);
+        count += 1;
     }
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(seen_dora);
+    try testing.expect(seen_bob);
+}
 
-    // $in uses point strategy and returns two documents
-    {
-        const in_values_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 30 } }),
-            bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 40 } }),
-        };
-        var in_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(in_values_pairs[0..]));
-        defer in_values_doc.deinit(allocator);
+test "Bucket.indexed query in uses points" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-in.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-in.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-in.bucket") catch {};
 
-        const age_in_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = in_values_doc }),
-        };
-        var age_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_in_pairs[0..]));
-        defer age_in_doc.deinit(allocator);
+    const in_values_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 30 } }),
+        bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 40 } }),
+    };
+    var in_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(in_values_pairs[0..]));
+    defer in_values_doc.deinit(allocator);
 
-        const age_filter_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_in_doc }),
-        };
-        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-        defer age_filter_doc.deinit(allocator);
+    const age_in_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = in_values_doc }),
+    };
+    var age_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_in_pairs[0..]));
+    defer age_in_doc.deinit(allocator);
 
-        const root_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-        };
-        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
-        defer qdoc.deinit(allocator);
+    const age_filter_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_in_doc }),
+    };
+    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+    defer age_filter_doc.deinit(allocator);
 
-        var q = try query.Query.parse(allocator, qdoc);
-        defer q.deinit(allocator);
+    const root_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+    };
+    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    defer qdoc.deinit(allocator);
 
-        const plan = bucket.planQuery(&q);
-        try testing.expect(plan.source == .index);
-        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
-        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
 
-        var iter = try bucket.listIterate(&arena, q);
-        defer {
-            iter.deinit() catch {};
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var seen_alice = false;
+    var seen_bob = false;
+    var count: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const name = doc.get("name").?.string.value;
+        if (std.mem.eql(u8, name, "Alice")) {
+            try testing.expect(!seen_alice);
+            seen_alice = true;
+        } else if (std.mem.eql(u8, name, "Bob")) {
+            try testing.expect(!seen_bob);
+            seen_bob = true;
+        } else {
+            try testing.expect(false);
         }
-        var seen_alice = false;
-        var seen_bob = false;
-        var count: usize = 0;
-        while (try iter.next(iter)) |doc| {
-            const name = doc.get("name").?.string.value;
-            if (std.mem.eql(u8, name, "Alice")) {
-                try testing.expect(!seen_alice);
-                seen_alice = true;
-            } else if (std.mem.eql(u8, name, "Bob")) {
-                try testing.expect(!seen_bob);
-                seen_bob = true;
-            } else {
-                try testing.expect(false);
-            }
-            count += 1;
-            // allocator.free(doc.buffer);
-        }
-        try testing.expectEqual(@as(usize, 2), count);
-        try testing.expect(seen_alice and seen_bob);
+        count += 1;
     }
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(seen_alice and seen_bob);
+}
 
-    // $between uses range strategy and returns Alice and Dora
-    {
-        const between_values_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 29 } }),
-            bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 38 } }),
-        };
-        var between_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(between_values_pairs[0..]));
-        defer between_values_doc.deinit(allocator);
+test "Bucket.indexed query between uses range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-between.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-between.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-between.bucket") catch {};
 
-        const age_between_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("$between", bson.BSONValue{ .array = between_values_doc }),
-        };
-        var age_between_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_between_pairs[0..]));
-        defer age_between_doc.deinit(allocator);
+    const between_values_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 29 } }),
+        bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 38 } }),
+    };
+    var between_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(between_values_pairs[0..]));
+    defer between_values_doc.deinit(allocator);
 
-        const age_filter_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_between_doc }),
-        };
-        var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-        defer age_filter_doc.deinit(allocator);
+    const age_between_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("$between", bson.BSONValue{ .array = between_values_doc }),
+    };
+    var age_between_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_between_pairs[0..]));
+    defer age_between_doc.deinit(allocator);
 
-        const root_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-        };
-        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
-        defer qdoc.deinit(allocator);
+    const age_filter_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_between_doc }),
+    };
+    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
+    defer age_filter_doc.deinit(allocator);
 
-        var q = try query.Query.parse(allocator, qdoc);
-        defer q.deinit(allocator);
+    const root_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
+    };
+    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    defer qdoc.deinit(allocator);
 
-        const plan = bucket.planQuery(&q);
-        try testing.expect(plan.source == .index);
-        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
 
-        var iter = try bucket.listIterate(&arena, q);
-        defer {
-            iter.deinit() catch {};
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var seen_alice = false;
+    var seen_dora = false;
+    var count: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const name = doc.get("name").?.string.value;
+        if (std.mem.eql(u8, name, "Alice")) {
+            seen_alice = true;
+        } else if (std.mem.eql(u8, name, "Dora")) {
+            seen_dora = true;
+        } else {
+            try testing.expect(false);
         }
-        var seen_alice = false;
-        var seen_dora = false;
-        var count: usize = 0;
-        while (try iter.next(iter)) |doc| {
-            const name = doc.get("name").?.string.value;
-            if (std.mem.eql(u8, name, "Alice")) {
-                seen_alice = true;
-            } else if (std.mem.eql(u8, name, "Dora")) {
-                seen_dora = true;
-            } else {
-                try testing.expect(false);
-            }
-            count += 1;
-            // allocator.free(doc.buffer);
-        }
-        try testing.expectEqual(@as(usize, 2), count);
-        try testing.expect(seen_alice and seen_dora);
+        count += 1;
     }
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(seen_alice and seen_dora);
+}
 
-    // $in on scores should hit the scores index using point strategy and avoid duplicates
-    {
-        const score_values_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 7 } }),
-        };
-        var score_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(score_values_pairs[0..]));
-        defer score_values_doc.deinit(allocator);
+test "Bucket.indexed query in scores avoids duplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-scores.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-scores.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-scores.bucket") catch {};
 
-        const scores_in_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = score_values_doc }),
-        };
-        var scores_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_in_pairs[0..]));
-        defer scores_in_doc.deinit(allocator);
+    const score_values_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 7 } }),
+    };
+    var score_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(score_values_pairs[0..]));
+    defer score_values_doc.deinit(allocator);
 
-        const scores_filter_pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .document = scores_in_doc }),
-        };
-        var scores_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_filter_pairs[0..]));
-        defer scores_filter_doc.deinit(allocator);
+    const scores_in_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = score_values_doc }),
+    };
+    var scores_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_in_pairs[0..]));
+    defer scores_in_doc.deinit(allocator);
 
-        const root_pairs_scores = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = scores_filter_doc }),
-        };
-        var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs_scores[0..]));
-        defer qdoc.deinit(allocator);
+    const scores_filter_pairs = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .document = scores_in_doc }),
+    };
+    var scores_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_filter_pairs[0..]));
+    defer scores_filter_doc.deinit(allocator);
 
-        var q = try query.Query.parse(allocator, qdoc);
-        defer q.deinit(allocator);
+    const root_pairs_scores = [_]bson.BSONKeyValuePair{
+        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = scores_filter_doc }),
+    };
+    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs_scores[0..]));
+    defer qdoc.deinit(allocator);
 
-        const plan = bucket.planQuery(&q);
-        try testing.expect(plan.source == .index);
-        try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
-        try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "scores"));
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
 
-        var doc_list: std.ArrayList(BSONDocument) = .{};
-        defer {
-            for (doc_list.items) |doc_item| allocator.free(doc_item.buffer);
-            doc_list.deinit(allocator);
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "scores"));
+
+    var doc_list: std.ArrayList(BSONDocument) = .{};
+    defer doc_list.deinit(allocator);
+    try bucket.collectDocs(&doc_list, allocator, &q, &plan);
+
+    var seen_alice = false;
+    var seen_dora = false;
+    for (doc_list.items) |doc| {
+        const name = doc.get("name").?.string.value;
+        if (std.mem.eql(u8, name, "Alice")) {
+            try testing.expect(!seen_alice);
+            seen_alice = true;
+        } else if (std.mem.eql(u8, name, "Dora")) {
+            try testing.expect(!seen_dora);
+            seen_dora = true;
+        } else {
+            try testing.expect(false);
         }
-        try bucket.collectDocs(&doc_list, allocator, &q, &plan);
-
-        var seen_alice = false;
-        var seen_dora = false;
-        for (doc_list.items) |doc| {
-            const name = doc.get("name").?.string.value;
-            if (std.mem.eql(u8, name, "Alice")) {
-                try testing.expect(!seen_alice);
-                seen_alice = true;
-            } else if (std.mem.eql(u8, name, "Dora")) {
-                try testing.expect(!seen_dora);
-                seen_dora = true;
-            } else {
-                try testing.expect(false);
-            }
-        }
-        try testing.expectEqual(@as(usize, 2), doc_list.items.len);
-        try testing.expect(seen_alice and seen_dora);
     }
+    try testing.expectEqual(@as(usize, 2), doc_list.items.len);
+    try testing.expect(seen_alice and seen_dora);
 }
 
 test "Page cache enforces capacity with LRU eviction" {

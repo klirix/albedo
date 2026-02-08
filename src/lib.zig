@@ -5,8 +5,14 @@ const bson = @import("./bson.zig");
 const platform = @import("./platform.zig");
 const Query = @import("./query.zig").Query;
 const IndexOptions = @import("./bplusindex.zig").IndexOptions;
+const builtin = @import("builtin");
 
-const ally = if (platform.isWasm) std.heap.wasm_allocator else std.heap.smp_allocator;
+const ally = if (builtin.is_test)
+    std.testing.allocator
+else if (platform.isWasm)
+    std.heap.wasm_allocator
+else
+    std.heap.smp_allocator;
 
 const Bucket = albedo.Bucket;
 
@@ -30,7 +36,10 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     // defer _ = gpa.deinit();
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    db.* = albedo.Bucket.init(ally, pathProper) catch return Result.Error;
+    db.* = albedo.Bucket.init(ally, pathProper) catch {
+        ally.destroy(db);
+        return Result.Error;
+    };
     out.* = db;
     return Result.OK;
 }
@@ -103,9 +112,15 @@ pub export fn albedo_drop_index(bucket: *albedo.Bucket, path: [*:0]const u8) Res
 }
 
 pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen: u16) Result {
-    const docBufferProper = queryBuffer[0..queryLen];
+    var arena = std.heap.ArenaAllocator.init(ally);
+    defer arena.deinit();
+    const local_ally = arena.allocator();
 
-    const query = Query.parseRaw(bucket.allocator, docBufferProper) catch |err| switch (err) {
+    const docBufferProper = local_ally.dupe(u8, queryBuffer[0..queryLen]) catch {
+        return Result.OutOfMemory;
+    };
+
+    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| switch (err) {
         Query.QueryParsingErrors.OutOfMemory => {
             return Result.OutOfMemory;
         },
@@ -113,6 +128,7 @@ pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen
             return Result.Error;
         },
     };
+    defer query.deinit(local_ally);
 
     bucket.delete(query) catch |err| switch (err) {
         else => {
@@ -134,17 +150,15 @@ pub const ListHandle = struct {
 
 pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterator: **ListHandle) Result {
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
-    var queryBufferProper = queryBuffer[0..queryLen];
+    const queryArena = ally.create(std.heap.ArenaAllocator) catch return Result.OutOfMemory;
+    errdefer ally.destroy(queryArena);
+    queryArena.* = std.heap.ArenaAllocator.init(ally);
+    errdefer queryArena.deinit();
 
-    var arena = std.heap.ArenaAllocator.init(bucket.allocator);
-    const local_ally = arena.allocator();
-    queryBufferProper = local_ally.dupe(u8, queryBufferProper) catch return Result.OutOfMemory;
-    const queryArena = local_ally.create(std.heap.ArenaAllocator) catch return Result.OutOfMemory;
-    queryArena.* = arena;
+    const local_ally = queryArena.allocator();
+    const queryBufferProper = local_ally.dupe(u8, queryBuffer[0..queryLen]) catch return Result.OutOfMemory;
 
-    // const queryArenaAllocator = queryArena.allocator();
-
-    const query = Query.parseRaw(queryArena.allocator(), queryBufferProper) catch |err| switch (err) {
+    const query = Query.parseRaw(local_ally, queryBufferProper) catch |err| switch (err) {
         else => {
             // std.debug.print("Failed to parse query, {any}", .{qErr});
             return Result.Error;
@@ -157,7 +171,7 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
             return Result.Error;
         },
     };
-    const listHandle = bucket.allocator.create(ListHandle) catch return Result.OutOfMemory;
+    const listHandle = local_ally.create(ListHandle) catch return Result.OutOfMemory;
     listHandle.* = ListHandle{
         .iterator = iterator,
         .arena = queryArena,
@@ -182,18 +196,12 @@ pub export fn albedo_data(handle: *ListHandle, outDoc: *[*]u8) Result {
     return Result.OK;
 }
 
-/// Advances the iterator to the next result and returns the current state.
-/// If the iterator is at the end of the results, it returns `Result.EOS`.
-/// Otherwise, it returns `Result.Data` to indicate more data is available.
-pub export fn albedo_next(handle: *ListHandle) Result {
-    if (handle.iterator.index == 0) {
-        return Result.EOS;
-    }
-    return Result.HasData;
-}
-
 pub export fn albedo_close_iterator(iterator: *ListHandle) Result {
-    iterator.arena.deinit();
+    const arena_ptr = iterator.arena;
+    iterator.iterator.deinit() catch {};
+    arena_ptr.deinit();
+    ally.destroy(arena_ptr);
+
     return Result.OK;
 }
 
@@ -220,14 +228,14 @@ pub export fn albedo_transform(
     const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
     const queryBufProper = queryBuffer[0..queryLen];
 
-    const arena_ptr = bucket.allocator.create(std.heap.ArenaAllocator) catch {
+    const arena_ptr = ally.create(std.heap.ArenaAllocator) catch {
         return Result.OutOfMemory;
     };
-    errdefer bucket.allocator.destroy(arena_ptr);
-    arena_ptr.* = std.heap.ArenaAllocator.init(bucket.allocator);
+    errdefer ally.destroy(arena_ptr);
+    arena_ptr.* = std.heap.ArenaAllocator.init(ally);
 
     const query = Query.parseRaw(
-        bucket.allocator,
+        arena_ptr.allocator(),
         arena_ptr.allocator().dupe(u8, queryBufProper) catch {
             return Result.OutOfMemory;
         },
@@ -245,7 +253,7 @@ pub export fn albedo_transform(
     const iter = bucket.transformIterate(arena_ptr, query) catch |err| switch (err) {
         else => {
             arena_ptr.deinit();
-            bucket.allocator.destroy(arena_ptr);
+            ally.destroy(arena_ptr);
             return Result.Error;
         },
     };
@@ -342,6 +350,183 @@ pub export fn albedo_free(ptr: [*c]u8, size: usize) void {
     ally.free(ptr[0..size]);
 }
 
-// test "basic add functionality" {
-//     try testing.expect(add(3, 7) == 10);
-// }
+fn makeTempPath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}.bucket", .{name});
+}
+
+test "lib API open insert list close" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-open-insert-list-close");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "name": "Alice",
+        \\  "age": 30
+        \\}
+    );
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+    var list_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": "Alice"
+        \\  }
+        \\}
+    );
+    defer list_query.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(list_query.buffer.ptr), &handle));
+    defer _ = albedo_close_iterator(handle);
+
+    var raw_doc_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_data(handle, &raw_doc_ptr));
+
+    const raw_len = std.mem.readInt(u32, raw_doc_ptr[0..4], .little);
+    const listed = bson.BSONDocument.init(raw_doc_ptr[0..raw_len]);
+    const listed_name = listed.get("name") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("Alice", listed_name.string.value);
+
+    try testing.expectEqual(Result.EOS, albedo_data(handle, &raw_doc_ptr));
+}
+
+test "lib API delete removes matched docs" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-delete-removes-matched-docs");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "name": "Bob",
+        \\  "age": 44
+        \\}
+    );
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+    var delete_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": "Bob"
+        \\  }
+        \\}
+    );
+    defer delete_query.deinit(allocator);
+    try testing.expectEqual(
+        Result.OK,
+        albedo_delete(bucket, @constCast(delete_query.buffer.ptr), @intCast(delete_query.buffer.len)),
+    );
+
+    var list_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": "Bob"
+        \\  }
+        \\}
+    );
+    defer list_query.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(list_query.buffer.ptr), &handle));
+    defer _ = albedo_close_iterator(handle);
+
+    var raw_doc_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.EOS, albedo_data(handle, &raw_doc_ptr));
+}
+
+test "lib API transform updates matching doc" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-transform-updates-matching-doc");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "name": "Carol",
+        \\  "age": 20
+        \\}
+    );
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+    var transform_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": "Carol"
+        \\  }
+        \\}
+    );
+    defer transform_query.deinit(allocator);
+
+    var iterator: *Bucket.TransformIterator = undefined;
+    try testing.expectEqual(Result.OK, albedo_transform(bucket, @constCast(transform_query.buffer.ptr), &iterator));
+
+    var current_ptr: [*c]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_transform_data(iterator, &current_ptr));
+
+    var updated = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "name": "Carol",
+        \\  "age": 21
+        \\}
+    );
+    defer updated.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_transform_apply(iterator, @constCast(updated.buffer.ptr)));
+    try testing.expectEqual(Result.EOS, albedo_transform_data(iterator, &current_ptr));
+    try testing.expectEqual(Result.OK, albedo_transform_close(iterator));
+
+    var list_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": "Carol"
+        \\  }
+        \\}
+    );
+    defer list_query.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(list_query.buffer.ptr), &handle));
+    defer _ = albedo_close_iterator(handle);
+
+    var listed_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_data(handle, &listed_ptr));
+    const listed_len = std.mem.readInt(u32, listed_ptr[0..4], .little);
+    const listed = bson.BSONDocument.init(listed_ptr[0..listed_len]);
+    const name = listed.get("name") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("Carol", name.string.value);
+    const age = listed.get("age") orelse return error.TestExpectedEqual;
+    const age_num = switch (age) {
+        .int32 => |v| @as(i64, v.value),
+        .int64 => |v| v.value,
+        else => return error.TestExpectedEqual,
+    };
+    try testing.expectEqual(@as(i64, 21), age_num);
+}
