@@ -102,6 +102,8 @@ fn buildSharedLibrary(b: *std.Build, libModule: *std.Build.Module, target: std.B
         .root_module = libModule,
     });
 
+    dynamic.headerpad_max_install_names = true;
+
     const arch = switch (target.result.cpu.arch) {
         .x86_64 => "x86_64-linux-android",
         .aarch64 => "aarch64-linux-android",
