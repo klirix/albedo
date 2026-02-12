@@ -1190,9 +1190,8 @@ test "Index delete" {
 
     try index.delete(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 1, .offset = 20 });
     var iter = try index.range(null, Index.RangeBound.lt(BSONValue{ .int32 = .{ .value = 12 } }));
-    while (try iter.next()) |loc| {
-        std.debug.print("Found no deleted location: pageId={}, offset={}\n", .{ loc.pageId, loc.offset });
-    }
+    const loc = try iter.next() orelse unreachable;
+    try testing.expectEqual(10, loc.offset);
 }
 
 test "Index load from root and query" {
@@ -1319,7 +1318,7 @@ test "reverse index with range bounds" {
     while (try full_iter.next()) |loc| {
         try full_offsets.append(testing.allocator, loc.offset);
     }
-    std.debug.print("Full scan: {any}\n", .{full_offsets.items});
+    // std.debug.print("Full scan: {any}\n", .{full_offsets.items});
 
     // Range [10, 20] should return: 20, 15, 10 (descending)
     const lower = BSONValue{ .int32 = .{ .value = 10 } };

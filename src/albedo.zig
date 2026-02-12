@@ -3715,7 +3715,7 @@ test "Bucket.reverse index with sort queries" {
     };
 
     for (test_docs) |td| {
-        var doc = try bson.fmt.serialize(.{ .name = td.name, .score = td.score }, allocator);
+        var doc = try bson.fmt.serialize(td, allocator);
         _ = try bucket.insert(doc);
         doc.deinit(allocator);
     }
@@ -3862,15 +3862,16 @@ test "Bucket.replication with page streaming" {
     primary.replication_callback = replicationCallback;
     primary.replication_context = &ctx;
 
+    const Person = struct { name: []const u8, age: i32 };
     // Insert documents into primary
-    const test_docs = [_]struct { name: []const u8, age: i32 }{
+    const test_docs = [_]Person{
         .{ .name = "Alice", .age = 30 },
         .{ .name = "Bob", .age = 25 },
         .{ .name = "Carol", .age = 35 },
     };
 
     for (test_docs) |td| {
-        var doc = try bson.fmt.serialize(.{ .name = td.name, .age = td.age }, allocator);
+        var doc = try bson.fmt.serialize(td, allocator);
         _ = try primary.insert(doc);
         doc.deinit(allocator);
     }
@@ -3880,7 +3881,7 @@ test "Bucket.replication with page streaming" {
 
     // Verify pages were replicated
     try testing.expect(ctx.pages_replicated > 0);
-    std.debug.print("Replicated {d} pages\n", .{ctx.pages_replicated});
+    // std.debug.print("Replicated {d} pages\n", .{ctx.pages_replicated});
 
     // Clear replica's cache to force reading from disk
     replica.pageCache.clear(allocator);
@@ -3901,10 +3902,11 @@ test "Bucket.replication with page streaming" {
     var carol_found = false;
 
     while (try iter.next(iter)) |doc| {
-        const name = doc.get("name").?.string.value;
-        const age = doc.get("age").?.int32.value;
+        const parseDoc = try bson.fmt.parse(Person, doc, allocator);
 
-        std.debug.print("Found in replica: {s}, age: {d}\n", .{ name, age });
+        const name = parseDoc.value.name;
+
+        // std.debug.print("Found in replica: {s}, age: {d}\n", .{ name, age });
 
         // Check names before freeing the buffer
         if (std.mem.eql(u8, name, "Alice")) alice_found = true;
@@ -3926,13 +3928,13 @@ test "Bucket.replication with page streaming" {
     // Test incremental replication: insert more docs
     ctx.pages_replicated = 0; // Reset counter
 
-    const more_docs = [_]struct { name: []const u8, age: i32 }{
+    const more_docs = [_]Person{
         .{ .name = "Dave", .age = 28 },
         .{ .name = "Eve", .age = 32 },
     };
 
     for (more_docs) |td| {
-        var doc = try bson.fmt.serialize(.{ .name = td.name, .age = td.age }, allocator);
+        var doc = try bson.fmt.serialize(td, allocator);
         _ = try primary.insert(doc);
         doc.deinit(allocator);
     }
@@ -3941,7 +3943,7 @@ test "Bucket.replication with page streaming" {
 
     // Verify incremental pages were replicated
     try testing.expect(ctx.pages_replicated > 0);
-    std.debug.print("Incrementally replicated {d} more pages\n", .{ctx.pages_replicated});
+    // std.debug.print("Incrementally replicated {d} more pages\n", .{ctx.pages_replicated});
 
     // Clear cache again
     replica.pageCache.clear(allocator);
@@ -3957,7 +3959,7 @@ test "Bucket.replication with page streaming" {
     }
 
     try testing.expectEqual(@as(usize, 5), docs_found);
-    std.debug.print("Replication test completed successfully!\n", .{});
+    // std.debug.print("Replication test completed successfully!\n", .{});
 }
 
 test "Deleting removes index entries for scalar field" {
