@@ -371,7 +371,7 @@ pub const Bucket = struct {
     const OpenBucketOptions = struct {
         buildIdIndex: bool = false,
         mode: BucketFileMode = BucketFileMode.ReadWrite,
-        autoVaccuum: bool = true,
+        auto_vaccuum: bool = true,
         page_cache_capacity: usize = DEFAULT_PAGE_CACHE_CAPACITY,
     };
 
@@ -504,7 +504,7 @@ pub const Bucket = struct {
             .allocator = ally,
             .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
-            .autoVaccuum = options.autoVaccuum,
+            .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
         };
@@ -528,7 +528,7 @@ pub const Bucket = struct {
             .allocator = ally,
             .pageCache = PageCache.init(ally, std.math.maxInt(usize)),
             .indexes = .init(ally),
-            .autoVaccuum = options.autoVaccuum,
+            .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .in_memory = true,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
@@ -587,7 +587,7 @@ pub const Bucket = struct {
             .header = .read(header_bytes[0..BucketHeader.byteSize]),
             .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
-            .autoVaccuum = options.autoVaccuum,
+            .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
         };
@@ -2861,7 +2861,7 @@ pub const Bucket = struct {
         const cache_capacity = self.pageCache.capacity;
         var newBucket = try Bucket.openFileWithOptions(self.allocator, tempFileName, .{
             .page_cache_capacity = cache_capacity,
-            .autoVaccuum = self.autoVaccuum,
+            .auto_vaccuum = self.autoVaccuum,
         });
         defer newBucket.deinit();
         // defer fs.deleteFileAbsolute(tempFileName) catch |err| {
@@ -2975,18 +2975,14 @@ test "Bucket.TransformIterator updates document" {
     defer bucket_arena.deinit();
     const allocator = bucket_arena.allocator();
 
+    _ = platform.deleteFile("transform-update.bucket") catch {};
     var bucket = try Bucket.init(allocator, "transform-update.bucket");
     defer {
         bucket.deinit();
         platform.deleteFile("transform-update.bucket") catch {};
     }
 
-    var insert_doc = try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "name": "Alice",
-        \\  "age": 37
-        \\}
-    );
+    var insert_doc = try bson.fmt.serialize(.{ .name = "Alice", .age = 37 }, allocator);
     defer insert_doc.deinit(allocator);
     _ = try bucket.insert(insert_doc);
 
@@ -2994,13 +2990,7 @@ test "Bucket.TransformIterator updates document" {
     defer query_arena.deinit();
     const q_alloc = query_arena.allocator();
 
-    var query_doc = try bson.BSONDocument.fromJSON(q_alloc,
-        \\{
-        \\  "query": {
-        \\    "name": "Alice"
-        \\  }
-        \\}
-    );
+    var query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "Alice" } }, q_alloc);
     defer query_doc.deinit(q_alloc);
 
     var q = try query.Query.parse(q_alloc, query_doc);
@@ -3021,12 +3011,7 @@ test "Bucket.TransformIterator updates document" {
         else => unreachable,
     };
 
-    var updated_doc = try bson.BSONDocument.fromJSON(q_alloc,
-        \\{
-        \\  "name": "Alice",
-        \\  "age": 42
-        \\}
-    );
+    var updated_doc = try bson.fmt.serialize(.{ .name = "Alice", .age = 42 }, q_alloc);
     defer updated_doc.deinit(q_alloc);
 
     try iter.transform(&updated_doc);
@@ -3034,13 +3019,9 @@ test "Bucket.TransformIterator updates document" {
     const after = try iter.data();
     try testing.expect(after == null);
 
-    var check_query_doc = try bson.BSONDocument.fromJSON(q_alloc,
-        \\{
-        \\  "query": {
-        \\    "name": "Alice"
-        \\  },
-        \\  "sector": {}
-        \\}
+    var check_query_doc = try bson.fmt.serialize(
+        .{ .query = .{ .name = "Alice" }, .sector = .{} },
+        q_alloc,
     );
     defer check_query_doc.deinit(q_alloc);
 
@@ -3073,18 +3054,14 @@ test "Bucket.TransformIterator deletes document when null transform" {
     // defer bucket_arena.deinit();
     const allocator = std.testing.allocator;
 
+    _ = platform.deleteFile("transform-delete.bucket") catch {};
     var bucket = try Bucket.init(allocator, "transform-delete.bucket");
     defer {
         bucket.deinit();
         platform.deleteFile("transform-delete.bucket") catch {};
     }
 
-    var insert_doc = try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "name": "Bob",
-        \\  "age": 30
-        \\}
-    );
+    var insert_doc = try bson.fmt.serialize(.{ .name = "Bob", .age = 30 }, allocator);
     defer insert_doc.deinit(allocator);
     _ = try bucket.insert(insert_doc);
 
@@ -3092,13 +3069,7 @@ test "Bucket.TransformIterator deletes document when null transform" {
     defer query_arena.deinit();
     const q_alloc = query_arena.allocator();
 
-    var query_doc = try bson.BSONDocument.fromJSON(q_alloc,
-        \\{
-        \\  "query": {
-        \\    "name": "Bob"
-        \\  }
-        \\}
-    );
+    var query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "Bob" } }, q_alloc);
     defer query_doc.deinit(q_alloc);
 
     var q = try query.Query.parse(q_alloc, query_doc);
@@ -3120,13 +3091,7 @@ test "Bucket.TransformIterator deletes document when null transform" {
     const drained = try iter.data();
     try testing.expect(drained == null);
 
-    var check_query_doc = try bson.BSONDocument.fromJSON(q_alloc,
-        \\{
-        \\  "query": {
-        \\    "name": "Bob"
-        \\  }
-        \\}
-    );
+    var check_query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "Bob" } }, q_alloc);
     defer check_query_doc.deinit(q_alloc);
 
     var check_query = try query.Query.parse(q_alloc, check_query_doc);
@@ -3151,21 +3116,14 @@ test "Bucket.insert" {
     };
 
     // Create a new BSON document
-    const doc = try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "name": "Alice",
-        \\  "age": 37
-        \\}
-    );
+    var doc = try bson.fmt.serialize(.{ .name = "Alice", .age = 37 }, allocator);
+    defer doc.deinit(allocator);
 
     // Insert the document into the bucket
     _ = try bucket.insert(doc);
 
-    const q1 = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "sector": {}
-        \\}
-    ));
+    const qDoc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
+    const q1 = try query.Query.parse(allocator, qDoc);
 
     var res1list = std.ArrayList(BSONDocument){};
     defer res1list.deinit(allocator);
@@ -3178,11 +3136,9 @@ test "Bucket.insert" {
     try testing.expect(res1.len == 1);
     try testing.expectEqualStrings(res1[0].get("name").?.string.value, "Alice");
 
-    const q2 = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "query": {"name": "Alice"}
-        \\}
-    ));
+    var q2Doc = try bson.fmt.serialize(.{ .query = .{ .name = "Alice" } }, allocator);
+    defer q2Doc.deinit(allocator);
+    const q2 = try query.Query.parse(allocator, q2Doc);
 
     var res2list = std.ArrayList(BSONDocument){};
     defer res2list.deinit(allocator);
@@ -3209,11 +3165,8 @@ test "Bucket.dump supports :memory: storage" {
     var in_mem_bucket = try Bucket.init(allocator, ":memory:");
     defer in_mem_bucket.deinit();
 
-    const doc = try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "name": "InMemory"
-        \\}
-    );
+    var doc = try bson.fmt.serialize(.{ .name = "InMemory" }, allocator);
+    defer doc.deinit(allocator);
     _ = try in_mem_bucket.insert(doc);
 
     const dump_path = "memory_dump.bucket";
@@ -3226,11 +3179,9 @@ test "Bucket.dump supports :memory: storage" {
     var disk_bucket = try Bucket.init(allocator, dump_path);
     defer disk_bucket.deinit();
 
-    const q = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "sector": {}
-        \\}
-    ));
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
+    defer qDoc.deinit(allocator);
+    const q = try query.Query.parse(allocator, qDoc);
 
     var iter = try disk_bucket.listIterate(&arena, q);
     defer {
@@ -3250,52 +3201,21 @@ fn setupIndexQueryBucket(bucket: *Bucket, allocator: std.mem.Allocator) !void {
     try bucket.ensureIndex("scores", .{ .sparse = 1 });
     try bucket.ensureIndex("name", .{});
 
-    const alice_scores_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 5 } }),
-        bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 7 } }),
-    };
-    var alice_scores = try bson.BSONDocument.fromPairs(allocator, @constCast(alice_scores_pairs[0..]));
-    defer alice_scores.deinit(allocator);
+    var alice_doc = try bson.fmt.serialize(.{ .name = "Alice", .age = 30, .scores = [_]i32{ 5, 7 } }, allocator);
+    defer alice_doc.deinit(allocator);
+    _ = try bucket.insert(alice_doc);
 
-    const bob_scores_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 9 } }),
-    };
-    var bob_scores = try bson.BSONDocument.fromPairs(allocator, @constCast(bob_scores_pairs[0..]));
-    defer bob_scores.deinit(allocator);
+    var bob_doc = try bson.fmt.serialize(.{ .name = "Bob", .age = 40, .scores = [_]i32{9} }, allocator);
+    defer bob_doc.deinit(allocator);
+    _ = try bucket.insert(bob_doc);
 
-    const dora_scores_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 7 } }),
-    };
-    var dora_scores = try bson.BSONDocument.fromPairs(allocator, @constCast(dora_scores_pairs[0..]));
-    defer dora_scores.deinit(allocator);
+    var carol_doc = try bson.fmt.serialize(.{ .name = "Carol", .age = 50 }, allocator);
+    defer carol_doc.deinit(allocator);
+    _ = try bucket.insert(carol_doc);
 
-    const doc_pairs = [_][]const bson.BSONKeyValuePair{
-        &[_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Alice" } }),
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
-            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .array = alice_scores }),
-        },
-        &[_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Bob" } }),
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 40 } }),
-            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .array = bob_scores }),
-        },
-        &[_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Carol" } }),
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 50 } }),
-        },
-        &[_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Dora" } }),
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 35 } }),
-            bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .array = dora_scores }),
-        },
-    };
-
-    for (doc_pairs) |pairs| {
-        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs));
-        _ = try bucket.insert(doc);
-        doc.deinit(allocator);
-    }
+    var dora_doc = try bson.fmt.serialize(.{ .name = "Dora", .age = 35, .scores = [_]i32{7} }, allocator);
+    defer dora_doc.deinit(allocator);
+    _ = try bucket.insert(dora_doc);
 }
 
 test "Bucket.indexed query equality uses range" {
@@ -3308,16 +3228,7 @@ test "Bucket.indexed query equality uses range" {
     defer bucket.deinit();
     defer platform.deleteFile("index-query-eq.bucket") catch {};
 
-    const age_filter_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
-    };
-    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-    defer age_filter_doc.deinit(allocator);
-
-    const root_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-    };
-    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = 30 } }, allocator);
     defer qdoc.deinit(allocator);
 
     var q = try query.Query.parse(allocator, qdoc);
@@ -3349,22 +3260,7 @@ test "Bucket.indexed query startsWith uses range" {
     defer bucket.deinit();
     defer platform.deleteFile("index-query-startswith.bucket") catch {};
 
-    const name_prefix_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("$startsWith", bson.BSONValue{ .string = .{ .value = "A" } }),
-    };
-    var name_prefix_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(name_prefix_pairs[0..]));
-    defer name_prefix_doc.deinit(allocator);
-
-    const name_filter_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .document = name_prefix_doc }),
-    };
-    var name_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(name_filter_pairs[0..]));
-    defer name_filter_doc.deinit(allocator);
-
-    const root_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = name_filter_doc }),
-    };
-    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    var qdoc = try bson.fmt.serialize(.{ .query = .{ .name = .{ .@"$startsWith" = "A" } } }, allocator);
     defer qdoc.deinit(allocator);
 
     var q = try query.Query.parse(allocator, qdoc);
@@ -3398,23 +3294,10 @@ test "Bucket.indexed query range bounds combine" {
     defer bucket.deinit();
     defer platform.deleteFile("index-query-range.bucket") catch {};
 
-    const age_range_ops = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("$gte", bson.BSONValue{ .int32 = .{ .value = 35 } }),
-        bson.BSONKeyValuePair.init("$lte", bson.BSONValue{ .int32 = .{ .value = 40 } }),
-    };
-    var age_range_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_range_ops[0..]));
-    defer age_range_doc.deinit(allocator);
-
-    const age_filter_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_range_doc }),
-    };
-    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-    defer age_filter_doc.deinit(allocator);
-
-    const root_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-    };
-    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    var qdoc = try bson.fmt.serialize(
+        .{ .query = .{ .age = .{ .@"$gte" = 35, .@"$lte" = 40 } } },
+        allocator,
+    );
     defer qdoc.deinit(allocator);
 
     var q = try query.Query.parse(allocator, qdoc);
@@ -3470,29 +3353,7 @@ test "Bucket.indexed query in uses points" {
     defer bucket.deinit();
     defer platform.deleteFile("index-query-in.bucket") catch {};
 
-    const in_values_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 30 } }),
-        bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 40 } }),
-    };
-    var in_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(in_values_pairs[0..]));
-    defer in_values_doc.deinit(allocator);
-
-    const age_in_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = in_values_doc }),
-    };
-    var age_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_in_pairs[0..]));
-    defer age_in_doc.deinit(allocator);
-
-    const age_filter_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_in_doc }),
-    };
-    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-    defer age_filter_doc.deinit(allocator);
-
-    const root_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-    };
-    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = .{ .@"$in" = [_]i32{ 30, 40 } } } }, allocator);
     defer qdoc.deinit(allocator);
 
     var q = try query.Query.parse(allocator, qdoc);
@@ -3535,29 +3396,7 @@ test "Bucket.indexed query between uses range" {
     defer bucket.deinit();
     defer platform.deleteFile("index-query-between.bucket") catch {};
 
-    const between_values_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 29 } }),
-        bson.BSONKeyValuePair.init("1", bson.BSONValue{ .int32 = .{ .value = 38 } }),
-    };
-    var between_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(between_values_pairs[0..]));
-    defer between_values_doc.deinit(allocator);
-
-    const age_between_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("$between", bson.BSONValue{ .array = between_values_doc }),
-    };
-    var age_between_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_between_pairs[0..]));
-    defer age_between_doc.deinit(allocator);
-
-    const age_filter_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .document = age_between_doc }),
-    };
-    var age_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_filter_pairs[0..]));
-    defer age_filter_doc.deinit(allocator);
-
-    const root_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_filter_doc }),
-    };
-    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = .{ .@"$between" = [_]i32{ 29, 38 } } } }, allocator);
     defer qdoc.deinit(allocator);
 
     var q = try query.Query.parse(allocator, qdoc);
@@ -3597,28 +3436,7 @@ test "Bucket.indexed query in scores avoids duplicates" {
     defer bucket.deinit();
     defer platform.deleteFile("index-query-scores.bucket") catch {};
 
-    const score_values_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("0", bson.BSONValue{ .int32 = .{ .value = 7 } }),
-    };
-    var score_values_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(score_values_pairs[0..]));
-    defer score_values_doc.deinit(allocator);
-
-    const scores_in_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("$in", bson.BSONValue{ .array = score_values_doc }),
-    };
-    var scores_in_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_in_pairs[0..]));
-    defer scores_in_doc.deinit(allocator);
-
-    const scores_filter_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("scores", bson.BSONValue{ .document = scores_in_doc }),
-    };
-    var scores_filter_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(scores_filter_pairs[0..]));
-    defer scores_filter_doc.deinit(allocator);
-
-    const root_pairs_scores = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = scores_filter_doc }),
-    };
-    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs_scores[0..]));
+    var qdoc = try bson.fmt.serialize(.{ .query = .{ .scores = .{ .@"$in" = [_]i32{7} } } }, allocator);
     defer qdoc.deinit(allocator);
 
     var q = try query.Query.parse(allocator, qdoc);
@@ -3695,26 +3513,18 @@ test "Page overflow" {
     defer platform.deleteFile("overflow.bucket") catch {
         // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
-    const jsonBuf = try testing.allocator.alloc(u8, 300);
-    defer testing.allocator.free(jsonBuf);
     for (0..900) |i| {
-        const docMany = try bson.BSONDocument.fromJSON(allocator, try std.fmt.bufPrint(jsonBuf,
-            \\{{
-            \\  "name": "test-{d}",
-            \\  "age": 10
-            \\}}
-        , .{i}));
+        const name = try std.fmt.allocPrint(allocator, "test-{d}", .{i});
+        const docMany = try bson.fmt.serialize(.{ .name = name, .age = 10 }, allocator);
 
         _ = try bucket.insert(docMany);
-        @memset(jsonBuf, 0);
+        allocator.free(name);
         allocator.free(docMany.buffer);
     }
 
-    const q1 = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "sector": {}
-        \\}
-    ));
+    var q1Doc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
+    defer q1Doc.deinit(allocator);
+    const q1 = try query.Query.parse(allocator, q1Doc);
 
     var res3list = std.ArrayList(BSONDocument){};
     defer res3list.deinit(allocator);
@@ -3739,21 +3549,15 @@ test "Bucket.delete" {
     };
 
     // Create a new BSON document
-    const doc = try bson.BSONDocument.fromJSON(allocator,
-        \\ {
-        \\  "name": "Alice",
-        \\  "age": "delete me"
-        \\ }
-    );
+    var doc = try bson.fmt.serialize(.{ .name = "Alice", .age = "delete me" }, allocator);
+    defer doc.deinit(allocator);
 
     // Insert the document into the bucket
     _ = try bucket.insert(doc);
 
-    const listQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "query": {}
-        \\}
-    ));
+    var listQDoc = try bson.fmt.serialize(.{ .query = .{} }, allocator);
+    defer listQDoc.deinit(allocator);
+    const listQ = try query.Query.parse(allocator, listQDoc);
 
     var docsList = std.ArrayList(BSONDocument){};
     defer docsList.deinit(allocator);
@@ -3767,11 +3571,9 @@ test "Bucket.delete" {
     // std.debug.print("Doc len before vacuum {d}\n", .{docCount});
     try std.testing.expect(docCount == 1);
 
-    const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "query": {"name": "Alice"}
-        \\}
-    ));
+    var deleteQDoc = try bson.fmt.serialize(.{ .query = .{ .name = "Alice" } }, allocator);
+    defer deleteQDoc.deinit(allocator);
+    const deleteQ = try query.Query.parse(allocator, deleteQDoc);
     // Delete the document from the bucket
     _ = try bucket.delete(deleteQ);
 
@@ -3813,29 +3615,19 @@ test "Deleted docs disappear after vacuum" {
     };
 
     // Create a new BSON document
-    const doc = try bson.BSONDocument.fromJSON(allocator,
-        \\ {
-        \\  "name": "Alice",
-        \\  "age": "delete me"
-        \\ }
-    );
+    var doc = try bson.fmt.serialize(.{ .name = "Alice", .age = "delete me" }, allocator);
+    defer doc.deinit(allocator);
 
-    const docGood = try bson.BSONDocument.fromJSON(allocator,
-        \\ {
-        \\  "name": "not Alice",
-        \\  "age": "delete me"
-        \\ }
-    );
+    var docGood = try bson.fmt.serialize(.{ .name = "not Alice", .age = "delete me" }, allocator);
+    defer docGood.deinit(allocator);
 
     // Insert the document into the bucket
     _ = try bucket.insert(doc);
     _ = try bucket.insert(docGood);
 
-    const listQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "query": {}
-        \\}
-    ));
+    var listQDoc = try bson.fmt.serialize(.{ .query = .{} }, allocator);
+    defer listQDoc.deinit(allocator);
+    const listQ = try query.Query.parse(allocator, listQDoc);
 
     var docsList = std.ArrayList(BSONDocument){};
     defer docsList.deinit(allocator);
@@ -3844,11 +3636,9 @@ test "Deleted docs disappear after vacuum" {
         try docsList.append(allocator, docItem);
     }
 
-    const deleteQ = try query.Query.parse(allocator, try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "query": {"name": "Alice"}
-        \\}
-    ));
+    var deleteQDoc = try bson.fmt.serialize(.{ .query = .{ .name = "Alice" } }, allocator);
+    defer deleteQDoc.deinit(allocator);
+    const deleteQ = try query.Query.parse(allocator, deleteQDoc);
 
     bucket.delete(deleteQ) catch |err| {
         std.debug.print("Failed to delete document: {any}\n", .{err});
@@ -3925,22 +3715,14 @@ test "Bucket.reverse index with sort queries" {
     };
 
     for (test_docs) |td| {
-        const pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = td.name } }),
-            bson.BSONKeyValuePair.init("score", bson.BSONValue{ .int32 = .{ .value = td.score } }),
-        };
-        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs[0..]));
+        var doc = try bson.fmt.serialize(.{ .name = td.name, .score = td.score }, allocator);
         _ = try bucket.insert(doc);
         doc.deinit(allocator);
     }
 
     // Test 1: Query with descending sort should use the reverse index (sort_covered = true)
     {
-        var query_doc = try bson.BSONDocument.fromJSON(allocator,
-            \\{
-            \\  "sort": {"desc": "score"}
-            \\}
-        );
+        var query_doc = try bson.fmt.serialize(.{ .sort = .{ .desc = "score" } }, allocator);
         defer query_doc.deinit(allocator);
 
         var q = try query.Query.parse(allocator, query_doc);
@@ -3968,11 +3750,7 @@ test "Bucket.reverse index with sort queries" {
 
     // Test 2: Query with ascending sort should NOT use reverse index efficiently (sort_covered = false)
     {
-        var query_doc = try bson.BSONDocument.fromJSON(allocator,
-            \\{
-            \\  "sort": {"asc": "score"}
-            \\}
-        );
+        var query_doc = try bson.fmt.serialize(.{ .sort = .{ .asc = "score" } }, allocator);
         defer query_doc.deinit(allocator);
 
         var q = try query.Query.parse(allocator, query_doc);
@@ -3999,13 +3777,12 @@ test "Bucket.reverse index with sort queries" {
 
     // Test 3: Range query with descending sort on reverse index
     {
-        var query_doc = try bson.BSONDocument.fromJSON(allocator,
-            \\{
-            \\  "query": {
-            \\    "score": {"$gte": 20, "$lte": 40}
-            \\  },
-            \\  "sort": {"desc": "score"}
-            \\}
+        var query_doc = try bson.fmt.serialize(
+            .{
+                .query = .{ .score = .{ .@"$gte" = 20, .@"$lte" = 40 } },
+                .sort = .{ .desc = "score" },
+            },
+            allocator,
         );
         defer query_doc.deinit(allocator);
 
@@ -4093,11 +3870,7 @@ test "Bucket.replication with page streaming" {
     };
 
     for (test_docs) |td| {
-        const pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = td.name } }),
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = td.age } }),
-        };
-        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs[0..]));
+        var doc = try bson.fmt.serialize(.{ .name = td.name, .age = td.age }, allocator);
         _ = try primary.insert(doc);
         doc.deinit(allocator);
     }
@@ -4113,11 +3886,7 @@ test "Bucket.replication with page streaming" {
     replica.pageCache.clear(allocator);
 
     // Query replica to verify data was replicated
-    var query_doc = try bson.BSONDocument.fromJSON(allocator,
-        \\{
-        \\  "sector": {}
-        \\}
-    );
+    var query_doc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
     defer query_doc.deinit(allocator);
 
     var q = try query.Query.parse(allocator, query_doc);
@@ -4163,11 +3932,7 @@ test "Bucket.replication with page streaming" {
     };
 
     for (more_docs) |td| {
-        const pairs = [_]bson.BSONKeyValuePair{
-            bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = td.name } }),
-            bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = td.age } }),
-        };
-        var doc = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs[0..]));
+        var doc = try bson.fmt.serialize(.{ .name = td.name, .age = td.age }, allocator);
         _ = try primary.insert(doc);
         doc.deinit(allocator);
     }
@@ -4208,33 +3973,16 @@ test "Deleting removes index entries for scalar field" {
     try bucket.ensureIndex("age", .{});
 
     // Insert two docs; only one matches age = 42
-    const pairs_a = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Zed" } }),
-        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 42 } }),
-    };
-    var doc_a = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs_a[0..]));
+    var doc_a = try bson.fmt.serialize(.{ .name = "Zed", .age = 42 }, allocator);
     _ = try bucket.insert(doc_a);
     doc_a.deinit(allocator);
 
-    const pairs_b = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Other" } }),
-        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 30 } }),
-    };
-    var doc_b = try bson.BSONDocument.fromPairs(allocator, @constCast(pairs_b[0..]));
+    var doc_b = try bson.fmt.serialize(.{ .name = "Other", .age = 30 }, allocator);
     _ = try bucket.insert(doc_b);
     doc_b.deinit(allocator);
 
     // Build equality query on age to ensure index plan
-    const age_eq_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("age", bson.BSONValue{ .int32 = .{ .value = 42 } }),
-    };
-    var age_eq_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(age_eq_pairs[0..]));
-    defer age_eq_doc.deinit(allocator);
-
-    const root_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = age_eq_doc }),
-    };
-    var qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(root_pairs[0..]));
+    var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = 42 } }, allocator);
     defer qdoc.deinit(allocator);
     var q = try query.Query.parse(allocator, qdoc);
     defer q.deinit(allocator);
@@ -4252,15 +4000,7 @@ test "Deleting removes index entries for scalar field" {
     try testing.expectEqual(@as(usize, 1), count_before);
 
     // Delete the matching document by name
-    const del_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("name", bson.BSONValue{ .string = .{ .value = "Zed" } }),
-    };
-    var del_doc = try bson.BSONDocument.fromPairs(allocator, @constCast(del_pairs[0..]));
-    defer del_doc.deinit(allocator);
-    const del_root_pairs = [_]bson.BSONKeyValuePair{
-        bson.BSONKeyValuePair.init("query", bson.BSONValue{ .document = del_doc }),
-    };
-    var del_qdoc = try bson.BSONDocument.fromPairs(allocator, @constCast(del_root_pairs[0..]));
+    var del_qdoc = try bson.fmt.serialize(.{ .query = .{ .name = "Zed" } }, allocator);
     defer del_qdoc.deinit(allocator);
     var del_q = try query.Query.parse(allocator, del_qdoc);
     defer del_q.deinit(allocator);

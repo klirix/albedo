@@ -226,15 +226,7 @@ pub const Filter = union(FilterType) {
 
 test "Filter.parse" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$eq", .value = .{ .string = bson.BSONString{ .value = "value" } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "field.subfield", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .@"field.subfield" = .{ .@"$eq" = "value" } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -254,15 +246,7 @@ test "Filter.parse" {
 
 test "Filter.parse handles gte" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$gte", .value = .{ .int32 = .{ .value = 10 } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "score", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .score = .{ .@"$gte" = 10 } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -281,15 +265,7 @@ test "Filter.parse handles gte" {
 
 test "Filter.parse handles lte" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$lte", .value = .{ .int32 = .{ .value = 20 } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "score", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .score = .{ .@"$lte" = 20 } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -308,15 +284,7 @@ test "Filter.parse handles lte" {
 
 test "Filter.parse handles startsWith" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$startsWith", .value = .{ .string = bson.BSONString{ .value = "prefix" } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "name", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .name = .{ .@"$startsWith" = "prefix" } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -335,15 +303,7 @@ test "Filter.parse handles startsWith" {
 
 test "Filter.matchValue startsWith matches correctly" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$startsWith", .value = .{ .string = bson.BSONString{ .value = "hello" } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "message", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .message = .{ .@"$startsWith" = "hello" } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -376,15 +336,7 @@ test "Filter.matchValue startsWith matches correctly" {
 
 test "Filter.matchValue startsWith with empty prefix" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$startsWith", .value = .{ .string = bson.BSONString{ .value = "" } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "message", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .message = .{ .@"$startsWith" = "" } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -403,15 +355,7 @@ test "Filter.matchValue startsWith with empty prefix" {
 
 test "Filter.parse handles endsWith" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$endsWith", .value = .{ .string = bson.BSONString{ .value = "suffix" } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "filename", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .filename = .{ .@"$endsWith" = "suffix" } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -430,15 +374,7 @@ test "Filter.parse handles endsWith" {
 
 test "Filter.matchValue endsWith matches correctly" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$endsWith", .value = .{ .string = bson.BSONString{ .value = ".txt" } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "filename", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .filename = .{ .@"$endsWith" = ".txt" } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -471,15 +407,7 @@ test "Filter.matchValue endsWith matches correctly" {
 
 test "Filter.matchValue endsWith with empty suffix" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$endsWith", .value = .{ .string = bson.BSONString{ .value = "" } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "filename", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .filename = .{ .@"$endsWith" = "" } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -498,15 +426,7 @@ test "Filter.matchValue endsWith with empty suffix" {
 
 test "Filter.parse handles exists" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$exists", .value = .{ .boolean = .{ .value = true } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "email", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .email = .{ .@"$exists" = true } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -524,15 +444,7 @@ test "Filter.parse handles exists" {
 
 test "Filter.matchValue exists always returns true" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$exists", .value = .{ .boolean = .{ .value = true } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "field", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .field = .{ .@"$exists" = true } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -554,15 +466,7 @@ test "Filter.matchValue exists always returns true" {
 
 test "Filter.match exists checks field presence in document" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$exists", .value = .{ .boolean = .{ .value = true } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "email", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .email = .{ .@"$exists" = true } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -586,15 +490,7 @@ test "Filter.match exists checks field presence in document" {
 
 test "Filter.parse handles notExists" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$notExists", .value = .{ .boolean = .{ .value = true } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "deletedAt", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .deletedAt = .{ .@"$notExists" = true } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -612,15 +508,7 @@ test "Filter.parse handles notExists" {
 
 test "Filter.matchValue notExists always returns false" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$notExists", .value = .{ .boolean = .{ .value = true } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "field", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .field = .{ .@"$notExists" = true } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -642,15 +530,7 @@ test "Filter.matchValue notExists always returns false" {
 
 test "Filter.match notExists checks field absence in document" {
     const ally = std.testing.allocator;
-    var opPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "$notExists", .value = .{ .boolean = .{ .value = true } } },
-    };
-    const opDoc = try bson.BSONDocument.fromPairs(ally, &opPairs);
-    defer opDoc.deinit(ally);
-    var filterPairs = [_]bson.BSONKeyValuePair{
-        .{ .key = "deletedAt", .value = .{ .document = opDoc } },
-    };
-    const filterDoc = try bson.BSONDocument.fromPairs(ally, &filterPairs);
+    const filterDoc = try bson.fmt.serialize(.{ .deletedAt = .{ .@"$notExists" = true } }, ally);
     defer filterDoc.deinit(ally);
     const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
     defer {
@@ -712,9 +592,7 @@ const SortConfig = union(SortType) {
 
 test "Sort.parse" {
     const ally = std.testing.allocator;
-    const sortDoc = try bson.BSONDocument.fromTuple(ally, .{
-        .asc = bson.BSONValue{ .string = bson.BSONString{ .value = "field" } },
-    });
+    const sortDoc = try bson.fmt.serialize(.{ .asc = "field" }, ally);
     defer sortDoc.deinit(ally);
     const sort = try SortConfig.parse(bson.BSONValue{ .document = sortDoc });
 
@@ -787,10 +665,7 @@ const Sector = struct {
 
 test "Sector.parse" {
     const ally = std.testing.allocator;
-    const sectorDoc = try bson.BSONDocument.fromTuple(ally, .{
-        .offset = bson.BSONValue{ .int32 = .{ .value = 10 } },
-        .limit = bson.BSONValue{ .int32 = .{ .value = 10 } },
-    });
+    const sectorDoc = try bson.fmt.serialize(.{ .offset = 10, .limit = 10 }, ally);
     defer sectorDoc.deinit(ally);
     const sector = try Sector.parse(&bson.BSONValue{ .document = sectorDoc });
     try std.testing.expectEqual(sector.offset, 10);
@@ -878,15 +753,20 @@ test "Query.parse" {
     const ally = arena.allocator();
     defer arena.deinit();
 
-    const queryDoc = try bson.BSONDocument.fromJSON(ally,
-        \\ {
-        \\   "query": {
-        \\      "field.subfield": {"$eq": "value"}
-        \\   },
-        \\   "sort": {"asc": "field"},
-        \\   "sector": {"offset": 0, "limit": 10}
-        \\ }
-    );
+    const queryDoc = try bson.fmt.serialize(.{
+        .query = .{
+            .@"field.subfield" = .{
+                .@"$eq" = "value",
+            },
+        },
+        .sort = .{
+            .asc = "field",
+        },
+        .sector = .{
+            .offset = 0,
+            .limit = 10,
+        },
+    }, ally);
     // const buffer = try ally.alloc(u8, queryDoc.len);
     // queryDoc.serializeToMemory(buffer);
     var query = try Query.parse(ally, queryDoc);

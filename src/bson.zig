@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 pub const ObjectId = @import("./object_id.zig").ObjectId;
+pub const fmt = @import("./bson_formatter.zig");
 
 pub const BSONString = struct {
     // code: i8, // 0x02
@@ -365,6 +366,57 @@ pub const BSONValue = union(BSONValueType) {
     maxKey: BSONMaxKey,
     minKey: BSONMinKey,
 
+    pub const FromNativeError = error{
+        IntegerOverflow,
+    };
+
+    pub fn fromNative(comptime T: type, value: T) FromNativeError!?BSONValue {
+        return switch (@typeInfo(T)) {
+            .bool => BSONValue{ .boolean = .{ .value = value } },
+            .float => BSONValue{ .double = .{ .value = @as(f64, @floatCast(value)) } },
+            .int => |int_info| blk: {
+                if (int_info.signedness == .signed and int_info.bits <= 32) {
+                    const casted_i32 = std.math.cast(i32, value) orelse return error.IntegerOverflow;
+                    break :blk BSONValue{ .int32 = .{ .value = casted_i32 } };
+                }
+                const casted_i64 = std.math.cast(i64, value) orelse return error.IntegerOverflow;
+                break :blk BSONValue{ .int64 = .{ .value = casted_i64 } };
+            },
+            .comptime_int => blk: {
+                if (std.math.cast(i32, value)) |casted_i32| {
+                    break :blk BSONValue{ .int32 = .{ .value = casted_i32 } };
+                }
+                if (std.math.cast(i64, value)) |casted_i64| {
+                    break :blk BSONValue{ .int64 = .{ .value = casted_i64 } };
+                }
+                return error.IntegerOverflow;
+            },
+            .pointer => |ptr| switch (ptr.size) {
+                .slice => if (ptr.child == u8) BSONValue{ .string = .{ .value = value } } else null,
+                .one => blk: {
+                    const child_info = @typeInfo(ptr.child);
+                    if (child_info == .array) {
+                        const arr = child_info.array;
+                        if (arr.child == u8 and arr.sentinel() != null) {
+                            break :blk BSONValue{ .string = .{ .value = value[0..value.len] } };
+                        }
+                    }
+                    break :blk null;
+                },
+                else => null,
+            },
+            .array => |arr| if (arr.child == u8 and arr.sentinel() != null)
+                BSONValue{ .string = .{ .value = value[0..value.len] } }
+            else
+                null,
+            .@"struct" => if (T == ObjectId)
+                BSONValue{ .objectId = .{ .value = value } }
+            else
+                null,
+            else => null,
+        };
+    }
+
     pub fn init(value: anytype) BSONValue {
         return switch (@TypeOf(value)) {
             i32 => BSONValue{ .int32 = BSONInt32{ .value = value } },
@@ -379,7 +431,7 @@ pub const BSONValue = union(BSONValueType) {
 
     pub fn format(
         self: @This(),
-        comptime fmt: []const u8,
+        comptime formatString: []const u8,
         opts: std.fmt.FormatOptions,
         writer: anytype,
     ) @TypeOf(writer).Error!void {
@@ -387,8 +439,8 @@ pub const BSONValue = union(BSONValueType) {
             .string => try std.fmt.format(writer, "\"{s}\"", .{self.string.value}),
             .double => try std.fmt.format(writer, "{d}", .{self.double.value}),
             .int32 => try std.fmt.format(writer, "{d}", .{self.int32.value}),
-            .document => try self.document.format(fmt, opts, writer),
-            .array => try self.array.format(fmt, opts, writer),
+            .document => try self.document.format(formatString, opts, writer),
+            .array => try self.array.format(formatString, opts, writer),
             .datetime => try std.fmt.format(writer, "{d}", .{self.datetime.value}),
             .int64 => try std.fmt.format(writer, "{d}", .{self.int64.value}),
             .binary => try std.fmt.format(writer, "Binary{{{s}}}", .{self.binary.value}),
@@ -643,10 +695,7 @@ pub const BSONValue = union(BSONValueType) {
 };
 
 test "BSONValue.eql array -> int32" {
-    const array = try BSONDocument.fromTuple(std.testing.allocator, .{
-        .@"0" = BSONValue{ .int32 = .{ .value = 123 } },
-        .@"1" = BSONValue{ .int32 = .{ .value = 123 } },
-    });
+    const array = try fmt.serialize(.{ .@"0" = 123, .@"1" = 123 }, std.testing.allocator);
     const doc = BSONValue{ .array = array };
     defer array.deinit(std.testing.allocator);
     const other = BSONValue{ .int32 = BSONInt32{ .value = 123 } };
@@ -791,47 +840,6 @@ pub const BSONDocument = struct {
         defer jsonStream.deinit();
 
         return .{ .buffer = try jsonToDoc(&jsonStream, ally) };
-    }
-
-    pub fn fromTuple(ally: mem.Allocator, comptime tuple: anytype) !BSONDocument {
-        // asses doc size
-        const T = @TypeOf(tuple);
-        const fields = @typeInfo(T).@"struct".fields;
-        comptime var size: u32 = 4; // Placeholder for length
-        inline for (fields) |field| {
-            const value: BSONValue = @field(tuple, field.name);
-            size += comptime value.size() + field.name.len + 2;
-        }
-        size += 1; // Null terminator for the document
-        const buffer = try ally.alloc(u8, size);
-        std.mem.writeInt(u32, buffer[0..4], size, .little);
-        var idx: u32 = 4;
-        inline for (fields) |field| {
-            const value: BSONValue = @field(tuple, field.name);
-            buffer[idx] = @intFromEnum(value.valueType());
-            idx += 1;
-            std.mem.copyForwards(u8, buffer[idx..], field.name);
-            idx += field.name.len;
-            buffer[idx] = 0x00;
-            idx += 1;
-            // std.mem.copyForwards(u8, buffer[idx..], &value);
-            switch (value) {
-                .string => |s| s.write(buffer[idx..]),
-                .double => |s| s.write(buffer[idx..]),
-                .int32 => |s| s.write(buffer[idx..]),
-                .int64 => |s| s.write(buffer[idx..]),
-                .datetime => |s| s.write(buffer[idx..]),
-                .binary => |s| s.write(buffer[idx..]),
-                .boolean => buffer[idx] = if (value.boolean.value) 0x01 else 0x00,
-                .null => {},
-                else => unreachable,
-            }
-            idx += value.size();
-        }
-        buffer[idx] = 0x00; // Null terminator for the document
-
-        // std.debug.print("{any}", .{buffer});
-        return BSONDocument{ .buffer = buffer };
     }
 
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
@@ -1018,7 +1026,7 @@ pub const BSONDocument = struct {
 
     pub fn format(
         self: BSONDocument,
-        comptime fmt: []const u8,
+        comptime formatString: []const u8,
         opts: std.fmt.FormatOptions,
         writer: anytype,
     ) @TypeOf(writer).Error!void {
@@ -1032,7 +1040,7 @@ pub const BSONDocument = struct {
             first = false;
             try writer.writeAll(pair.key);
             try writer.writeAll(": ");
-            try pair.value.format(fmt, opts, writer);
+            try pair.value.format(formatString, opts, writer);
         }
         try writer.writeAll(" }");
     }
@@ -1053,9 +1061,7 @@ pub const BSONDocument = struct {
 
     test "Document.getPath single value" {
         const ally = std.testing.allocator;
-        var doc = try BSONDocument.fromTuple(ally, .{
-            .key = BSONValue{ .string = .{ .value = "test" } },
-        });
+        var doc = try fmt.serialize(.{ .key = "test" }, ally);
 
         defer doc.deinit(ally);
 
@@ -1188,9 +1194,7 @@ pub const BSONDocument = struct {
 
 test "format" {
     const allocator = std.testing.allocator;
-    var doc = try BSONDocument.fromTuple(allocator, .{
-        .key = BSONValue{ .string = .{ .value = "test" } },
-    });
+    var doc = try fmt.serialize(.{ .key = "test" }, allocator);
     defer doc.deinit(allocator);
 
     var arrList = std.ArrayList(u8){};
@@ -1216,9 +1220,7 @@ test "BSONDocument write" {
 
 test "BSONDocument serializeToMemory" {
     var allocator = std.testing.allocator;
-    var doc = try BSONDocument.fromTuple(allocator, .{
-        .key = BSONValue{ .string = .{ .value = "test" } },
-    });
+    var doc = try fmt.serialize(.{ .key = "test" }, allocator);
     defer doc.deinit(allocator);
     // std.debug.print("doc len: {d}", .{doc.buffer.len});
     const actual = allocator.alloc(u8, 100) catch unreachable;
