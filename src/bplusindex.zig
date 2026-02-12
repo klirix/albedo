@@ -1297,18 +1297,16 @@ test "reverse index with range bounds" {
     defer index.deinit();
     index.options.reverse = 1;
 
-    const entries = [_]struct { value: i32, page: u64, offset: u16 }{
-        .{ .value = 5, .page = 1, .offset = 50 },
-        .{ .value = 10, .page = 2, .offset = 100 },
-        .{ .value = 15, .page = 4, .offset = 150 },
-        .{ .value = 20, .page = 5, .offset = 200 },
-        .{ .value = 25, .page = 6, .offset = 250 },
+    const entries = [_]struct { value: i3, loc: Index.DocumentLocation }{
+        .{ .value = 5, .loc = .{ .page = 1, .offset = 50 } },
+        .{ .value = 10, .loc = .{ .page = 2, .offset = 100 } },
+        .{ .value = 15, .loc = .{ .page = 4, .offset = 150 } },
+        .{ .value = 20, .loc = .{ .page = 5, .offset = 200 } },
+        .{ .value = 25, .loc = .{ .page = 6, .offset = 250 } },
     };
 
     for (entries) |entry| {
-        const value = BSONValue{ .int32 = .{ .value = entry.value } };
-        const loc = Index.DocumentLocation{ .pageId = entry.page, .offset = entry.offset };
-        try index.insert(value, loc);
+        try index.insert(BSONValue.init(entry.value), entry.loc);
     }
 
     // First verify full scan works
