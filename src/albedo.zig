@@ -8,8 +8,10 @@ const ObjectId = @import("object_id.zig").ObjectId;
 const ObjectIdGenerator = @import("object_id.zig").ObjectIdGenerator;
 const query = @import("query.zig");
 const bindex = @import("bplusindex.zig");
+const encryption = @import("encryption.zig");
 const Index = bindex.Index;
 const IndexOptions = bindex.IndexOptions;
+const Aes256Gcm = encryption.Aes256Gcm;
 
 const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
@@ -61,8 +63,8 @@ const BucketHeader = struct {
             .reserved = undefined,
         };
 
-        std.mem.copyForwards(u8, header.magic[0..], ALBEDO_MAGIC);
-        std.mem.copyForwards(u8, header.reserved[0..], &[_]u8{0} ** 28);
+        std.mem.copyForwards(u8, header.magic[0..], memory[0..6]);
+        std.mem.copyForwards(u8, header.reserved[0..], memory[36..64]);
 
         return header;
     }
@@ -98,7 +100,7 @@ const PageHeader = struct {
     used_size: u16 = 0, // 2
     page_id: u64, // 8
     first_readable_byte: u16, // 2
-    reserved: [19]u8, // 19
+    encryption: [encryption.PAGE_HEADER_ENCRYPTION_BYTES]u8, // 19
 
     pub const byteSize = 32;
 
@@ -108,7 +110,7 @@ const PageHeader = struct {
             .used_size = 0,
             .page_id = id,
             .first_readable_byte = 0,
-            .reserved = [_]u8{0} ** 19,
+            .encryption = [_]u8{0} ** encryption.PAGE_HEADER_ENCRYPTION_BYTES,
         };
     }
 
@@ -118,7 +120,7 @@ const PageHeader = struct {
         std.mem.writeInt(u16, buffer[1..3], self.used_size, .little);
         std.mem.writeInt(u64, buffer[3..11], self.page_id, .little);
         std.mem.writeInt(u16, buffer[11..13], self.first_readable_byte, .little);
-        std.mem.copyForwards(u8, buffer[13..32], &self.reserved);
+        std.mem.copyForwards(u8, buffer[13..32], &self.encryption);
         return buffer;
     }
 
@@ -128,7 +130,7 @@ const PageHeader = struct {
             .used_size = std.mem.readInt(u16, memory[1..3], .little),
             .page_id = std.mem.readInt(u64, memory[3..11], .little),
             .first_readable_byte = std.mem.readInt(u16, memory[11..13], .little),
-            .reserved = [_]u8{0} ** 19,
+            .encryption = memory[13..32].*,
         };
         return header;
     }
@@ -280,10 +282,15 @@ const BucketInitErrors = error{
     FileReadError,
     FileWriteError,
     LoadIndexError,
+    PasswordRequired,
+    InvalidPassword,
+    UnsupportedEncryption,
     InitializationError,
     OutOfMemory,
     UnexpectedError,
 };
+
+const EncryptionContext = encryption.Context;
 
 /// Callback function type for page replication
 /// Called after pages are written and synced to disk
@@ -327,6 +334,7 @@ pub const Bucket = struct {
     dirty_pages: std.AutoHashMap(u64, void),
     replication_retry_count: u32 = 0,
     max_replication_retries: u32 = 3,
+    encryption: EncryptionContext = .{},
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -363,17 +371,138 @@ pub const Bucket = struct {
         return Bucket.openFile(allocator, path);
     }
 
-    const BucketFileMode = enum {
+    pub fn initWithPassword(allocator: std.mem.Allocator, path: []const u8, password: ?[]const u8) !Bucket {
+        return Bucket.openFileWithOptions(allocator, path, .{ .password = password });
+    }
+
+    pub const FileMode = enum {
         ReadOnly,
         ReadWrite,
     };
 
-    const OpenBucketOptions = struct {
+    pub const OpenBucketOptions = struct {
         buildIdIndex: bool = false,
-        mode: BucketFileMode = BucketFileMode.ReadWrite,
+        mode: FileMode = FileMode.ReadWrite,
         auto_vaccuum: bool = true,
         page_cache_capacity: usize = DEFAULT_PAGE_CACHE_CAPACITY,
+        password: ?[]const u8 = null,
     };
+
+    fn isEncrypted(self: *const Bucket) bool {
+        return (self.header.flags & encryption.FLAG_ENCRYPTED) != 0;
+    }
+
+    fn writeBucketEncryptionMetadata(self: *Bucket, salt: [encryption.SALT_BYTES]u8, verifier: [encryption.KEY_CHECK_BYTES]u8) void {
+        @memset(self.header.reserved[0..], 0);
+        @memcpy(
+            self.header.reserved[encryption.BUCKET_RESERVED_OFFSET_SALT .. encryption.BUCKET_RESERVED_OFFSET_SALT + encryption.SALT_BYTES],
+            &salt,
+        );
+        @memcpy(
+            self.header.reserved[encryption.BUCKET_RESERVED_OFFSET_KEY_CHECK .. encryption.BUCKET_RESERVED_OFFSET_KEY_CHECK + encryption.KEY_CHECK_BYTES],
+            &verifier,
+        );
+        self.header.flags |= encryption.FLAG_ENCRYPTED;
+        self.header.flags |= encryption.FLAG_KDF_ARGON2ID_V1;
+        self.header.flags |= encryption.FLAG_CIPHER_AES256_GCM_V1;
+    }
+
+    fn initializeBucketEncryption(self: *Bucket, password: []const u8) BucketInitErrors!void {
+        if (password.len == 0) {
+            return BucketInitErrors.PasswordRequired;
+        }
+
+        var salt: [encryption.SALT_BYTES]u8 = undefined;
+        std.crypto.random.bytes(&salt);
+
+        const key = encryption.deriveBucketKey(self.allocator, password, salt) catch {
+            return BucketInitErrors.InitializationError;
+        };
+        const verifier = encryption.computeBucketKeyCheck(key);
+
+        self.encryption = .{
+            .key = key,
+            .salt = salt,
+        };
+        self.writeBucketEncryptionMetadata(salt, verifier);
+    }
+
+    fn readBucketEncryptionSalt(self: *const Bucket) [encryption.SALT_BYTES]u8 {
+        var salt: [encryption.SALT_BYTES]u8 = undefined;
+        @memcpy(
+            salt[0..],
+            self.header.reserved[encryption.BUCKET_RESERVED_OFFSET_SALT .. encryption.BUCKET_RESERVED_OFFSET_SALT + encryption.SALT_BYTES],
+        );
+        return salt;
+    }
+
+    fn readBucketKeyVerifier(self: *const Bucket) [encryption.KEY_CHECK_BYTES]u8 {
+        var verifier: [encryption.KEY_CHECK_BYTES]u8 = undefined;
+        @memcpy(
+            verifier[0..],
+            self.header.reserved[encryption.BUCKET_RESERVED_OFFSET_KEY_CHECK .. encryption.BUCKET_RESERVED_OFFSET_KEY_CHECK + encryption.KEY_CHECK_BYTES],
+        );
+        return verifier;
+    }
+
+    fn activateEncryptionFromPassword(self: *Bucket, password: ?[]const u8) BucketInitErrors!void {
+        if (!self.isEncrypted()) {
+            self.encryption.clear();
+            return;
+        }
+
+        const provided = password orelse return BucketInitErrors.PasswordRequired;
+        if (provided.len == 0) {
+            return BucketInitErrors.PasswordRequired;
+        }
+
+        const expected_verifier = self.readBucketKeyVerifier();
+        const salt = self.readBucketEncryptionSalt();
+
+        const key = encryption.deriveBucketKey(self.allocator, provided, salt) catch {
+            return BucketInitErrors.InvalidPassword;
+        };
+        const actual_verifier = encryption.computeBucketKeyCheck(key);
+        const ok = std.crypto.timing_safe.eql([encryption.KEY_CHECK_BYTES]u8, expected_verifier, actual_verifier);
+        if (!ok) {
+            return BucketInitErrors.InvalidPassword;
+        }
+
+        self.encryption = .{
+            .key = key,
+            .salt = salt,
+        };
+    }
+
+    fn assertEncryptionKeyMatchesHeader(self: *Bucket) !void {
+        if (!self.isEncrypted()) return;
+        const key = self.encryption.key orelse return error.PasswordRequired;
+
+        const expected = self.readBucketKeyVerifier();
+        const actual = encryption.computeBucketKeyCheck(key);
+        if (!std.crypto.timing_safe.eql([encryption.KEY_CHECK_BYTES]u8, expected, actual)) {
+            return error.InvalidPassword;
+        }
+    }
+
+    fn copyEncryptionFrom(self: *Bucket, source: *const Bucket) !void {
+        if (!source.isEncrypted()) {
+            self.encryption.clear();
+            self.header.flags &= ~encryption.FLAG_ENCRYPTED;
+            self.header.flags &= ~encryption.FLAG_KDF_ARGON2ID_V1;
+            self.header.flags &= ~encryption.FLAG_CIPHER_AES256_GCM_V1;
+            @memset(self.header.reserved[0..], 0);
+            return;
+        }
+
+        const source_key = source.encryption.key orelse return error.PasswordRequired;
+        const verifier = encryption.computeBucketKeyCheck(source_key);
+        self.encryption = .{
+            .key = source_key,
+            .salt = source.encryption.salt,
+        };
+        self.writeBucketEncryptionMetadata(source.encryption.salt, verifier);
+    }
 
     fn loadIndices(self: *Bucket, page: *const Page) !void {
         var reader = std.io.Reader.fixed(page.data);
@@ -508,6 +637,10 @@ pub const Bucket = struct {
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
         };
+
+        if (options.password) |password| {
+            try bucket.initializeBucketEncryption(password);
+        }
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
@@ -533,6 +666,8 @@ pub const Bucket = struct {
             .in_memory = true,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
         };
+
+        _ = options.password;
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
         bucket.ensureIndex("_id", .{ .unique = 1 }) catch return BucketInitErrors.InitializationError;
@@ -597,6 +732,10 @@ pub const Bucket = struct {
             bucket.indexes.deinit();
             ally.free(bucket.path);
         }
+
+        bucket.activateEncryptionFromPassword(options.password) catch |err| {
+            return err;
+        };
 
         const meta = bucket.loadPage(0) catch {
             return BucketInitErrors.FileReadError;
@@ -700,6 +839,13 @@ pub const Bucket = struct {
 
     // Previous openFile implementation remains the same...
 
+    fn pageAssociatedData(header: *const PageHeader) [13]u8 {
+        var ad_header = header.*;
+        @memset(ad_header.encryption[0..], 0);
+        const bytes = ad_header.write();
+        return bytes[0..13].*;
+    }
+
     pub fn loadPage(self: *Bucket, page_id: u64) !*Page {
         // Check if the page is already in the cache
         if (self.pageCache.get(page_id)) |page| {
@@ -740,6 +886,29 @@ pub const Bucket = struct {
             };
         };
 
+        if (self.isEncrypted()) {
+            try self.assertEncryptionKeyMatchesHeader();
+            const meta = encryption.decodePageMeta(&page.header.encryption) catch {
+                Page.deinit(page, self.allocator);
+                self.allocator.destroy(page);
+                return error.InvalidPageEncryptionMetadata;
+            };
+            const key = self.encryption.key orelse {
+                Page.deinit(page, self.allocator);
+                self.allocator.destroy(page);
+                return error.PasswordRequired;
+            };
+            const nonce = encryption.derivePageNonce(self.encryption.salt, page.header.page_id, meta.counter);
+            const ad = Bucket.pageAssociatedData(&page.header);
+            var plaintext: [DEFAULT_PAGE_SIZE - PageHeader.byteSize]u8 = undefined;
+            Aes256Gcm.decrypt(plaintext[0..page.data.len], page.data, meta.tag, &ad, nonce, key) catch {
+                Page.deinit(page, self.allocator);
+                self.allocator.destroy(page);
+                return error.InvalidPassword;
+            };
+            @memcpy(page.data, plaintext[0..page.data.len]);
+        }
+
         if (try self.pageCache.put(page_id, page)) |evicted| {
             // Don't destroy evicted pages immediately - they may still be referenced
             // by B+ tree Node structures. They will be freed during pageCache.clear()
@@ -749,7 +918,7 @@ pub const Bucket = struct {
         return page;
     }
 
-    pub fn writePage(self: *Bucket, page: *const Page) !void {
+    pub fn writePage(self: *Bucket, page: *Page) !void {
         if (self.in_memory) {
             return;
         }
@@ -758,9 +927,38 @@ pub const Bucket = struct {
 
         const offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
 
-        const header_bytes = PageHeader.write(&page.header);
+        var header_to_write = page.header;
+        var page_bytes_to_write: []const u8 = page.data;
+        var ciphertext: [DEFAULT_PAGE_SIZE - PageHeader.byteSize]u8 = undefined;
+
+        if (self.isEncrypted()) {
+            try self.assertEncryptionKeyMatchesHeader();
+            const key = self.encryption.key orelse return error.PasswordRequired;
+
+            var previous_counter: u32 = 0;
+            if (encryption.decodePageMeta(&page.header.encryption)) |meta| {
+                previous_counter = meta.counter;
+            } else |_| {
+                previous_counter = 0;
+            }
+
+            var next_counter = previous_counter + 1;
+            if (next_counter == 0 or next_counter > encryption.PAGE_COUNTER_MAX) {
+                next_counter = encryption.PAGE_COUNTER_DEFAULT;
+            }
+
+            const nonce = encryption.derivePageNonce(self.encryption.salt, page.header.page_id, next_counter);
+            const ad = Bucket.pageAssociatedData(&header_to_write);
+            var tag: [Aes256Gcm.tag_length]u8 = undefined;
+            Aes256Gcm.encrypt(ciphertext[0..page.data.len], &tag, page.data, &ad, nonce, key);
+            encryption.encodePageMeta(&header_to_write.encryption, next_counter, tag);
+            page.header = header_to_write;
+            page_bytes_to_write = ciphertext[0..page.data.len];
+        }
+
+        const header_bytes = PageHeader.write(&header_to_write);
         try file.pwriteAll(header_bytes[0..], offset);
-        try file.pwriteAll(page.data, offset + PageHeader.byteSize);
+        try file.pwriteAll(page_bytes_to_write, offset + PageHeader.byteSize);
 
         // Track dirty page for replication (set automatically handles duplicates)
         if (self.replication_callback != null) {
@@ -804,15 +1002,17 @@ pub const Bucket = struct {
         var iterator = self.dirty_pages.keyIterator();
         var i: usize = 0;
         while (iterator.next()) |page_id_ptr| : (i += 1) {
-            const page = try self.loadPage(page_id_ptr.*);
             const offset = BucketHeader.byteSize + (i * DEFAULT_PAGE_SIZE);
 
-            // Write page header (32 bytes)
-            const page_header_bytes = PageHeader.write(&page.header);
-            @memcpy(buffer[offset .. offset + PageHeader.byteSize], &page_header_bytes);
-
-            // Write page data
-            @memcpy(buffer[offset + PageHeader.byteSize .. offset + DEFAULT_PAGE_SIZE], page.data);
+            if (self.file) |*file| {
+                const source_offset = BucketHeader.byteSize + (page_id_ptr.* * DEFAULT_PAGE_SIZE);
+                try file.preadAll(buffer[offset .. offset + DEFAULT_PAGE_SIZE], source_offset);
+            } else {
+                const page = try self.loadPage(page_id_ptr.*);
+                const page_header_bytes = PageHeader.write(&page.header);
+                @memcpy(buffer[offset .. offset + PageHeader.byteSize], &page_header_bytes);
+                @memcpy(buffer[offset + PageHeader.byteSize .. offset + DEFAULT_PAGE_SIZE], page.data);
+            }
         }
 
         // Call the callback once with all pages and check acknowledgement
@@ -888,6 +1088,10 @@ pub const Bucket = struct {
 
         // Update our header with the replicated values
         self.header = new_header;
+        if (self.isEncrypted()) {
+            try self.assertEncryptionKeyMatchesHeader();
+            self.encryption.salt = self.readBucketEncryptionSalt();
+        }
         try self.flushHeader();
 
         var meta_page_replicated = false;
@@ -2864,6 +3068,11 @@ pub const Bucket = struct {
             .auto_vaccuum = self.autoVaccuum,
         });
         defer newBucket.deinit();
+
+        if (self.isEncrypted()) {
+            try newBucket.copyEncryptionFrom(self);
+            try newBucket.flushHeader();
+        }
         // defer fs.deleteFileAbsolute(tempFileName) catch |err| {
         // std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
         // };
@@ -2960,6 +3169,8 @@ pub const Bucket = struct {
         // Free path
         self.allocator.free(self.path);
 
+        self.encryption.clear();
+
         // Close file last
         if (self.file) |*file| {
             file.close();
@@ -2969,6 +3180,136 @@ pub const Bucket = struct {
 };
 
 const testing = std.testing;
+
+test "Bucket/Page header reserved fields round-trip" {
+    var header = BucketHeader.init();
+    header.flags = encryption.FLAG_ENCRYPTED | encryption.FLAG_KDF_ARGON2ID_V1 | encryption.FLAG_CIPHER_AES256_GCM_V1;
+    for (header.reserved[0..], 0..) |*b, i| {
+        b.* = @truncate(i + 1);
+    }
+
+    const encoded = header.toBytes();
+    const decoded = BucketHeader.read(&encoded);
+    try testing.expectEqual(header.flags, decoded.flags);
+    try testing.expect(std.mem.eql(u8, &header.reserved, &decoded.reserved));
+
+    var page_header = PageHeader.init(.Data, 42);
+    page_header.used_size = 512;
+    page_header.first_readable_byte = 3;
+    for (page_header.encryption[0..], 0..) |*b, i| {
+        b.* = @truncate(0xFF - i);
+    }
+
+    const page_encoded = page_header.write();
+    const page_decoded = PageHeader.read(&page_encoded);
+    try testing.expectEqual(page_header.page_id, page_decoded.page_id);
+    try testing.expectEqual(page_header.used_size, page_decoded.used_size);
+    try testing.expectEqual(page_header.first_readable_byte, page_decoded.first_readable_byte);
+    try testing.expect(std.mem.eql(u8, &page_header.encryption, &page_decoded.encryption));
+}
+
+test "Encrypted bucket requires valid password and keeps data readable with password" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const file_name = "encrypted-open.bucket";
+    defer platform.deleteFile(file_name) catch {};
+
+    {
+        var bucket = try Bucket.initWithPassword(allocator, file_name, "secret-password");
+        defer bucket.deinit();
+
+        var doc = try bson.fmt.serialize(.{ .name = "enc", .age = 11 }, allocator);
+        defer doc.deinit(allocator);
+        _ = try bucket.insert(doc);
+        try bucket.flush();
+    }
+
+    try testing.expectError(BucketInitErrors.PasswordRequired, Bucket.openFile(allocator, file_name));
+    try testing.expectError(BucketInitErrors.InvalidPassword, Bucket.initWithPassword(allocator, file_name, "wrong-password"));
+
+    var reopened = try Bucket.initWithPassword(allocator, file_name, "secret-password");
+    defer reopened.deinit();
+
+    var query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "enc" } }, allocator);
+    defer query_doc.deinit(allocator);
+    var q = try query.Query.parse(allocator, query_doc);
+    defer q.deinit(allocator);
+
+    var iter = try reopened.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    const found = try iter.next(iter);
+    try testing.expect(found != null);
+}
+
+test "Encrypted bucket stores ciphertext and supports multi-page documents" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const file_name = "encrypted-multipage.bucket";
+    defer platform.deleteFile(file_name) catch {};
+
+    const marker = "SECRET_MARKER_1234567890";
+    const payload_len = DEFAULT_PAGE_SIZE * 2;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'A');
+
+    {
+        var bucket = try Bucket.initWithPassword(allocator, file_name, "very-secret");
+        defer bucket.deinit();
+
+        var doc = try bson.fmt.serialize(.{ .marker = marker, .payload = payload }, allocator);
+        defer doc.deinit(allocator);
+        _ = try bucket.insert(doc);
+        try bucket.flush();
+    }
+
+    const raw = try std.fs.cwd().readFileAlloc(allocator, file_name, 2 * 1024 * 1024);
+    defer allocator.free(raw);
+    try testing.expect(std.mem.indexOf(u8, raw, marker) == null);
+
+    var reopened = try Bucket.initWithPassword(allocator, file_name, "very-secret");
+    defer reopened.deinit();
+
+    var query_doc = try bson.fmt.serialize(.{ .query = .{} }, allocator);
+    defer query_doc.deinit(allocator);
+    var q = try query.Query.parse(allocator, query_doc);
+    defer q.deinit(allocator);
+
+    var iter = try reopened.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+
+    const maybe_doc = try iter.next(iter);
+    try testing.expect(maybe_doc != null);
+    const loaded = maybe_doc.?;
+    const field = loaded.get("payload") orelse return error.TestExpectedEqual;
+    const loaded_bytes = field.string.value;
+    try testing.expectEqual(payload_len, loaded_bytes.len);
+}
+
+test "Legacy unencrypted bucket still opens without password" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const file_name = "legacy-compat.bucket";
+    defer platform.deleteFile(file_name) catch {};
+
+    {
+        var bucket = try Bucket.init(allocator, file_name);
+        defer bucket.deinit();
+
+        var doc = try bson.fmt.serialize(.{ .name = "legacy" }, allocator);
+        defer doc.deinit(allocator);
+        _ = try bucket.insert(doc);
+        try bucket.flush();
+    }
+
+    var reopened = try Bucket.openFile(allocator, file_name);
+    defer reopened.deinit();
+
+    try testing.expect(!reopened.isEncrypted());
+}
 
 test "Bucket.TransformIterator updates document" {
     var bucket_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
