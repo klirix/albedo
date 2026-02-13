@@ -29,16 +29,46 @@ const Result = enum(u8) {
     NotFound,
     InvalidFormat,
     DuplicateKey,
+    PasswordRequired,
+    InvalidPassword,
 };
 
 pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
+    return albedo_open_with_options(path, null, out);
+}
+
+fn mapOpenError(err: anyerror) Result {
+    return switch (err) {
+        error.OutOfMemory => Result.OutOfMemory,
+        error.FileNotFound => Result.FileNotFound,
+        error.PasswordRequired => Result.PasswordRequired,
+        error.InvalidPassword => Result.InvalidPassword,
+        else => Result.Error,
+    };
+}
+
+pub export fn albedo_open_with_options(
+    path: [*:0]u8,
+    options_doc: [*c]const u8,
+    out: **albedo.Bucket,
+) Result {
     const pathProper = std.mem.span(path);
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    // defer _ = gpa.deinit();
+    const options: albedo.Bucket.OpenBucketOptions = blk: {
+        if (options_doc == null) break :blk .{};
+
+        const doc_len = std.mem.readInt(u32, options_doc[0..4], .little);
+        const doc = bson.BSONDocument.init(options_doc[0..doc_len]);
+        var parsed = bson.fmt.parse(albedo.Bucket.OpenBucketOptions, doc, ally) catch {
+            return Result.InvalidFormat;
+        };
+        defer parsed.deinit();
+        break :blk parsed.value;
+    };
+
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    db.* = albedo.Bucket.init(ally, pathProper) catch {
+    db.* = albedo.Bucket.openFileWithOptions(ally, pathProper, options) catch |err| {
         ally.destroy(db);
-        return Result.Error;
+        return mapOpenError(err);
     };
     out.* = db;
     return Result.OK;
@@ -410,6 +440,48 @@ test "lib API open insert list close" {
     try testing.expectEqualStrings("Alice", listed_name.string.value);
 
     try testing.expectEqual(Result.EOS, albedo_data(handle, &raw_doc_ptr));
+}
+
+test "lib API open with options for encrypted bucket" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-open-with-password");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    {
+        var encrypted_bucket = try albedo.Bucket.initWithPassword(allocator, path, "lib-secret");
+        defer encrypted_bucket.deinit();
+        var doc = try bson.BSONDocument.fromJSON(allocator,
+            \\{
+            \\  "name": "secure"
+            \\}
+        );
+        defer doc.deinit(allocator);
+        _ = try encrypted_bucket.insert(doc);
+        try encrypted_bucket.flush();
+    }
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.PasswordRequired, albedo_open(path_z.ptr, &bucket));
+
+    var wrong_options = try bson.fmt.serialize(.{ .password = "wrong" }, allocator);
+    defer wrong_options.deinit(allocator);
+    try testing.expectEqual(
+        Result.InvalidPassword,
+        albedo_open_with_options(path_z.ptr, wrong_options.buffer.ptr, &bucket),
+    );
+
+    var correct_options = try bson.fmt.serialize(.{ .password = "lib-secret" }, allocator);
+    defer correct_options.deinit(allocator);
+    try testing.expectEqual(
+        Result.OK,
+        albedo_open_with_options(path_z.ptr, correct_options.buffer.ptr, &bucket),
+    );
+    defer _ = albedo_close(bucket);
 }
 
 test "lib API delete removes matched docs" {

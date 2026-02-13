@@ -21,6 +21,8 @@ typedef enum albedo_result {
   ALBEDO_NOT_FOUND = 6,
   ALBEDO_INVALID_FORMAT = 7,
   ALBEDO_DUPLICATE_KEY = 8,
+  ALBEDO_PASSWORD_REQUIRED = 9,
+  ALBEDO_INVALID_PASSWORD = 10,
 } albedo_result;
 
 typedef uint8_t (*albedo_page_change_callback)(
@@ -30,6 +32,10 @@ typedef uint8_t (*albedo_page_change_callback)(
     uint32_t page_count);
 
 albedo_result albedo_open(char *path, albedo_bucket **out);
+albedo_result albedo_open_with_options(
+    char *path,
+    const uint8_t *options_doc,
+    albedo_bucket **out);
 albedo_result albedo_close(albedo_bucket *bucket);
 
 albedo_result albedo_insert(albedo_bucket *bucket, uint8_t *doc_buffer);

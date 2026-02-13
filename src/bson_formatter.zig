@@ -109,7 +109,9 @@ fn parseDocumentToType(comptime T: type, doc: bson.BSONDocument, arena_allocator
         if (maybe_value) |bson_value| {
             @field(result, field.name) = try parseValueToType(field_type, bson_value, arena_allocator);
         } else {
-            if (@typeInfo(field_type) == .optional) {
+            if (field.defaultValue()) |default_value| {
+                @field(result, field.name) = default_value;
+            } else if (@typeInfo(field_type) == .optional) {
                 @field(result, field.name) = null;
             } else {
                 return Error.MissingField;
@@ -136,6 +138,13 @@ fn parseValueToType(comptime T: type, bson_value: bson.BSONValue, arena_allocato
             .int32 => std.math.cast(T, bson_value.int32.value) orelse Error.IntegerOverflow,
             .int64 => std.math.cast(T, bson_value.int64.value) orelse Error.IntegerOverflow,
             .double => std.math.cast(T, @as(i64, @intFromFloat(bson_value.double.value))) orelse Error.IntegerOverflow,
+            else => Error.TypeMismatch,
+        },
+        .@"enum" => switch (bson_value) {
+            .string => std.meta.stringToEnum(T, bson_value.string.value) orelse Error.TypeMismatch,
+            .int32 => std.meta.intToEnum(T, std.math.cast(std.meta.Tag(T), bson_value.int32.value) orelse return Error.IntegerOverflow) catch Error.TypeMismatch,
+            .int64 => std.meta.intToEnum(T, std.math.cast(std.meta.Tag(T), bson_value.int64.value) orelse return Error.IntegerOverflow) catch Error.TypeMismatch,
+            .double => std.meta.intToEnum(T, std.math.cast(std.meta.Tag(T), @as(i64, @intFromFloat(bson_value.double.value))) orelse return Error.IntegerOverflow) catch Error.TypeMismatch,
             else => Error.TypeMismatch,
         },
         .optional => |opt| switch (bson_value) {
