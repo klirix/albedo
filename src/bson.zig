@@ -260,6 +260,53 @@ test "decodes BSONBinary" {
     try std.testing.expectEqual(expected_subtype, binary.subtype);
 }
 
+test "BSONDocument.fromPairs encodes binary length correctly" {
+    const allocator = std.testing.allocator;
+    const payload = [_]u8{ 0x01, 0x02, 0x03 };
+
+    var pairs = [_]BSONKeyValuePair{BSONKeyValuePair{
+        .key = "bin",
+        .value = BSONValue{ .binary = BSONBinary{ .value = &payload, .subtype = 0x00 } },
+    }};
+    const doc = try BSONDocument.fromPairs(allocator, pairs[0..]);
+    defer doc.deinit(allocator);
+
+    const expected = [_]u8{
+        0x12, 0x00, 0x00, 0x00, // document length (18)
+        0x05, // type: binary
+        0x62, 0x69, 0x6e, 0x00, // key: "bin\0"
+        0x03, 0x00, 0x00, 0x00, // payload length (3)
+        0x00, // subtype
+        0x01, 0x02, 0x03, // payload
+        0x00, // document terminator
+    };
+
+    try std.testing.expectEqualSlices(u8, &expected, doc.buffer);
+}
+
+test "BSONDocument.fromPairs encodes trusted hello-world document" {
+    const allocator = std.testing.allocator;
+
+    var pairs = [_]BSONKeyValuePair{BSONKeyValuePair{
+        .key = "hello",
+        .value = BSONValue{ .string = .{ .value = "world" } },
+    }};
+    const doc = try BSONDocument.fromPairs(allocator, pairs[0..]);
+    defer doc.deinit(allocator);
+
+    // Canonical BSON bytes for {"hello": "world"}
+    const expected = [_]u8{
+        0x16, 0x00, 0x00, 0x00, // document length (22)
+        0x02, // type: string
+        0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x00, // key: "hello\0"
+        0x06, 0x00, 0x00, 0x00, // string length incl. terminator (6)
+        0x77, 0x6f, 0x72, 0x6c, 0x64, 0x00, // "world\0"
+        0x00, // document terminator
+    };
+
+    try std.testing.expectEqualSlices(u8, &expected, doc.buffer);
+}
+
 pub const BSONBoolean = struct {
     value: bool,
 
@@ -650,7 +697,7 @@ pub const BSONValue = union(BSONValueType) {
                 try writer.writeInt(i64, self.int64.value, .little);
             },
             .binary => {
-                try writer.writeInt(u32, @as(u32, @truncate(self.binary.value.len)) + 5, .little);
+                try writer.writeInt(u32, @as(u32, @truncate(self.binary.value.len)), .little);
                 try writer.writeByte(self.binary.subtype);
                 try writer.writeAll(self.binary.value);
             },
