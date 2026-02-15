@@ -3234,16 +3234,16 @@ test "Bucket._id unique index rejects duplicate ObjectId" {
     const oid = try ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
     const oid2 = try ObjectId.parseString("507c7f79bcf86cd7994f6c0f");
 
-    var doc1 = try bson.fmt.serialize(.{ .@"_id" = oid, .name = "Alice" }, allocator);
+    var doc1 = try bson.fmt.serialize(.{ ._id = oid, .name = "Alice" }, allocator);
     defer doc1.deinit(allocator);
     _ = try bucket.insert(doc1);
 
-    var doc2 = try bson.fmt.serialize(.{ .@"_id" = oid, .name = "Bob" }, allocator);
+    var doc2 = try bson.fmt.serialize(.{ ._id = oid, .name = "Bob" }, allocator);
     defer doc2.deinit(allocator);
     try std.testing.expectError(error.DuplicateKey, bucket.insert(doc2));
 
     // Different ObjectId should still insert fine
-    var doc3 = try bson.fmt.serialize(.{ .@"_id" = oid2, .name = "Carol" }, allocator);
+    var doc3 = try bson.fmt.serialize(.{ ._id = oid2, .name = "Carol" }, allocator);
     defer doc3.deinit(allocator);
     _ = try bucket.insert(doc3);
 }
