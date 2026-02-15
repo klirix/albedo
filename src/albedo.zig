@@ -1,7 +1,7 @@
 const std = @import("std");
-const bson = @import("bson.zig");
-const BSONValue = bson.BSONValue;
-const BSONDocument = bson.BSONDocument;
+pub const bson = @import("bson.zig");
+pub const BSONValue = bson.BSONValue;
+pub const BSONDocument = bson.BSONDocument;
 const mem = std.mem;
 const platform = @import("platform.zig");
 const ObjectId = @import("object_id.zig").ObjectId;

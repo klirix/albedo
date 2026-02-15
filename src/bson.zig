@@ -422,9 +422,12 @@ pub const BSONValue = union(BSONValueType) {
             i32 => BSONValue{ .int32 = BSONInt32{ .value = value } },
             f64 => BSONValue{ .double = BSONDouble{ .value = value } },
             []u8 => BSONValue{ .string = BSONString{ .value = value } },
+            []const u8 => BSONValue{ .string = BSONString{ .value = value } },
             BSONDocument => BSONValue{ .document = value },
             BSONBinary => BSONValue{ .binary = BSONBinary{ .value = value, .subtype = 1 } },
             ObjectId => BSONValue{ .objectId = .{ .value = value } },
+            bool => BSONValue{ .boolean = BSONBoolean{ .value = value } },
+
             else => |unsupportedType| @compileError(std.fmt.comptimePrint("Unsupported BSONValue type: {any}", .{unsupportedType})),
         };
     }
@@ -746,7 +749,7 @@ pub const BSONValueType = enum(u8) {
     minKey = 0xFF,
 };
 
-const TypeNamePair = struct {
+pub const TypeNamePair = struct {
     type: BSONValueType,
     name: []const u8,
     len: u32,

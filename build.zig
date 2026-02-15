@@ -211,6 +211,12 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseFast,
     });
 
+    _ = b.addModule("albedo", .{
+        .root_source_file = b.path("src/albedo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const buildStatic = b.option(bool, "static", "Build static library") orelse false;
     // const buildNode = b.option(bool, "node", "Build node extension") orelse false;
     // const buildClient = b.option(bool, "client", "Build CLI client") orelse true;
