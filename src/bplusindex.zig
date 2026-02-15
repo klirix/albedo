@@ -1297,12 +1297,12 @@ test "reverse index with range bounds" {
     defer index.deinit();
     index.options.reverse = 1;
 
-    const entries = [_]struct { value: i3, loc: Index.DocumentLocation }{
-        .{ .value = 5, .loc = .{ .page = 1, .offset = 50 } },
-        .{ .value = 10, .loc = .{ .page = 2, .offset = 100 } },
-        .{ .value = 15, .loc = .{ .page = 4, .offset = 150 } },
-        .{ .value = 20, .loc = .{ .page = 5, .offset = 200 } },
-        .{ .value = 25, .loc = .{ .page = 6, .offset = 250 } },
+    const entries = [_]struct { value: i32, loc: Index.DocumentLocation }{
+        .{ .value = 5, .loc = .{ .pageId = 1, .offset = 50 } },
+        .{ .value = 10, .loc = .{ .pageId = 2, .offset = 100 } },
+        .{ .value = 15, .loc = .{ .pageId = 4, .offset = 150 } },
+        .{ .value = 20, .loc = .{ .pageId = 5, .offset = 200 } },
+        .{ .value = 25, .loc = .{ .pageId = 6, .offset = 250 } },
     };
 
     for (entries) |entry| {

@@ -3,7 +3,7 @@ const testing = std.testing;
 const albedo = @import("./albedo.zig");
 const bson = @import("./bson.zig");
 const platform = @import("./platform.zig");
-const Query = @import("./query.zig").Query;
+const Query = albedo.Query;
 const IndexOptions = @import("./bplusindex.zig").IndexOptions;
 const builtin = @import("builtin");
 
@@ -107,6 +107,65 @@ pub export fn albedo_drop_index(bucket: *albedo.Bucket, path: [*:0]const u8) Res
             return Result.Error;
         },
     };
+
+    return Result.OK;
+}
+
+pub export fn albedo_list_indexes(bucket: *albedo.Bucket, outDoc: *[*c]u8) Result {
+    var index_info = bucket.listIndexes() catch {
+        return Result.Error;
+    };
+    defer index_info.deinit();
+
+    var indexes_doc = bson.BSONDocument.initEmpty();
+    var indexes_owned = false;
+    defer if (indexes_owned) indexes_doc.deinit(ally);
+
+    for (index_info.indexes) |entry| {
+        const options = entry.value.options;
+
+        // Build per-index options subdocument via formatter
+        var options_doc = bson.fmt.serialize(.{
+            .unique = options.unique == 1,
+            .sparse = options.sparse == 1,
+            .reverse = options.reverse == 1,
+        }, ally) catch |err| switch (err) {
+            error.OutOfMemory => return Result.OutOfMemory,
+            else => return Result.Error,
+        };
+        defer options_doc.deinit(ally);
+
+        // Attach options_doc under indexes.<path>
+        const index_value = bson.BSONValue{ .document = options_doc };
+        const next_indexes = indexes_doc.set(ally, entry.key, index_value) catch {
+            return Result.OutOfMemory;
+        };
+
+        if (indexes_owned) {
+            indexes_doc.deinit(ally);
+        } else {
+            indexes_owned = true;
+        }
+        indexes_doc = next_indexes;
+
+        // options_doc is freed via defer; set() copied its bytes
+    }
+
+    var root_doc = bson.BSONDocument.initEmpty();
+    var root_owned = false;
+    defer if (root_owned) root_doc.deinit(ally);
+
+    const next_root = root_doc.set(ally, "indexes", bson.BSONValue{ .document = indexes_doc }) catch {
+        return Result.OutOfMemory;
+    };
+    root_owned = true;
+    root_doc = next_root;
+
+    const out_buf = ally.alloc(u8, root_doc.buffer.len) catch {
+        return Result.OutOfMemory;
+    };
+    @memcpy(out_buf, root_doc.buffer);
+    outDoc.* = @ptrCast(out_buf.ptr);
 
     return Result.OK;
 }
@@ -463,6 +522,36 @@ test "lib API delete removes matched docs" {
 
     var raw_doc_ptr: [*]u8 = undefined;
     try testing.expectEqual(Result.EOS, albedo_data(handle, &raw_doc_ptr));
+}
+
+test "lib API list_indexes returns index options" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-list-indexes-returns-index-options");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    // Create a sparse index on "name"
+    const name_z = try allocator.dupeZ(u8, "name");
+    defer allocator.free(name_z);
+    try testing.expectEqual(Result.OK, albedo_ensure_index(bucket, name_z.ptr, 0x02));
+
+    var raw_ptr: [*c]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_list_indexes(bucket, &raw_ptr));
+
+    const raw_len = std.mem.readInt(u32, raw_ptr[0..4], .little);
+    defer albedo_free(raw_ptr, raw_len);
+
+    const doc = bson.BSONDocument.init(raw_ptr[0..raw_len]);
+    const sparse_val = doc.getPath("indexes.name.sparse") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(true, sparse_val.boolean.value);
 }
 
 test "lib API transform updates matching doc" {

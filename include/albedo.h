@@ -35,6 +35,7 @@ albedo_result albedo_close(albedo_bucket *bucket);
 albedo_result albedo_insert(albedo_bucket *bucket, uint8_t *doc_buffer);
 albedo_result albedo_ensure_index(albedo_bucket *bucket, const char *path, uint8_t options_byte);
 albedo_result albedo_drop_index(albedo_bucket *bucket, const char *path);
+albedo_result albedo_list_indexes(albedo_bucket *bucket, uint8_t **out_doc);
 albedo_result albedo_delete(albedo_bucket *bucket, uint8_t *query_buffer, uint16_t query_len);
 
 albedo_result albedo_list(albedo_bucket *bucket, uint8_t *query_buffer, albedo_list_handle **out_iterator);

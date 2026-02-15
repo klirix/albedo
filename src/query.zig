@@ -136,7 +136,7 @@ pub const Filter = union(FilterType) {
 
                     if (!matched) return FilterParsingErrors.InvalidQueryOperator;
                 },
-                .string, .int32, .int64, .objectId, .datetime, .boolean, .null => {
+                .string, .int32, .int64, .objectId, .datetime, .boolean, .null, .double => {
                     const path_copy = try ally.dupe(u8, path);
                     errdefer ally.free(path_copy);
                     try filters.append(ally, .{ .eq = .{ .path = path_copy, .value = pair.value } });

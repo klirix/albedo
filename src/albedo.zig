@@ -7,6 +7,7 @@ const platform = @import("platform.zig");
 const ObjectId = @import("object_id.zig").ObjectId;
 const ObjectIdGenerator = @import("object_id.zig").ObjectIdGenerator;
 const query = @import("query.zig");
+pub const Query = query.Query;
 const bindex = @import("bplusindex.zig");
 const Index = bindex.Index;
 const IndexOptions = bindex.IndexOptions;
@@ -447,6 +448,36 @@ pub const Bucket = struct {
         // try self.indexes.put(key, newIndex);
         // try self.recordIndexes();
         try self.buildIndex(path, options);
+    }
+    const IndexEntry = struct {
+        key: []const u8,
+        value: *Index,
+    };
+
+    const IndexInfo = struct {
+        bucket: *Bucket,
+        indexes: []IndexEntry,
+        pub fn deinit(self: *IndexInfo) void {
+            self.bucket.allocator.free(self.indexes);
+        }
+    };
+
+    pub fn listIndexes(self: *Bucket) !IndexInfo {
+        const count = self.indexes.count();
+
+        var entries = try self.allocator.alloc(IndexEntry, count);
+        var recordIterator = self.indexes.iterator();
+        for (0..count) |i| {
+            const entry = recordIterator.next() orelse unreachable;
+            entries[i] = IndexEntry{
+                .key = entry.key_ptr.*,
+                .value = entry.value_ptr.*,
+            };
+        }
+        return IndexInfo{
+            .bucket = self,
+            .indexes = entries,
+        };
     }
 
     pub fn dropIndex(self: *Bucket, path: []const u8) !void {
@@ -3155,6 +3186,66 @@ test "Bucket.insert" {
     //     // const oId = item.get("_id").?.objectId.value;
     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
     // }
+}
+
+test "Bucket.unique index rejects duplicate string values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var bucket = try Bucket.init(allocator, ":memory:");
+    defer bucket.deinit();
+
+    try bucket.ensureIndex("email", .{ .unique = 1 });
+
+    var doc1 = try bson.fmt.serialize(.{ .email = "a@example.com" }, allocator);
+    defer doc1.deinit(allocator);
+    _ = try bucket.insert(doc1);
+
+    var doc2 = try bson.fmt.serialize(.{ .email = "a@example.com" }, allocator);
+    defer doc2.deinit(allocator);
+    try std.testing.expectError(error.DuplicateKey, bucket.insert(doc2));
+
+    // Ensure no partial write occurred
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
+    defer qDoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qDoc);
+    defer q.deinit(allocator);
+
+    var list_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer list_arena.deinit();
+    var iter = try bucket.listIterate(&list_arena, q);
+
+    var count: usize = 0;
+    while (try iter.next(iter)) |_| {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "Bucket._id unique index rejects duplicate ObjectId" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var bucket = try Bucket.init(allocator, ":memory:");
+    defer bucket.deinit();
+
+    const oid = try ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
+    const oid2 = try ObjectId.parseString("507c7f79bcf86cd7994f6c0f");
+
+    var doc1 = try bson.fmt.serialize(.{ .@"_id" = oid, .name = "Alice" }, allocator);
+    defer doc1.deinit(allocator);
+    _ = try bucket.insert(doc1);
+
+    var doc2 = try bson.fmt.serialize(.{ .@"_id" = oid, .name = "Bob" }, allocator);
+    defer doc2.deinit(allocator);
+    try std.testing.expectError(error.DuplicateKey, bucket.insert(doc2));
+
+    // Different ObjectId should still insert fine
+    var doc3 = try bson.fmt.serialize(.{ .@"_id" = oid2, .name = "Carol" }, allocator);
+    defer doc3.deinit(allocator);
+    _ = try bucket.insert(doc3);
 }
 
 test "Bucket.dump supports :memory: storage" {
