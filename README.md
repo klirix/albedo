@@ -96,7 +96,7 @@ See [include/albedo.h](include/albedo.h) for the full C API surface.
 
 ## Building from source
 
-Requires [Zig](https://ziglang.org) (0.13+).
+Requires [Zig](https://ziglang.org) (0.15.1).
 
 ```sh
 # Shared library (default)
