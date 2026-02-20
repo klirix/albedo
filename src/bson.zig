@@ -481,24 +481,22 @@ pub const BSONValue = union(BSONValueType) {
 
     pub fn format(
         self: @This(),
-        comptime formatString: []const u8,
-        opts: std.fmt.FormatOptions,
-        writer: anytype,
-    ) @TypeOf(writer).Error!void {
+        writer: *std.Io.Writer,
+    ) error{WriteFailed}!void {
         switch (self) {
-            .string => try std.fmt.format(writer, "\"{s}\"", .{self.string.value}),
-            .double => try std.fmt.format(writer, "{d}", .{self.double.value}),
-            .int32 => try std.fmt.format(writer, "{d}", .{self.int32.value}),
-            .document => try self.document.format(formatString, opts, writer),
-            .array => try self.array.format(formatString, opts, writer),
-            .datetime => try std.fmt.format(writer, "{d}", .{self.datetime.value}),
-            .int64 => try std.fmt.format(writer, "{d}", .{self.int64.value}),
-            .binary => try std.fmt.format(writer, "Binary{{{s}}}", .{self.binary.value}),
-            .boolean => try std.fmt.format(writer, "{s}", .{if (self.boolean.value) "true" else "false"}),
+            .string => try writer.print("\"{s}\"", .{self.string.value}),
+            .double => try writer.print("{d}", .{self.double.value}),
+            .int32 => try writer.print("{d}", .{self.int32.value}),
+            .document => try self.document.format(writer),
+            .array => try self.array.format(writer),
+            .datetime => try writer.print("{d}", .{self.datetime.value}),
+            .int64 => try writer.print("{d}", .{self.int64.value}),
+            .binary => try writer.print("Binary{{{s}}}", .{self.binary.value}),
+            .boolean => try writer.print("{s}", .{if (self.boolean.value) "true" else "false"}),
             .null => try writer.writeAll("null"),
             .minKey => try writer.writeAll("MinKey"),
             .maxKey => try writer.writeAll("MaxKey"),
-            .objectId => try std.fmt.format(writer, "ObjectId(\"{s}\")", .{&self.objectId.value.toString()}),
+            .objectId => try writer.print("ObjectId(\"{s}\")", .{&self.objectId.value.toString()}),
         }
     }
 
@@ -1076,10 +1074,8 @@ pub const BSONDocument = struct {
 
     pub fn format(
         self: BSONDocument,
-        comptime formatString: []const u8,
-        opts: std.fmt.FormatOptions,
-        writer: anytype,
-    ) @TypeOf(writer).Error!void {
+        writer: *std.Io.Writer,
+    ) error{WriteFailed}!void {
         var pairIter = self.iter();
         try writer.writeAll("{ ");
         var first = true;
@@ -1090,7 +1086,7 @@ pub const BSONDocument = struct {
             first = false;
             try writer.writeAll(pair.key);
             try writer.writeAll(": ");
-            try pair.value.format(formatString, opts, writer);
+            try pair.value.format(writer);
         }
         try writer.writeAll(" }");
     }
