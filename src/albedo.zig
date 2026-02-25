@@ -679,8 +679,6 @@ pub const Bucket = struct {
             if (maybe_doc == null) break;
             const doc_result = maybe_doc.?;
 
-            defer temp_allocator.free(doc_result.data);
-
             var doc = BSONDocument{ .buffer = doc_result.data };
 
             var values = std.ArrayList(BSONValue){};
