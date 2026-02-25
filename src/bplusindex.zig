@@ -846,7 +846,15 @@ pub const Index = struct {
     }
 
     pub fn insert(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
-        if (self.options.unique == 1) {
+        return self.insertWithOptions(value, loc, .{ .skip_uniqueness_check = false });
+    }
+
+    pub const InsertOptions = struct {
+        skip_uniqueness_check: bool = false,
+    };
+
+    pub fn insertWithOptions(self: *Index, value: BSONValue, loc: DocumentLocation, options: InsertOptions) !void {
+        if (self.options.unique == 1 and !options.skip_uniqueness_check) {
             if (try self.hasValue(value)) {
                 return error.DuplicateKey;
             }

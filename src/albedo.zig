@@ -328,6 +328,7 @@ pub const Bucket = struct {
     dirty_pages: std.AutoHashMap(u64, void),
     replication_retry_count: u32 = 0,
     max_replication_retries: u32 = 3,
+    cached_last_data_page: ?*Page = null,
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -648,7 +649,8 @@ pub const Bucket = struct {
         const file = if (self.file) |*f| f else return error.StorageUnavailable;
         const bytes = self.header.toBytes();
         try file.pwriteAll(bytes[0..], 0);
-        try file.sync();
+        // Sync is handled by writePage's batched sync and flush().
+        // Removing per-call fsync avoids costly syscalls on every insert/createNewPage.
     }
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
@@ -787,9 +789,12 @@ pub const Bucket = struct {
 
         const offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
 
+        // Combine header + data into a single pwriteAll to halve syscalls
+        var buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         const header_bytes = PageHeader.write(&page.header);
-        try file.pwriteAll(header_bytes[0..], offset);
-        try file.pwriteAll(page.data, offset + PageHeader.byteSize);
+        @memcpy(buf[0..PageHeader.byteSize], header_bytes[0..]);
+        @memcpy(buf[PageHeader.byteSize..], page.data);
+        try file.pwriteAll(buf[0..DEFAULT_PAGE_SIZE], offset);
 
         // Track dirty page for replication (set automatically handles duplicates)
         if (self.replication_callback != null) {
@@ -1065,6 +1070,12 @@ pub const Bucket = struct {
     };
 
     fn findLastDataPage(self: *Bucket) !?*Page {
+        // Return cached page if still valid (not freed, correct type)
+        if (self.cached_last_data_page) |cached| {
+            if (cached.header.page_type == PageType.Data) {
+                return cached;
+            }
+        }
 
         // Find the last data page
         var pageIter = PageIterator{
@@ -1075,6 +1086,7 @@ pub const Bucket = struct {
         };
         while (try pageIter.next()) |page| {
             if (page.header.page_type == PageType.Data) {
+                self.cached_last_data_page = page;
                 return page;
             }
         }
@@ -1168,6 +1180,7 @@ pub const Bucket = struct {
             page = p;
         } else {
             page = try self.createNewPage(.Data);
+            self.cached_last_data_page = page;
             try self.writePage(page);
         }
 
@@ -1175,6 +1188,7 @@ pub const Bucket = struct {
         if ((page.data.len - page.header.used_size) <= (4 + DocHeader.byteSize)) { // 20 bytes
             // Not enough space, create a new page
             page = try self.createNewPage(.Data);
+            self.cached_last_data_page = page;
             try self.writePage(page);
         }
 
@@ -1231,6 +1245,7 @@ pub const Bucket = struct {
             // If there are still bytes left to write, create a new page
             if (bytes_written < bytes_to_write) {
                 page = try self.createNewPage(.Data);
+                self.cached_last_data_page = page;
                 try self.writePage(page);
             }
         }
@@ -1243,15 +1258,12 @@ pub const Bucket = struct {
         for (planned_index_inserts.items) |plan| {
             self.bindIndex(plan.index);
             for (plan.values.items) |value| {
-                plan.index.insert(value, index_location) catch |err| switch (err) {
-                    error.DuplicateKey => return error.DuplicateKey,
-                    else => return err,
-                };
+                try plan.index.insertWithOptions(value, index_location, .{ .skip_uniqueness_check = true });
             }
         }
 
         self.header.doc_count += 1;
-        try self.flushHeader();
+        // Header will be flushed by the next createNewPage or flush()
 
         // After writing is done, free the page resources
         return result;
@@ -2955,6 +2967,7 @@ pub const Bucket = struct {
         try file.preadAll(header_bytes[0..], 0);
         self.header = BucketHeader.read(header_bytes[0..]);
         self.pageCache = PageCache.init(self.allocator, cache_capacity);
+        self.cached_last_data_page = null;
         // Reinitialize and reload indexes from the meta page
         self.indexes = .init(self.allocator);
         // Reinitialize dirty_pages for replication tracking

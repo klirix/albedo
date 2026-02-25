@@ -1243,11 +1243,11 @@ test "format" {
     var doc = try fmt.serialize(.{ .key = "test" }, allocator);
     defer doc.deinit(allocator);
 
-    var arrList = std.ArrayList(u8){};
-    defer arrList.deinit(allocator);
-    try doc.format("{s}", .{}, arrList.writer(allocator));
+    var arrList = std.Io.Writer.Allocating.init(allocator);
+    defer arrList.deinit();
+    try doc.format(&arrList.writer);
 
-    try std.testing.expectEqualStrings("{ key: \"test\" }", arrList.items);
+    try std.testing.expectEqualStrings("{ key: \"test\" }", arrList.written());
 }
 
 test "BSONDocument write" {
