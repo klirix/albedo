@@ -1,9 +1,9 @@
 /// queries will be simple
 /// There are filters, sorts, sectoring and projections
-/// filters: $eq, $ne, $lt, $gt, $in
+/// filters: $eq, $ne, $lt, $lte, $gt, $gte, $in, $between, $startsWith, $endsWith, $exists, $notExists
 /// sorts: $asc, $desc
 /// sectoring: $offset, $limit
-/// projections: $fields
+///
 /// All of the fields are optional and can be omitted
 /// The query will be a BSON document with the following structure:
 /// {
