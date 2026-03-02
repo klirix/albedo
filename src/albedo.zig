@@ -316,6 +316,18 @@ pub const ReplicationError = enum(u8) {
     UnknownError = 255,
 };
 
+/// Controls when fsync is called to guarantee durability.
+pub const Durability = union(enum) {
+    /// Every write is fsynced immediately (safest, slowest).
+    all,
+    /// Fsync every N page writes (balanced).
+    periodic: u32,
+    /// Never fsync automatically; rely on OS page cache.
+    /// Data is visible to readers immediately but may be lost on crash.
+    /// Use `flush()` for explicit durability when needed.
+    manual,
+};
+
 pub const Bucket = struct {
     file: ?platform.FileHandle = null,
     path: []const u8,
@@ -328,7 +340,7 @@ pub const Bucket = struct {
     objectIdGenerator: ObjectIdGenerator,
     in_memory: bool = false,
     writes_since_sync: u32 = 0,
-    sync_threshold: u32 = 100, // Sync after every N writes
+    durability: Durability = .{ .periodic = 100 },
     replication_callback: PageChangeCallback = null,
     replication_context: ?*anyopaque = null,
     dirty_pages: std.AutoHashMap(u64, void),
@@ -392,6 +404,11 @@ pub const Bucket = struct {
         /// When false, pages are written directly to the main DB file
         /// (simpler but no cross-process MVCC or crash safety).
         wal: bool = true,
+        /// Controls when fsync is called.
+        ///  - .all        — fsync every write (safest, slowest)
+        ///  - .periodic(N) — fsync every N page writes
+        ///  - .manual      — never auto-fsync; call flush() manually
+        durability: Durability = .{ .periodic = 100 },
     };
 
     fn loadIndices(self: *Bucket, page: *const Page) !void {
@@ -559,6 +576,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .durability = options.durability,
             .wal = if (comptime is_posix) null else {},
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
@@ -656,6 +674,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .durability = options.durability,
             .wal = wal_instance,
         };
         errdefer {
@@ -964,13 +983,21 @@ pub const Bucket = struct {
                     try self.dirty_pages.put(page.header.page_id, {});
                 }
 
-                // Batched WAL sync.
-                self.writes_since_sync += 1;
-                if (self.writes_since_sync >= self.sync_threshold) {
-                    w.sync() catch {};
-                    self.writes_since_sync = 0;
-
-                    self.notifyDirtyPages() catch {};
+                // Honour the durability setting for WAL writes.
+                switch (self.durability) {
+                    .all => {
+                        w.sync() catch {};
+                        self.notifyDirtyPages() catch {};
+                    },
+                    .periodic => |threshold| {
+                        self.writes_since_sync += 1;
+                        if (self.writes_since_sync >= threshold) {
+                            w.sync() catch {};
+                            self.writes_since_sync = 0;
+                            self.notifyDirtyPages() catch {};
+                        }
+                    },
+                    .manual => {},
                 }
                 return;
             }
@@ -985,12 +1012,21 @@ pub const Bucket = struct {
             try self.dirty_pages.put(page.header.page_id, {});
         }
 
-        self.writes_since_sync += 1;
-        if (self.writes_since_sync >= self.sync_threshold) {
-            try file.sync();
-            self.writes_since_sync = 0;
-
-            self.notifyDirtyPages() catch {};
+        // Honour the durability setting for direct-file writes.
+        switch (self.durability) {
+            .all => {
+                try file.sync();
+                self.notifyDirtyPages() catch {};
+            },
+            .periodic => |threshold| {
+                self.writes_since_sync += 1;
+                if (self.writes_since_sync >= threshold) {
+                    try file.sync();
+                    self.writes_since_sync = 0;
+                    self.notifyDirtyPages() catch {};
+                }
+            },
+            .manual => {},
         }
     }
 

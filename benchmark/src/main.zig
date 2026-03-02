@@ -329,8 +329,12 @@ pub fn main() !void {
     defer arena.deinit();
 
     // ── Setup Albedo ─────────────────────────────────────────────────────
-    var bucket = try Bucket.openFileWithOptions(arena.allocator(), "file.bucket", .{});
+    var bucket = try Bucket.openFileWithOptions(arena.allocator(), "file.bucket", .{
+        .wal = true,
+    });
     defer bucket.deinit();
+
+    // bucket.sync_threshold = 2000;
 
     // ── Setup SQLite ─────────────────────────────────────────────────────
     var db = try sqlite.Db.init(.{
