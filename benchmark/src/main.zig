@@ -7,7 +7,7 @@ const Query = albedo.Query;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-const NUM_RECORDS: usize = 100000;
+const NUM_RECORDS: usize = 100_000;
 const SEARCH_ITERATIONS: usize = 1000;
 const SEARCH_TARGET_NAME = std.fmt.comptimePrint("record_{}", .{NUM_RECORDS - 2});
 const SEARCH_TARGET_AGE: i32 = 42;
@@ -24,9 +24,9 @@ fn print(comptime fmt: []const u8, args: anytype) void {
     write(s);
 }
 
-// ─── Pretty Printing Helpers ─────────────────────────────────────────────────
+// ─── Colors ──────────────────────────────────────────────────────────────────
 
-const Color = struct {
+const C = struct {
     const reset = "\x1b[0m";
     const bold = "\x1b[1m";
     const dim = "\x1b[2m";
@@ -34,68 +34,117 @@ const Color = struct {
     const green = "\x1b[32m";
     const yellow = "\x1b[33m";
     const magenta = "\x1b[35m";
-    const white = "\x1b[37m";
     const blue = "\x1b[34m";
     const red = "\x1b[31m";
 };
 
-fn printHeader() void {
-    print("\n", .{});
-    print("{s}{s}  ╔══════════════════════════════════════════════════════════╗{s}\n", .{ Color.bold, Color.cyan, Color.reset });
-    print("{s}{s}  ║          ◆  ALBEDO  vs  SQLITE  BENCHMARK  ◆           ║{s}\n", .{ Color.bold, Color.cyan, Color.reset });
-    print("{s}{s}  ╚══════════════════════════════════════════════════════════╝{s}\n", .{ Color.bold, Color.cyan, Color.reset });
-    print("{s}  Records: {d}  |  Search iterations: {d}{s}\n\n", .{ Color.dim, NUM_RECORDS, SEARCH_ITERATIONS, Color.reset });
-}
+// ─── Statistics ──────────────────────────────────────────────────────────────
 
-fn printSectionHeader(title: []const u8) void {
-    print("  {s}{s}▐ {s}{s}\n", .{ Color.bold, Color.yellow, title, Color.reset });
-    print("  {s}├──────────────────────────────────────────────────────────{s}\n", .{ Color.dim, Color.reset });
-}
+const Stats = struct {
+    runs: usize,
+    avg_ns: f64,
+    stddev_ns: f64,
+    min_ns: u64,
+    max_ns: u64,
+    p75_ns: u64,
+    p99_ns: u64,
+    p995_ns: u64,
+};
 
-fn printResult(label: []const u8, nanos: u64) void {
-    const ms = @as(f64, @floatFromInt(nanos)) / 1_000_000.0;
-    const color = if (ms < 10.0) Color.green else if (ms < 100.0) Color.yellow else Color.red;
-    print("  {s}│{s}  {s:<20} {s}{s}{d:>10.3} ms{s}\n", .{ Color.dim, Color.reset, label, Color.bold, color, ms, Color.reset });
-}
+fn computeStats(samples: []u64) Stats {
+    const n = samples.len;
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
 
-fn printOpsPerSec(label: []const u8, nanos: u64, ops: usize) void {
-    const secs = @as(f64, @floatFromInt(nanos)) / 1_000_000_000.0;
-    const ops_sec = @as(f64, @floatFromInt(ops)) / secs;
-    const avg_us = @as(f64, @floatFromInt(nanos)) / @as(f64, @floatFromInt(ops)) / 1_000.0;
-    print("  {s}│{s}  {s:<20} {s}{d:>10.0} ops/s  {s}{d:>8.2} µs/op{s}\n", .{ Color.dim, Color.reset, label, Color.magenta, ops_sec, Color.dim, avg_us, Color.reset });
-}
+    var sum: f64 = 0;
+    for (samples) |s| sum += @floatFromInt(s);
+    const avg = sum / @as(f64, @floatFromInt(n));
 
-fn printWinner(albedo_ns: u64, sqlite_ns: u64) void {
-    if (albedo_ns < sqlite_ns) {
-        const speedup = @as(f64, @floatFromInt(sqlite_ns)) / @as(f64, @floatFromInt(albedo_ns));
-        print("  {s}│{s}  {s}{s}  ★ Albedo wins — {d:.1}x faster{s}\n", .{ Color.dim, Color.reset, Color.bold, Color.green, speedup, Color.reset });
-    } else if (sqlite_ns < albedo_ns) {
-        const speedup = @as(f64, @floatFromInt(albedo_ns)) / @as(f64, @floatFromInt(sqlite_ns));
-        print("  {s}│{s}  {s}{s}  ★ SQLite wins — {d:.1}x faster{s}\n", .{ Color.dim, Color.reset, Color.bold, Color.blue, speedup, Color.reset });
-    } else {
-        print("  {s}│{s}  {s}  ≈ Tie{s}\n", .{ Color.dim, Color.reset, Color.yellow, Color.reset });
+    var var_sum: f64 = 0;
+    for (samples) |s| {
+        const d = @as(f64, @floatFromInt(s)) - avg;
+        var_sum += d * d;
     }
-    print("  {s}│{s}\n", .{ Color.dim, Color.reset });
+    const stddev = @sqrt(var_sum / @as(f64, @floatFromInt(n)));
+
+    return .{
+        .runs = n,
+        .avg_ns = avg,
+        .stddev_ns = stddev,
+        .min_ns = samples[0],
+        .max_ns = samples[n - 1],
+        .p75_ns = samples[@min(n - 1, (n * 75) / 100)],
+        .p99_ns = samples[@min(n - 1, (n * 99) / 100)],
+        .p995_ns = samples[@min(n - 1, (n * 995) / 1000)],
+    };
 }
 
-fn printBar(albedo_ns: u64, sqlite_ns: u64) void {
-    const max_ns = @max(albedo_ns, sqlite_ns);
-    const bar_width: usize = 40;
+fn fmtTime(ns: u64) [10]u8 {
+    return fmtTimeF(@floatFromInt(ns));
+}
 
-    const a_width: usize = if (max_ns > 0) @intFromFloat(@as(f64, @floatFromInt(albedo_ns)) / @as(f64, @floatFromInt(max_ns)) * @as(f64, @floatFromInt(bar_width))) else 0;
-    const s_width: usize = if (max_ns > 0) @intFromFloat(@as(f64, @floatFromInt(sqlite_ns)) / @as(f64, @floatFromInt(max_ns)) * @as(f64, @floatFromInt(bar_width))) else 0;
+fn fmtTimeF(ns: f64) [10]u8 {
+    var buf: [10]u8 = .{' '} ** 10;
+    if (ns < 1_000.0) {
+        _ = std.fmt.bufPrint(&buf, "{d:>6.1} ns", .{ns}) catch {};
+    } else if (ns < 1_000_000.0) {
+        _ = std.fmt.bufPrint(&buf, "{d:>6.2} us", .{ns / 1_000.0}) catch {};
+    } else if (ns < 1_000_000_000.0) {
+        _ = std.fmt.bufPrint(&buf, "{d:>6.2} ms", .{ns / 1_000_000.0}) catch {};
+    } else {
+        _ = std.fmt.bufPrint(&buf, "{d:>7.3} s", .{ns / 1_000_000_000.0}) catch {};
+    }
+    return buf;
+}
 
-    print("  {s}│{s}  {s}Albedo{s} ", .{ Color.dim, Color.reset, Color.cyan, Color.reset });
-    for (0..a_width) |_| write("\x1b[36m█\x1b[0m");
+// ─── Table Output ────────────────────────────────────────────────────────────
+
+fn printTableHeader() void {
+    print("\n  {s}{s}{s:<22} {s:>5}  {s:>23}  {s:>23}  {s:>10} {s:>10} {s:>10}{s}\n", .{
+        C.bold,             C.cyan,
+        "benchmark",        "runs",
+        "time (avg ± σ)", "(min … max)",
+        "p75",              "p99",
+        "p995",             C.reset,
+    });
+    write("  ");
+    for (0..112) |_| write("\xe2\x94\x80"); // ─
     write("\n");
+}
 
-    print("  {s}│{s}  {s}SQLite{s} ", .{ Color.dim, Color.reset, Color.blue, Color.reset });
-    for (0..s_width) |_| write("\x1b[34m█\x1b[0m");
+fn printRow(name: []const u8, s: Stats, color: []const u8) void {
+    const avg = fmtTimeF(s.avg_ns);
+    const dev = fmtTimeF(s.stddev_ns);
+    const lo = fmtTime(s.min_ns);
+    const hi = fmtTime(s.max_ns);
+    const p75 = fmtTime(s.p75_ns);
+    const p99 = fmtTime(s.p99_ns);
+    const p995 = fmtTime(s.p995_ns);
+
+    print("  {s}{s:<22}{s}", .{ color, name, C.reset });
+    print(" {s}{d:>5}{s}", .{ C.dim, s.runs, C.reset });
+    print("  {s}{s}{s} ± {s}{s}{s}", .{ C.bold, &avg, C.reset, C.dim, &dev, C.reset });
+    print("  {s}({s} … {s}){s}", .{ C.dim, &lo, &hi, C.reset });
+    print("  {s}", .{&p75});
+    print(" {s}", .{&p99});
+    print(" {s}", .{&p995});
     write("\n");
+}
+
+fn printWinner(a: Stats, b: Stats) void {
+    if (a.avg_ns < b.avg_ns) {
+        const speedup = b.avg_ns / a.avg_ns;
+        print("  {s}{s}★ Albedo is {d:.2}x faster{s}\n\n", .{ C.bold, C.green, speedup, C.reset });
+    } else if (b.avg_ns < a.avg_ns) {
+        const speedup = a.avg_ns / b.avg_ns;
+        print("  {s}{s}★ SQLite is {d:.2}x faster{s}\n\n", .{ C.bold, C.blue, speedup, C.reset });
+    } else {
+        print("  {s}≈ Tie{s}\n\n", .{ C.yellow, C.reset });
+    }
 }
 
 // ─── Benchmark Functions ─────────────────────────────────────────────────────
 
+/// Insert benchmark: single bulk run of NUM_RECORDS inserts, returns total ns.
 fn benchAlbedoInsert(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
     var timer = try std.time.Timer.start();
 
@@ -121,8 +170,6 @@ fn benchAlbedoInsert(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
 fn benchSqliteInsert(db: *sqlite.Db) !u64 {
     var timer = try std.time.Timer.start();
 
-    // try db.exec("BEGIN TRANSACTION", .{}, .{});
-
     var stmt = try db.prepare("INSERT INTO docs (name, age, email, active) VALUES (?, ?, ?, ?)");
     defer stmt.deinit();
 
@@ -144,179 +191,129 @@ fn benchSqliteInsert(db: *sqlite.Db) !u64 {
         stmt.reset();
     }
 
-    // try db.exec("COMMIT", .{}, .{});
-
     return timer.read();
 }
 
-fn benchAlbedoScan(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
-    var timer = try std.time.Timer.start();
+/// Per-iteration benchmarks fill samples[] with per-iteration nanoseconds.
+fn benchAlbedoScan(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
+    for (samples) |*sample| {
+        var timer = try std.time.Timer.start();
 
-    for (0..SEARCH_ITERATIONS) |_| {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
+        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+        defer arena_alloc.deinit();
 
         var qdoc = try bson.fmt.serialize(.{
             .query = .{ .name = @as([]const u8, SEARCH_TARGET_NAME) },
-        }, arena.allocator());
-        defer qdoc.deinit(arena.allocator());
+        }, arena_alloc.allocator());
+        defer qdoc.deinit(arena_alloc.allocator());
 
-        var q = try Query.parse(arena.allocator(), qdoc);
-        defer q.deinit(arena.allocator());
+        var q = try Query.parse(arena_alloc.allocator(), qdoc);
+        defer q.deinit(arena_alloc.allocator());
 
-        var iter = try bucket.listIterate(&arena, q);
+        var iter = try bucket.listIterate(&arena_alloc, q);
         defer iter.deinit() catch {};
 
-        var count: usize = 0;
-        while (try iter.next(iter)) |_| {
-            count += 1;
-        }
+        while (try iter.next(iter)) |_| {}
 
-        if (count == 0) {
-            std.debug.print("  {s}│  ⚠ Albedo scan found 0 results{s}\n", .{ Color.dim, Color.reset });
-        }
+        sample.* = timer.read();
     }
-
-    return timer.read();
 }
 
-fn benchSqliteScan(db: *sqlite.Db) !u64 {
-    var timer = try std.time.Timer.start();
-
+fn benchSqliteScan(db: *sqlite.Db, samples: []u64) !void {
     var stmt = try db.prepare("SELECT id, age, active FROM docs WHERE name = ?");
     defer stmt.deinit();
 
-    for (0..SEARCH_ITERATIONS) |_| {
+    for (samples) |*sample| {
+        var timer = try std.time.Timer.start();
+
         const Row = struct { id: i64, age: i32, active: i32 };
         var iter = try stmt.iterator(Row, .{@as([]const u8, SEARCH_TARGET_NAME)});
+        while (try iter.next(.{})) |_| {}
 
-        var count: usize = 0;
-        while (try iter.next(.{})) |_| {
-            count += 1;
-        }
-
-        if (count == 0) {
-            std.debug.print("  {s}│  ⚠ SQLite scan found 0 results{s}\n", .{ Color.dim, Color.reset });
-        }
-
+        sample.* = timer.read();
         stmt.reset();
     }
-
-    return timer.read();
 }
 
-fn benchAlbedoIndexSearch(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
-    var timer = try std.time.Timer.start();
+fn benchAlbedoIndexSearch(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
+    for (samples) |*sample| {
+        var timer = try std.time.Timer.start();
 
-    for (0..SEARCH_ITERATIONS) |_| {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
+        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+        defer arena_alloc.deinit();
 
         const qdoc = try bson.fmt.serialize(.{
             .query = .{ .age = SEARCH_TARGET_AGE },
-        }, arena.allocator());
+        }, arena_alloc.allocator());
 
-        const q = try Query.parse(arena.allocator(), qdoc);
+        const q = try Query.parse(arena_alloc.allocator(), qdoc);
 
-        const iter = try bucket.listIterate(&arena, q);
+        const iter = try bucket.listIterate(&arena_alloc, q);
         defer iter.deinit() catch {};
 
-        var count: usize = 0;
-        while (try iter.next(iter)) |_| {
-            count += 1;
-        }
+        while (try iter.next(iter)) |_| {}
 
-        if (count != 1) {
-            std.debug.print("  {s}│  ⚠ Albedo index search found 0 results{s}\n", .{ Color.dim, Color.reset });
-        }
+        sample.* = timer.read();
     }
-
-    return timer.read();
 }
 
-fn benchSqliteIndexSearch(db: *sqlite.Db) !u64 {
-    var timer = try std.time.Timer.start();
-
+fn benchSqliteIndexSearch(db: *sqlite.Db, samples: []u64) !void {
     var stmt = try db.prepare("SELECT id, age, active FROM docs WHERE age = ?");
     defer stmt.deinit();
 
-    for (0..SEARCH_ITERATIONS) |_| {
+    for (samples) |*sample| {
+        var timer = try std.time.Timer.start();
+
         const Row = struct { id: i64, age: i32, active: i32 };
         var iter = try stmt.iterator(Row, .{SEARCH_TARGET_AGE});
+        while (try iter.next(.{})) |_| {}
 
-        var count: usize = 0;
-        while (try iter.next(.{})) |_| {
-            count += 1;
-        }
-
-        if (count == 0) {
-            std.debug.print("  {s}│  ⚠ SQLite index search found 0 results{s}\n", .{ Color.dim, Color.reset });
-        }
-
+        sample.* = timer.read();
         stmt.reset();
     }
-
-    return timer.read();
 }
 
-fn benchAlbedoReadAll(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
-    var timer = try std.time.Timer.start();
+fn benchAlbedoReadAll(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
+    for (samples) |*sample| {
+        var timer = try std.time.Timer.start();
 
-    for (0..SEARCH_ITERATIONS) |_| {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
+        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+        defer arena_alloc.deinit();
 
         var qdoc = try bson.fmt.serialize(.{
             .query = .{},
-            .sector = .{
-                .limit = 1000, // Large limit to read all records
-            },
-        }, arena.allocator());
+            .sector = .{ .limit = 1000 },
+        }, arena_alloc.allocator());
         _ = &qdoc;
 
-        const q = try Query.parse(arena.allocator(), qdoc);
+        const q = try Query.parse(arena_alloc.allocator(), qdoc);
 
-        var iter = try bucket.listIterate(&arena, q);
+        var iter = try bucket.listIterate(&arena_alloc, q);
         defer iter.deinit() catch {};
 
-        var count: usize = 0;
         while (try iter.next(iter)) |doc| {
             const Row = struct { name: []const u8, age: i32, email: []const u8, active: bool };
             _ = try bson.fmt.parse(Row, doc, allocator);
-            count += 1;
         }
 
-        if (count != NUM_RECORDS) {
-            std.debug.print("  {s}│  ⚠ Albedo read all: expected {d}, got {d}{s}\n", .{ Color.dim, NUM_RECORDS, count, Color.reset });
-        }
+        sample.* = timer.read();
     }
-
-    return timer.read();
 }
 
-fn benchSqliteReadAll(db: *sqlite.Db) !u64 {
-    var timer = try std.time.Timer.start();
-
-    var stmt = try db.prepare("SELECT id, age, active FROM docs LIMIT 1000"); // Large limit to read all records
+fn benchSqliteReadAll(db: *sqlite.Db, samples: []u64) !void {
+    var stmt = try db.prepare("SELECT id, age, active FROM docs LIMIT 1000");
     defer stmt.deinit();
 
-    for (0..SEARCH_ITERATIONS) |_| {
+    for (samples) |*sample| {
+        var timer = try std.time.Timer.start();
+
         const Row = struct { id: i64, age: i32, active: i32 };
         var iter = try stmt.iterator(Row, .{});
+        while (try iter.next(.{})) |_| {}
 
-        var count: usize = 0;
-        while (try iter.next(.{})) |_| {
-            count += 1;
-        }
-
-        if (count != NUM_RECORDS) {
-            std.debug.print("  {s}│  ⚠ SQLite read all: expected {d}, got {d}{s}\n", .{ Color.dim, NUM_RECORDS, count, Color.reset });
-        }
-
+        sample.* = timer.read();
         stmt.reset();
     }
-
-    return timer.read();
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -327,8 +324,6 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    printHeader();
-
     // ── Setup Albedo ─────────────────────────────────────────────────────
     var bucket = try Bucket.init(arena.allocator(), "file.bucket");
     defer bucket.deinit();
@@ -336,16 +331,12 @@ pub fn main() !void {
     // ── Setup SQLite ─────────────────────────────────────────────────────
     var db = try sqlite.Db.init(.{
         .mode = sqlite.Db.Mode{ .File = "file.sqlite" },
-        .open_flags = .{
-            .write = true,
-            .create = true,
-        },
+        .open_flags = .{ .write = true, .create = true },
         .threading_mode = .Serialized,
     });
     defer db.deinit();
 
     // No WAL — use rollback journal like Albedo's direct-write model.
-    // synchronous=NORMAL: fsync on commit but not on journal write.
     _ = try db.pragma(void, .{}, "journal_mode", "DELETE");
     _ = try db.pragma(void, .{}, "synchronous", "NORMAL");
     try db.exec(
@@ -354,127 +345,79 @@ pub fn main() !void {
         .{},
     );
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 1. INSERTION BENCHMARK
-    // ══════════════════════════════════════════════════════════════════════
-    printSectionHeader("1 ▸ x100k Insertion Speed");
+    // ── Print header ─────────────────────────────────────────────────────
+    print("\n  {s}{s}◆  ALBEDO vs SQLITE  ◆{s}", .{ C.bold, C.cyan, C.reset });
+    print("  {s}records={d}  iters={d}{s}\n", .{ C.dim, NUM_RECORDS, SEARCH_ITERATIONS, C.reset });
 
-    const albedo_insert_ns = try benchAlbedoInsert(arena.allocator(), &bucket);
-    printResult("Albedo", albedo_insert_ns);
-    printOpsPerSec("", albedo_insert_ns, NUM_RECORDS);
-
-    const sqlite_insert_ns = try benchSqliteInsert(&db);
-    printResult("SQLite", sqlite_insert_ns);
-    printOpsPerSec("", sqlite_insert_ns, NUM_RECORDS);
-
-    printBar(albedo_insert_ns, sqlite_insert_ns);
-    printWinner(albedo_insert_ns, sqlite_insert_ns);
+    printTableHeader();
 
     // ══════════════════════════════════════════════════════════════════════
-    // 2. FULL SCAN (no index on name)
+    // 1. INSERTION — single bulk run
     // ══════════════════════════════════════════════════════════════════════
-    printSectionHeader("2 ▸ x1000 Column Scan (no index)");
+    {
+        const a_ns = try benchAlbedoInsert(arena.allocator(), &bucket);
+        const s_ns = try benchSqliteInsert(&db);
 
-    const albedo_scan_ns = try benchAlbedoScan(arena.allocator(), &bucket);
-    printResult("Albedo", albedo_scan_ns);
-    printOpsPerSec("", albedo_scan_ns, SEARCH_ITERATIONS);
+        var a_buf = [_]u64{a_ns};
+        var s_buf = [_]u64{s_ns};
+        const a_stats = computeStats(&a_buf);
+        const s_stats = computeStats(&s_buf);
 
-    const sqlite_scan_ns = try benchSqliteScan(&db);
-    printResult("SQLite", sqlite_scan_ns);
-    printOpsPerSec("", sqlite_scan_ns, SEARCH_ITERATIONS);
-
-    printBar(albedo_scan_ns, sqlite_scan_ns);
-    printWinner(albedo_scan_ns, sqlite_scan_ns);
+        printRow("Albedo insert 100k", a_stats, C.cyan);
+        printRow("SQLite insert 100k", s_stats, C.blue);
+        printWinner(a_stats, s_stats);
+    }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 3. READ ALL
+    // 2. COLUMN SCAN (no index)
     // ══════════════════════════════════════════════════════════════════════
-    printSectionHeader("3 ▸ Read 1000x Documents");
+    {
+        var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        try benchAlbedoScan(arena.allocator(), &bucket, &a_samples);
+        try benchSqliteScan(&db, &s_samples);
+        const a_stats = computeStats(&a_samples);
+        const s_stats = computeStats(&s_samples);
 
-    const albedo_read_ns = try benchAlbedoReadAll(arena.allocator(), &bucket);
-    printResult("Albedo", albedo_read_ns);
-    printOpsPerSec("", albedo_read_ns, SEARCH_ITERATIONS);
+        printRow("Albedo scan", a_stats, C.cyan);
+        printRow("SQLite scan", s_stats, C.blue);
+        printWinner(a_stats, s_stats);
+    }
 
-    const sqlite_read_ns = try benchSqliteReadAll(&db);
-    printResult("SQLite", sqlite_read_ns);
-    printOpsPerSec("", sqlite_read_ns, SEARCH_ITERATIONS);
+    // ══════════════════════════════════════════════════════════════════════
+    // 3. READ 1000 DOCUMENTS
+    // ══════════════════════════════════════════════════════════════════════
+    {
+        var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        try benchAlbedoReadAll(arena.allocator(), &bucket, &a_samples);
+        try benchSqliteReadAll(&db, &s_samples);
+        const a_stats = computeStats(&a_samples);
+        const s_stats = computeStats(&s_samples);
 
-    printBar(albedo_read_ns, sqlite_read_ns);
-    printWinner(albedo_read_ns, sqlite_read_ns);
+        printRow("Albedo read 1000", a_stats, C.cyan);
+        printRow("SQLite read 1000", s_stats, C.blue);
+        printWinner(a_stats, s_stats);
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // 4. INDEX-BASED SEARCH
     // ══════════════════════════════════════════════════════════════════════
-    printSectionHeader("4 ▸ 1000x Indexed Search");
+    {
+        try bucket.ensureIndex("age", .{});
+        try db.exec("CREATE INDEX IF NOT EXISTS idx_age ON docs(age)", .{}, .{});
 
-    // std.log.debug("Data: {x}", .{bucket.pageCache.get(2).?.data[4358 + 32 .. 4362 + 32]});
-    // Create indexes on "age" for both
-    try bucket.ensureIndex("age", .{});
+        var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        try benchAlbedoIndexSearch(arena.allocator(), &bucket, &a_samples);
+        try benchSqliteIndexSearch(&db, &s_samples);
+        const a_stats = computeStats(&a_samples);
+        const s_stats = computeStats(&s_samples);
 
-    // std.log.debug("Data: {x}", .{bucket.pageCache.get(2).?.data[4358 + 32 .. 4362 + 32]});
-    try db.exec("CREATE INDEX IF NOT EXISTS idx_age ON docs(age)", .{}, .{});
-
-    const albedo_idx_ns = try benchAlbedoIndexSearch(arena.allocator(), &bucket);
-    printResult("Albedo", albedo_idx_ns);
-    printOpsPerSec("", albedo_idx_ns, SEARCH_ITERATIONS);
-
-    const sqlite_idx_ns = try benchSqliteIndexSearch(&db);
-    printResult("SQLite", sqlite_idx_ns);
-    printOpsPerSec("", sqlite_idx_ns, SEARCH_ITERATIONS);
-
-    printBar(albedo_idx_ns, sqlite_idx_ns);
-    printWinner(albedo_idx_ns, sqlite_idx_ns);
-
-    // ══════════════════════════════════════════════════════════════════════
-    // SUMMARY
-    // ══════════════════════════════════════════════════════════════════════
-    print("  {s}{s}╔══════════════════════════════════════════════════════════╗{s}\n", .{ Color.bold, Color.cyan, Color.reset });
-    print("  {s}{s}║                      SUMMARY                            ║{s}\n", .{ Color.bold, Color.cyan, Color.reset });
-    print("  {s}{s}╠══════════════════════════════════════════════════════════╣{s}\n", .{ Color.bold, Color.cyan, Color.reset });
-    print("  {s}{s}║{s}  {s:<24} {s}{s:>10}   {s}{s:>10}    {s}{s}║{s}\n", .{
-        Color.bold,
-        Color.cyan,
-        Color.reset,
-        "Test",
-        Color.cyan,
-        "Albedo",
-        Color.blue,
-        "SQLite",
-        Color.bold,
-        Color.cyan,
-        Color.reset,
-    });
-    print("  {s}{s}╠══════════════════════════════════════════════════════════╣{s}\n", .{ Color.bold, Color.cyan, Color.reset });
-
-    const tests = [_]struct { name: []const u8, albedo_ns: u64, sqlite_ns: u64 }{
-        .{ .name = "Insert", .albedo_ns = albedo_insert_ns, .sqlite_ns = sqlite_insert_ns },
-        .{ .name = "Column Scan", .albedo_ns = albedo_scan_ns, .sqlite_ns = sqlite_scan_ns },
-        .{ .name = "Read All", .albedo_ns = albedo_read_ns, .sqlite_ns = sqlite_read_ns },
-        .{ .name = "Index Search", .albedo_ns = albedo_idx_ns, .sqlite_ns = sqlite_idx_ns },
-    };
-
-    for (tests) |t| {
-        const a_ms = @as(f64, @floatFromInt(t.albedo_ns)) / 1_000_000.0;
-        const s_ms = @as(f64, @floatFromInt(t.sqlite_ns)) / 1_000_000.0;
-        const marker_a: []const u8 = if (t.albedo_ns <= t.sqlite_ns) " ★" else "  ";
-        const marker_s: []const u8 = if (t.sqlite_ns <= t.albedo_ns) " ★" else "  ";
-
-        print("  {s}{s}║{s}  {s:<24}{s}{d:>8.2} ms{s}{s}{d:>8.2} ms{s}  {s}{s}║{s}\n", .{
-            Color.bold,
-            Color.cyan,
-            Color.reset,
-            t.name,
-            if (t.albedo_ns <= t.sqlite_ns) Color.green else Color.dim,
-            a_ms,
-            marker_a,
-            if (t.sqlite_ns <= t.albedo_ns) Color.green else Color.dim,
-            s_ms,
-            marker_s,
-            Color.bold,
-            Color.cyan,
-            Color.reset,
-        });
+        printRow("Albedo index search", a_stats, C.cyan);
+        printRow("SQLite index search", s_stats, C.blue);
+        printWinner(a_stats, s_stats);
     }
 
-    print("  {s}{s}╚══════════════════════════════════════════════════════════╝{s}\n\n", .{ Color.bold, Color.cyan, Color.reset });
+    write("\n");
 }
