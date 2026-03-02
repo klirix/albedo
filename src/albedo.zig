@@ -328,6 +328,21 @@ pub const Durability = union(enum) {
     manual,
 };
 
+/// Controls how page reads interact with the WAL.
+pub const ReadDurability = enum {
+    /// Always consult the WAL before returning a cached page.
+    /// Required for multi-process readers that must see writes from
+    /// other connections.  This is the safe default.
+    shared,
+    /// Trust the local page cache: return cached pages without
+    /// consulting the WAL.  The WAL is only checked on cache misses.
+    /// Use this for single-process workloads where all writes and
+    /// reads go through the same `Bucket` handle — it avoids the
+    /// SHM lock + skip-list traversal + 8 KB pread on every
+    /// index-node read and restores pre-WAL query performance.
+    process,
+};
+
 pub const Bucket = struct {
     file: ?platform.FileHandle = null,
     path: []const u8,
@@ -347,6 +362,7 @@ pub const Bucket = struct {
     replication_retry_count: u32 = 0,
     max_replication_retries: u32 = 3,
     cached_last_data_page: ?*Page = null,
+    read_durability: ReadDurability = .shared,
     wal: if (is_posix) ?WAL else void = if (is_posix) null else {},
 
     const PageIterator = struct {
@@ -409,6 +425,10 @@ pub const Bucket = struct {
         ///  - .periodic(N) — fsync every N page writes
         ///  - .manual      — never auto-fsync; call flush() manually
         durability: Durability = .{ .periodic = 100 },
+        /// Controls how page reads interact with the WAL.
+        ///  - .shared  — always consult WAL (safe for multi-process readers)
+        ///  - .process — trust local cache, WAL only on miss (fast single-process)
+        read_durability: ReadDurability = .shared,
     };
 
     fn loadIndices(self: *Bucket, page: *const Page) !void {
@@ -577,6 +597,7 @@ pub const Bucket = struct {
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
             .durability = options.durability,
+            .read_durability = options.read_durability,
             .wal = if (comptime is_posix) null else {},
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
@@ -612,6 +633,7 @@ pub const Bucket = struct {
             .objectIdGenerator = generator,
             .in_memory = true,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .read_durability = options.read_durability,
         };
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
@@ -675,6 +697,7 @@ pub const Bucket = struct {
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
             .durability = options.durability,
+            .read_durability = options.read_durability,
             .wal = wal_instance,
         };
         errdefer {
@@ -859,48 +882,65 @@ pub const Bucket = struct {
 
     pub fn loadPage(self: *Bucket, page_id: u64) !*Page {
         if (self.in_memory) {
-            // In-memory buckets have no WAL; the cache is authoritative.
             if (self.pageCache.get(page_id)) |page| {
                 return page;
             }
             return PageError.PageNotFound;
         }
 
-        // In WAL mode, always consult the WAL first.  A parallel writer
-        // from another process may have appended a newer version of this
-        // page since we last cached it.  When the page already exists in
-        // our local cache we update it *in-place* so that any external
-        // pointers (e.g. cached_last_data_page) stay valid.
-        if (comptime is_posix) {
-            if (self.wal) |*w| {
-                if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
-                    const header = PageHeader.read(data[0..PageHeader.byteSize]);
-
-                    if (self.pageCache.get(page_id)) |existing| {
-                        // Refresh the cached page in-place.
-                        existing.header = header;
-                        @memcpy(existing.data, data[PageHeader.byteSize..]);
-                        return existing;
-                    }
-
-                    // First time seeing this page — allocate & cache.
-                    const page = try self.allocator.create(Page);
-                    page.* = try Page.init(self.allocator, self, header);
-                    @memcpy(page.data, data[PageHeader.byteSize..]);
-                    if (try self.pageCache.put(page_id, page)) |evicted| {
-                        _ = evicted;
-                    }
+        // read_durability == .process  →  trust the local cache; only
+        //   consult the WAL on a cache miss.  This avoids SHM lock +
+        //   skip-list lookup + 8 KB pread + checksum on every B+ tree
+        //   node read and restores pre-WAL index performance.
+        //
+        // read_durability == .shared  →  always ask the WAL first so
+        //   that pages written by another process are visible even if
+        //   the local cache holds a stale copy.
+        switch (self.read_durability) {
+            .process => {
+                // Fast path: cache hit → done.
+                if (self.pageCache.get(page_id)) |page| {
                     return page;
-                } else |err| switch (err) {
-                    error.WalPageNotFound => {}, // Not in WAL — fall through.
-                    else => {},
                 }
-            }
-        }
+                // Cache miss — try the WAL, then the main DB file.
+                if (comptime is_posix) {
+                    if (self.wal) |*w| {
+                        if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
+                            return try self.cachePageFromWal(page_id, data);
+                        } else |err| switch (err) {
+                            error.WalPageNotFound => {},
+                            else => {},
+                        }
+                    }
+                }
+            },
+            .shared => {
+                // Always consult the WAL first for cross-process visibility.
+                if (comptime is_posix) {
+                    if (self.wal) |*w| {
+                        if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
+                            const header = PageHeader.read(data[0..PageHeader.byteSize]);
 
-        // Fall back to the local page cache, then the main DB file.
-        if (self.pageCache.get(page_id)) |page| {
-            return page;
+                            if (self.pageCache.get(page_id)) |existing| {
+                                // Refresh the cached page in-place.
+                                existing.header = header;
+                                @memcpy(existing.data, data[PageHeader.byteSize..]);
+                                return existing;
+                            }
+
+                            return try self.cachePageFromWal(page_id, data);
+                        } else |err| switch (err) {
+                            error.WalPageNotFound => {},
+                            else => {},
+                        }
+                    }
+                }
+
+                // Not in WAL — check the cache before hitting disk.
+                if (self.pageCache.get(page_id)) |page| {
+                    return page;
+                }
+            },
         }
 
         const file = if (self.file) |*f| f else return error.StorageUnavailable;
@@ -939,6 +979,18 @@ pub const Bucket = struct {
             _ = evicted;
         }
 
+        return page;
+    }
+
+    /// Allocate a new Page from raw WAL data, cache it, and return it.
+    fn cachePageFromWal(self: *Bucket, page_id: u64, data: [wal_mod.DEFAULT_PAGE_SIZE]u8) !*Page {
+        const header = PageHeader.read(data[0..PageHeader.byteSize]);
+        const page = try self.allocator.create(Page);
+        page.* = try Page.init(self.allocator, self, header);
+        @memcpy(page.data, data[PageHeader.byteSize..]);
+        if (try self.pageCache.put(page_id, page)) |evicted| {
+            _ = evicted;
+        }
         return page;
     }
 

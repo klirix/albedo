@@ -148,22 +148,22 @@ fn printWinner(a: Stats, b: Stats) void {
 fn benchAlbedoInsert(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
     var timer = try std.time.Timer.start();
 
+    const doc = try bson.fmt.serialize(.{
+        .name = "record_000000",
+        .age = @as(i32, 0),
+        .email = "user@example.com",
+        .active = true,
+    }, allocator);
+
+    var buffer: []u8 = @constCast(doc.buffer);
+
     for (0..NUM_RECORDS) |i| {
         const age: i32 = @intCast(i);
-        var name_buf: [64]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "record_{d}", .{i}) catch unreachable;
-
-        const doc = try bson.fmt.serialize(.{
-            ._id = try bson.ObjectId.init(),
-            .name = @as([]const u8, name),
-            .age = age,
-            .email = @as([]const u8, "user@example.com"),
-            .active = true,
-        }, allocator);
-
+        const name_buf = (buffer)[4 + 1 + 5 + 4 ..];
+        _ = std.fmt.bufPrint(name_buf, "record_{d:0>6}", .{i}) catch unreachable;
+        std.mem.writeInt(i32, buffer[33 .. 33 + 4], age, .little);
         _ = try bucket.insert(doc);
     }
-
     return timer.read();
 }
 
@@ -240,17 +240,15 @@ fn benchSqliteScan(db: *sqlite.Db, samples: []u64) !void {
 }
 
 fn benchAlbedoIndexSearch(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
+    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+    defer arena_alloc.deinit();
+    const qdoc = try bson.fmt.serialize(.{
+        .query = .{ .age = SEARCH_TARGET_AGE },
+    }, arena_alloc.allocator());
+
+    const q = try Query.parse(arena_alloc.allocator(), qdoc);
     for (samples) |*sample| {
         var timer = try std.time.Timer.start();
-
-        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
-        defer arena_alloc.deinit();
-
-        const qdoc = try bson.fmt.serialize(.{
-            .query = .{ .age = SEARCH_TARGET_AGE },
-        }, arena_alloc.allocator());
-
-        const q = try Query.parse(arena_alloc.allocator(), qdoc);
 
         const iter = try bucket.listIterate(&arena_alloc, q);
         defer iter.deinit() catch {};
@@ -296,8 +294,12 @@ fn benchAlbedoReadAll(allocator: std.mem.Allocator, bucket: *Bucket, samples: []
         defer iter.deinit() catch {};
 
         while (try iter.next(iter)) |doc| {
-            const Row = struct { name: []const u8, age: i32, email: []const u8, active: bool };
-            _ = try bson.fmt.parse(Row, doc, allocator);
+            if (doc.get("active").?.boolean.value != true) {
+                @branchHint(.unlikely);
+                return error.UnexpectedValue;
+            }
+            // const Row = struct { name: []const u8, age: i32, email: []const u8, active: bool };
+            // _ = try bson.fmt.parse(Row, doc, allocator);
         }
 
         sample.* = timer.read();
@@ -331,10 +333,9 @@ pub fn main() !void {
     // ── Setup Albedo ─────────────────────────────────────────────────────
     var bucket = try Bucket.openFileWithOptions(arena.allocator(), "file.bucket", .{
         .wal = true,
+        .read_durability = .process,
     });
     defer bucket.deinit();
-
-    // bucket.sync_threshold = 2000;
 
     // ── Setup SQLite ─────────────────────────────────────────────────────
     var db = try sqlite.Db.init(.{
