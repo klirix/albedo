@@ -62,8 +62,7 @@
         //    .lazy = false,
         //},
         .Albedo = .{
-            .url = "..",
-            .hash = "Albedo-0.5.3-BBOn1aJ7BQCflw5rDlzGsk521Z-PFmLmUQa2Xs8yjG7t",
+            .path = "..",
         },
         .sqlite = .{
             .url = "git+https://github.com/vrischmann/zig-sqlite#0b75ba276d34de3141ec1697e3ef7c836d7b38e7",

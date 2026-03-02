@@ -196,7 +196,11 @@ fn benchSqliteInsert(db: *sqlite.Db) !u64 {
 
 /// Per-iteration benchmarks fill samples[] with per-iteration nanoseconds.
 fn benchAlbedoScan(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
-    for (samples) |*sample| {
+    for (samples, 0..) |*sample, i| {
+        if (i >= SEARCH_ITERATIONS) break;
+        if (@mod(1, 10) == 0) {
+            print("  {s}Albedo scan iteration {d}/{d}{s}\n", .{ C.dim, i + 1, SEARCH_ITERATIONS, C.reset });
+        }
         var timer = try std.time.Timer.start();
 
         var arena_alloc = std.heap.ArenaAllocator.init(allocator);
@@ -213,7 +217,7 @@ fn benchAlbedoScan(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64
         var iter = try bucket.listIterate(&arena_alloc, q);
         defer iter.deinit() catch {};
 
-        while (try iter.next(iter)) |_| {}
+        while ((try iter.next(iter))) |_| {}
 
         sample.* = timer.read();
     }
@@ -325,7 +329,7 @@ pub fn main() !void {
     defer arena.deinit();
 
     // ── Setup Albedo ─────────────────────────────────────────────────────
-    var bucket = try Bucket.init(arena.allocator(), "file.bucket");
+    var bucket = try Bucket.openFileWithOptions(arena.allocator(), "file.bucket", .{});
     defer bucket.deinit();
 
     // ── Setup SQLite ─────────────────────────────────────────────────────
@@ -337,8 +341,8 @@ pub fn main() !void {
     defer db.deinit();
 
     // No WAL — use rollback journal like Albedo's direct-write model.
-    _ = try db.pragma(void, .{}, "journal_mode", "DELETE");
-    _ = try db.pragma(void, .{}, "synchronous", "NORMAL");
+    _ = try db.pragma(void, .{}, "journal_mode", "WAL");
+    // _ = try db.pragma(void, .{}, "synchronous", "NORMAL");
     try db.exec(
         "CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age INTEGER, email TEXT, active INTEGER)",
         .{},

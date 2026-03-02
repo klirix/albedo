@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 pub const bson = @import("bson.zig");
 pub const BSONValue = bson.BSONValue;
 pub const BSONDocument = bson.BSONDocument;
@@ -11,6 +12,11 @@ pub const Query = query.Query;
 const bindex = @import("bplusindex.zig");
 const Index = bindex.Index;
 const IndexOptions = bindex.IndexOptions;
+
+/// WAL is only supported on POSIX targets (Linux / macOS).
+const is_posix = builtin.os.tag == .linux or builtin.os.tag == .macos;
+pub const wal_mod = if (is_posix) @import("wal.zig") else struct {};
+pub const WAL = if (is_posix) wal_mod.WAL else void;
 
 const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
@@ -329,6 +335,7 @@ pub const Bucket = struct {
     replication_retry_count: u32 = 0,
     max_replication_retries: u32 = 3,
     cached_last_data_page: ?*Page = null,
+    wal: if (is_posix) ?WAL else void = if (is_posix) null else {},
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -349,7 +356,13 @@ pub const Bucket = struct {
                     found = page.header.page_type == self.type;
                 } else {
                     if (self.index >= self.bucket.header.page_count) {
-                        return null;
+                        // WAL mode: another connection may have created new
+                        // pages since we last checked.  Refresh the header
+                        // from the mmap'd WAL index before giving up.
+                        self.bucket.loadHeaderFromWal();
+                        if (self.index >= self.bucket.header.page_count) {
+                            return null;
+                        }
                     }
                     page = try self.bucket.loadPage(self.index);
                     found = page.header.page_type == self.type;
@@ -370,11 +383,15 @@ pub const Bucket = struct {
         ReadWrite,
     };
 
-    const OpenBucketOptions = struct {
+    pub const OpenBucketOptions = struct {
         buildIdIndex: bool = false,
         mode: BucketFileMode = BucketFileMode.ReadWrite,
         auto_vaccuum: bool = true,
         page_cache_capacity: usize = DEFAULT_PAGE_CACHE_CAPACITY,
+        /// Enable the Write-Ahead Log for crash recovery and MVCC.
+        /// When false, pages are written directly to the main DB file
+        /// (simpler but no cross-process MVCC or crash safety).
+        wal: bool = true,
     };
 
     fn loadIndices(self: *Bucket, page: *const Page) !void {
@@ -529,6 +546,9 @@ pub const Bucket = struct {
             return BucketInitErrors.UnexpectedError;
         };
 
+        // Bootstrap the file WITHOUT the WAL so that the header and meta
+        // page are written directly to the main file.  This ensures the
+        // DB file always has a valid baseline, just like SQLite.
         var bucket = Bucket{
             .file = new_file,
             .path = stored_path,
@@ -539,6 +559,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .wal = if (comptime is_posix) null else {},
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
@@ -546,6 +567,15 @@ pub const Bucket = struct {
         bucket.ensureIndex("_id", .{ .unique = 1 }) catch return BucketInitErrors.InitializationError;
 
         bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
+
+        // Sync the baseline to disk before activating the WAL.
+        if (bucket.file) |*f| f.sync() catch {};
+
+        // Now attach the WAL for subsequent operations (if enabled).
+        bucket.wal = if (comptime is_posix)
+            (if (options.wal) initWal(ally, path) else null)
+        else {};
+
         bucket.rwlock = .{};
 
         return bucket;
@@ -612,6 +642,10 @@ pub const Bucket = struct {
             return BucketInitErrors.UnexpectedError;
         };
 
+        const wal_instance = if (comptime is_posix)
+            (if (options.wal) initWal(ally, path) else null)
+        else {};
+
         var bucket = Bucket{
             .file = file,
             .path = stored_path,
@@ -622,12 +656,24 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .wal = wal_instance,
         };
         errdefer {
             if (bucket.file) |*fh| fh.close();
             bucket.pageCache.deinit();
             bucket.indexes.deinit();
             ally.free(bucket.path);
+            if (comptime is_posix) {
+                if (bucket.wal) |*w| w.deinit();
+            }
+        }
+
+        // In WAL mode the SHM index (rebuilt inside WAL.init) already
+        // makes un-checkpointed frames visible to loadPage.  We only
+        // need to pick up the latest BucketHeader from the WAL (if any)
+        // so that page_count / doc_count are correct.
+        if (comptime is_posix) {
+            bucket.loadHeaderFromWal();
         }
 
         const meta = bucket.loadPage(0) catch {
@@ -641,16 +687,77 @@ pub const Bucket = struct {
         return bucket;
     }
 
+    /// Load the most recent BucketHeader from the WAL (if one exists).
+    /// Called on open so that page_count / doc_count reflect any writes
+    /// that were committed to the WAL but not yet checkpointed.
+    fn loadHeaderFromWal(self: *Bucket) void {
+        if (comptime !is_posix) return;
+        const w = &(self.wal orelse return);
+        const data = w.page_data(WAL.HEADER_PAGE_ID, std.math.maxInt(i64)) catch return;
+        self.header = BucketHeader.read(data[0..BucketHeader.byteSize]);
+    }
+
+    /// Apply every WAL frame to the main database file.  Called during
+    /// close when this is the last active connection so that the main
+    /// file is fully up-to-date for the next open.
+    fn checkpointWal(self: *Bucket) void {
+        if (comptime !is_posix) return;
+
+        const w = &(self.wal orelse return);
+        if (w.header.frame_count == 0) return;
+
+        const f = if (self.file) |*fh| fh else return;
+
+        var it = w.frames();
+
+        while (it.next() catch null) |frame| {
+            if (frame.header.page_id == WAL.HEADER_PAGE_ID) {
+                f.pwriteAll(frame.data[0..BucketHeader.byteSize], 0) catch return;
+            } else {
+                const offset = BucketHeader.byteSize + frame.header.page_id * DEFAULT_PAGE_SIZE;
+                f.pwriteAll(frame.data, offset) catch return;
+            }
+        }
+
+        // Write the current in-memory header (most up-to-date).
+        const bytes = self.header.toBytes();
+        f.pwriteAll(bytes[0..], 0) catch return;
+        f.sync() catch return;
+    }
+
+    /// Build the WAL path (<db_path>-wal) and try to open/create the WAL.
+    /// Only available on POSIX targets.
+    fn initWal(ally: std.mem.Allocator, db_path: []const u8) if (is_posix) ?WAL else void {
+        if (comptime !is_posix) return {};
+        const wal_path = ally.alloc(u8, db_path.len + 4) catch return null;
+        defer ally.free(wal_path);
+        @memcpy(wal_path[0..db_path.len], db_path);
+        @memcpy(wal_path[db_path.len..], "-wal");
+        return WAL.init(ally, wal_path) catch null;
+    }
+
     fn flushHeader(self: *Bucket) !void {
         if (self.in_memory) {
             return;
         }
 
-        const file = if (self.file) |*f| f else return error.StorageUnavailable;
         const bytes = self.header.toBytes();
+
+        // In WAL mode, persist the header only in the WAL.
+        // The main file is updated at checkpoint time.
+        if (comptime is_posix) {
+            if (self.wal) |*w| {
+                var header_page: [DEFAULT_PAGE_SIZE]u8 = [_]u8{0} ** DEFAULT_PAGE_SIZE;
+                @memcpy(header_page[0..BucketHeader.byteSize], bytes[0..BucketHeader.byteSize]);
+                const tx_ts = walTimestamp();
+                w.appendPage(WAL.HEADER_PAGE_ID, &header_page, tx_ts) catch {};
+                return;
+            }
+        }
+
+        // No WAL: write directly to the main DB file.
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
         try file.pwriteAll(bytes[0..], 0);
-        // Sync is handled by writePage's batched sync and flush().
-        // Removing per-call fsync avoids costly syscalls on every insert/createNewPage.
     }
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
@@ -732,13 +839,49 @@ pub const Bucket = struct {
     // Previous openFile implementation remains the same...
 
     pub fn loadPage(self: *Bucket, page_id: u64) !*Page {
-        // Check if the page is already in the cache
-        if (self.pageCache.get(page_id)) |page| {
-            return page;
+        if (self.in_memory) {
+            // In-memory buckets have no WAL; the cache is authoritative.
+            if (self.pageCache.get(page_id)) |page| {
+                return page;
+            }
+            return PageError.PageNotFound;
         }
 
-        if (self.in_memory) {
-            return PageError.PageNotFound;
+        // In WAL mode, always consult the WAL first.  A parallel writer
+        // from another process may have appended a newer version of this
+        // page since we last cached it.  When the page already exists in
+        // our local cache we update it *in-place* so that any external
+        // pointers (e.g. cached_last_data_page) stay valid.
+        if (comptime is_posix) {
+            if (self.wal) |*w| {
+                if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
+                    const header = PageHeader.read(data[0..PageHeader.byteSize]);
+
+                    if (self.pageCache.get(page_id)) |existing| {
+                        // Refresh the cached page in-place.
+                        existing.header = header;
+                        @memcpy(existing.data, data[PageHeader.byteSize..]);
+                        return existing;
+                    }
+
+                    // First time seeing this page — allocate & cache.
+                    const page = try self.allocator.create(Page);
+                    page.* = try Page.init(self.allocator, self, header);
+                    @memcpy(page.data, data[PageHeader.byteSize..]);
+                    if (try self.pageCache.put(page_id, page)) |evicted| {
+                        _ = evicted;
+                    }
+                    return page;
+                } else |err| switch (err) {
+                    error.WalPageNotFound => {}, // Not in WAL — fall through.
+                    else => {},
+                }
+            }
+        }
+
+        // Fall back to the local page cache, then the main DB file.
+        if (self.pageCache.get(page_id)) |page| {
+            return page;
         }
 
         const file = if (self.file) |*f| f else return error.StorageUnavailable;
@@ -780,37 +923,74 @@ pub const Bucket = struct {
         return page;
     }
 
+    /// Return a nanosecond timestamp (as i64) for WAL frame ordering.
+    /// Using nanoseconds instead of seconds avoids duplicate tx_timestamp
+    /// values when multiple pages are written in the same second.
+    inline fn walTimestamp() i64 {
+        return @intCast(std.time.nanoTimestamp());
+    }
+
     pub fn writePage(self: *Bucket, page: *const Page) !void {
         if (self.in_memory) {
             return;
         }
 
-        const file = if (self.file) |*f| f else return error.StorageUnavailable;
-
-        const offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
-
-        // Combine header + data into a single pwriteAll to halve syscalls
+        // Combine header + data into a single buffer.
         var buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         const header_bytes = PageHeader.write(&page.header);
         @memcpy(buf[0..PageHeader.byteSize], header_bytes[0..]);
         @memcpy(buf[PageHeader.byteSize..], page.data);
+
+        // In WAL mode, write ONLY to the WAL — the main DB file stays
+        // untouched until checkpoint. Other processes read new pages from
+        // the WAL via the shared-memory index (MVCC).
+        if (comptime is_posix) {
+            if (self.wal) |*w| {
+                const tx_ts = walTimestamp();
+                w.appendPage(page.header.page_id, &buf, tx_ts) catch |err| switch (err) {
+                    error.WalIndexFailed => {
+                        // SHM index is full — checkpoint to free space and retry.
+                        self.checkpointWal();
+                        w.checkpoint() catch {};
+                        w.appendPage(page.header.page_id, &buf, tx_ts) catch {
+                            return error.StorageUnavailable;
+                        };
+                    },
+                    else => return error.StorageUnavailable,
+                };
+
+                // Track dirty page for replication.
+                if (self.replication_callback != null) {
+                    try self.dirty_pages.put(page.header.page_id, {});
+                }
+
+                // Batched WAL sync.
+                self.writes_since_sync += 1;
+                if (self.writes_since_sync >= self.sync_threshold) {
+                    w.sync() catch {};
+                    self.writes_since_sync = 0;
+
+                    self.notifyDirtyPages() catch {};
+                }
+                return;
+            }
+        }
+
+        // Fallback: no WAL — write directly to the main DB file.
+        const file = if (self.file) |*f| f else return error.StorageUnavailable;
+        const offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
         try file.pwriteAll(buf[0..DEFAULT_PAGE_SIZE], offset);
 
-        // Track dirty page for replication (set automatically handles duplicates)
         if (self.replication_callback != null) {
             try self.dirty_pages.put(page.header.page_id, {});
         }
 
-        // Batched sync: only sync periodically instead of every write
         self.writes_since_sync += 1;
         if (self.writes_since_sync >= self.sync_threshold) {
             try file.sync();
             self.writes_since_sync = 0;
 
-            // Trigger replication callback after sync (non-fatal)
-            self.notifyDirtyPages() catch {
-                // Replication error - will retry on next sync
-            };
+            self.notifyDirtyPages() catch {};
         }
     }
 
@@ -885,6 +1065,13 @@ pub const Bucket = struct {
     pub fn flush(self: *Bucket) !void {
         if (self.in_memory) {
             return;
+        }
+
+        // Sync the WAL (if active) so all appended frames are durable.
+        if (comptime is_posix) {
+            if (self.wal) |*w| {
+                w.sync() catch {};
+            }
         }
 
         if (self.file) |*f| {
@@ -1263,7 +1450,7 @@ pub const Bucket = struct {
         }
 
         self.header.doc_count += 1;
-        // Header will be flushed by the next createNewPage or flush()
+        try self.flushHeader();
 
         // After writing is done, free the page resources
         return result;
@@ -1451,6 +1638,24 @@ pub const Bucket = struct {
             // std.debug.print("Page approved, header {x}\n", .{header.reserved});
 
             if (header.doc_id == 0) {
+                // WAL mode: the writer may have appended documents to
+                // this page since we last loaded it.  Reload via
+                // loadPage (which refreshes the cached page in-place
+                // from the WAL) and re-check.
+                if (comptime is_posix) {
+                    if (self.bucket.wal != null) {
+                        _ = self.bucket.loadPage(self.page.header.page_id) catch return null;
+                        const refreshed = std.mem.bytesToValue(DocHeader, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)]);
+                        if (refreshed.doc_id != 0 and refreshed.reserved == 0 and refreshed.is_deleted <= 1) {
+                            self.offset += @sizeOf(DocHeader);
+                            return .{
+                                .page_id = self.page.header.page_id,
+                                .offset = self.offset - @sizeOf(DocHeader),
+                                .header = refreshed,
+                            };
+                        }
+                    }
+                }
                 return null; // No more documents
             }
             self.offset += @sizeOf(DocHeader);
@@ -2943,6 +3148,15 @@ pub const Bucket = struct {
             const newDoc = bson.BSONDocument.init(doc.data);
             _ = try newBucket.insert(newDoc);
         }
+
+        // In WAL mode inserts went to the temp bucket's WAL.
+        // Checkpoint now so the temp main file has all the data
+        // before we swap it into place.
+        try newBucket.flush();
+        if (comptime is_posix) {
+            newBucket.checkpointWal();
+        }
+
         const path = try self.allocator.dupe(u8, self.path);
         iterator.deinit();
         self.deinit();
@@ -2981,6 +3195,19 @@ pub const Bucket = struct {
         self.flush() catch {
             // Ignore flush errors during cleanup
         };
+
+        // Apply WAL frames to the main file and clean up.
+        if (comptime is_posix) {
+            if (self.wal) |*w| {
+                // Only checkpoint to the main file when we are the last
+                // connection — other processes may still be reading the WAL.
+                if (w.index.activeConnections() <= 1) {
+                    self.checkpointWal();
+                }
+                w.consumeAndClose();
+                self.wal = null;
+            }
+        }
 
         var idx_iter = self.indexes.iterator();
         while (idx_iter.next()) |pair| {
@@ -4119,4 +4346,328 @@ test "Deleting removes index entries for scalar field" {
         count_after += 1;
     }
     try testing.expectEqual(@as(usize, 0), count_after);
+}
+
+test "Bucket WAL restore recovers data after simulated crash" {
+    if (comptime !is_posix) return;
+
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/albedo_test_wal_restore.bucket";
+    const wal_path = "/tmp/albedo_test_wal_restore.bucket-wal";
+    const shm_path = "/tmp/albedo_test_wal_restore.bucket-wal-shm";
+
+    // Clean up any leftovers from previous runs.
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    // ── Phase 1: create bucket, insert documents, and save the WAL ──
+
+    // Record the DB file size *before* inserting docs so we can truncate back.
+    var saved_wal_bytes: []u8 = undefined;
+    var pre_insert_db_size: u64 = undefined;
+
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const ally = arena.allocator();
+
+        var bucket = try Bucket.init(ally, db_path);
+
+        // After init + meta page write, grab pre-insert file size.
+        try bucket.flush();
+        const db_stat = try std.fs.cwd().statFile(db_path);
+        pre_insert_db_size = db_stat.size;
+
+        // Insert three documents.
+        const doc1 = try bson.fmt.serialize(.{ .name = "Alice", .age = @as(i32, 30) }, ally);
+        _ = try bucket.insert(doc1);
+        const doc2 = try bson.fmt.serialize(.{ .name = "Bob", .age = @as(i32, 25) }, ally);
+        _ = try bucket.insert(doc2);
+        const doc3 = try bson.fmt.serialize(.{ .name = "Charlie", .age = @as(i32, 40) }, ally);
+        _ = try bucket.insert(doc3);
+
+        // Flush to ensure WAL has committed frames.
+        try bucket.flush();
+        if (bucket.wal) |*w| {
+            try w.sync();
+        }
+
+        // Verify we can read docs back before the crash.
+        try testing.expectEqual(@as(u64, 3), bucket.header.doc_count);
+
+        // Save WAL bytes to a heap buffer before deinit consumes it.
+        const wal_file = try std.fs.cwd().openFile(wal_path, .{});
+        defer wal_file.close();
+        const wal_stat = try wal_file.stat();
+        saved_wal_bytes = try allocator.alloc(u8, wal_stat.size);
+        const n = try wal_file.readAll(saved_wal_bytes);
+        try testing.expect(n == saved_wal_bytes.len);
+
+        // Normal close — this consumes the WAL.
+        bucket.deinit();
+    }
+    defer allocator.free(saved_wal_bytes);
+
+    // ── Phase 2: simulate a crash ──────────────────────────────────
+
+    // Truncate the main DB file back to its pre-insert size (lose data pages).
+    {
+        const db_file = try std.fs.cwd().openFile(db_path, .{ .mode = .read_write });
+        defer db_file.close();
+        try db_file.setEndPos(pre_insert_db_size);
+        try db_file.sync();
+    }
+
+    // Restore the saved WAL (as if the WAL survived the crash).
+    {
+        const wal_file = try std.fs.cwd().createFile(wal_path, .{});
+        defer wal_file.close();
+        try wal_file.writeAll(saved_wal_bytes);
+        try wal_file.sync();
+    }
+
+    // ── Phase 3: reopen — replayWal should restore the data ───────
+
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const ally = arena.allocator();
+
+        var bucket = try Bucket.openFile(ally, db_path);
+        defer bucket.deinit();
+
+        // The WAL replay should have restored all three documents.
+        try testing.expectEqual(@as(u64, 3), bucket.header.doc_count);
+
+        // Verify we can actually read back the documents.
+        var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, ally);
+        defer qDoc.deinit(ally);
+        const q = try query.Query.parse(ally, qDoc);
+
+        const docs = try bucket.list(ally, q);
+        try testing.expectEqual(@as(usize, 3), docs.len);
+
+        // Verify names are present (order may vary).
+        var found_alice = false;
+        var found_bob = false;
+        var found_charlie = false;
+        for (docs) |d| {
+            if (d.get("name")) |v| {
+                const name = v.string.value;
+                if (std.mem.eql(u8, name, "Alice")) found_alice = true;
+                if (std.mem.eql(u8, name, "Bob")) found_bob = true;
+                if (std.mem.eql(u8, name, "Charlie")) found_charlie = true;
+            }
+        }
+        try testing.expect(found_alice);
+        try testing.expect(found_bob);
+        try testing.expect(found_charlie);
+    }
+}
+
+test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
+    if (comptime !is_posix) return;
+
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/albedo_test_wal_crash.bucket";
+    const wal_path = "/tmp/albedo_test_wal_crash.bucket-wal";
+    const shm_path = "/tmp/albedo_test_wal_crash.bucket-wal-shm";
+
+    // Clean up any leftovers from previous runs.
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    // ── Phase 1: create bucket, insert documents, then crash ──────
+
+    var pre_insert_db_size: u64 = undefined;
+
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const ally = arena.allocator();
+
+        var bucket = try Bucket.init(ally, db_path);
+
+        // Grab the file size before any inserts.
+        try bucket.flush();
+        const db_stat = try std.fs.cwd().statFile(db_path);
+        pre_insert_db_size = db_stat.size;
+
+        // Insert documents.
+        const doc1 = try bson.fmt.serialize(.{ .title = "Doc A", .value = @as(i32, 1) }, ally);
+        _ = try bucket.insert(doc1);
+        const doc2 = try bson.fmt.serialize(.{ .title = "Doc B", .value = @as(i32, 2) }, ally);
+        _ = try bucket.insert(doc2);
+
+        // Ensure WAL frames are committed to the WAL file.
+        try bucket.flush();
+        if (bucket.wal) |*w| {
+            try w.sync();
+        }
+
+        try testing.expectEqual(@as(u64, 2), bucket.header.doc_count);
+
+        // ── Simulate abrupt crash ──
+        // Close WAL file descriptors without consuming (leaves WAL on disk).
+        if (bucket.wal) |*w| {
+            w.deinit();
+            bucket.wal = null;
+        }
+        // Close the rest of the bucket normally.
+        bucket.deinit();
+    }
+
+    // The WAL file should still exist on disk after the "crash".
+    _ = try std.fs.cwd().statFile(wal_path);
+
+    // Truncate the main DB file to lose the data pages written after init.
+    {
+        const db_file = try std.fs.cwd().openFile(db_path, .{ .mode = .read_write });
+        defer db_file.close();
+        try db_file.setEndPos(pre_insert_db_size);
+        try db_file.sync();
+    }
+
+    // ── Phase 2: reopen — WAL replay should restore everything ────
+
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const ally = arena.allocator();
+
+        var bucket = try Bucket.openFile(ally, db_path);
+        defer bucket.deinit();
+
+        // After replay the header should reflect both documents.
+        try testing.expectEqual(@as(u64, 2), bucket.header.doc_count);
+
+        // Query all documents.
+        var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, ally);
+        defer qDoc.deinit(ally);
+        const q = try query.Query.parse(ally, qDoc);
+
+        const docs = try bucket.list(ally, q);
+        try testing.expectEqual(@as(usize, 2), docs.len);
+
+        var found_a = false;
+        var found_b = false;
+        for (docs) |d| {
+            if (d.get("title")) |v| {
+                const title = v.string.value;
+                if (std.mem.eql(u8, title, "Doc A")) found_a = true;
+                if (std.mem.eql(u8, title, "Doc B")) found_b = true;
+            }
+        }
+        try testing.expect(found_a);
+        try testing.expect(found_b);
+    }
+
+    // After the clean reopen + deinit the WAL should have been consumed.
+    if (std.fs.cwd().statFile(wal_path)) |_| {
+        return error.TestUnexpectedResult; // WAL should be gone after clean close
+    } else |_| {}
+}
+
+test "WAL live-tail: reader polls for docs written by another connection" {
+    if (comptime !is_posix) return;
+
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/albedo_test_wal_live_tail.bucket";
+    const wal_path = "/tmp/albedo_test_wal_live_tail.bucket-wal";
+    const shm_path = "/tmp/albedo_test_wal_live_tail.bucket-wal-shm";
+
+    // Clean up leftovers.
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    // ── Writer: create the database and insert the first batch ──────
+    var writer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer writer_arena.deinit();
+    const w_ally = writer_arena.allocator();
+
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{
+        .wal = true,
+    });
+    defer writer.deinit();
+
+    // Insert two documents.
+    const doc1 = try bson.fmt.serialize(.{ .seq = @as(i32, 1), .msg = "hello" }, w_ally);
+    _ = try writer.insert(doc1);
+    const doc2 = try bson.fmt.serialize(.{ .seq = @as(i32, 2), .msg = "world" }, w_ally);
+    _ = try writer.insert(doc2);
+    try writer.flush();
+
+    // ── Reader: open the same file in WAL mode ──────────────────────
+    var reader_arena = std.heap.ArenaAllocator.init(allocator);
+    defer reader_arena.deinit();
+    const r_ally = reader_arena.allocator();
+
+    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{
+        .wal = true,
+    });
+    defer reader.deinit();
+
+    // The reader should already see the 2 docs written before it opened.
+    var iter_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iter_arena.deinit();
+
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, iter_arena.allocator());
+    defer qDoc.deinit(iter_arena.allocator());
+    const q = try query.Query.parse(iter_arena.allocator(), qDoc);
+
+    var iter = try reader.listIterate(&iter_arena, q);
+
+    var seen: usize = 0;
+    while (try iter.next(iter)) |_| {
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+
+    // ── Writer: insert more documents after the reader exhausted ────
+    const doc3 = try bson.fmt.serialize(.{ .seq = @as(i32, 3), .msg = "foo" }, w_ally);
+    _ = try writer.insert(doc3);
+    const doc4 = try bson.fmt.serialize(.{ .seq = @as(i32, 4), .msg = "bar" }, w_ally);
+    _ = try writer.insert(doc4);
+    try writer.flush();
+
+    // ── Reader: poll again — should see the 2 new documents ─────────
+    // This is the live-tail pattern: the iterator was exhausted, we
+    // "sleep" (no-op here), then call next() again which will refresh
+    // the header from the WAL SHM and pick up new pages/docs.
+    var seen_after: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const seq = doc.get("seq").?.int32.value;
+        // We should only see seq 3 and 4, not 1 and 2 again.
+        try testing.expect(seq == 3 or seq == 4);
+        seen_after += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen_after);
+
+    // ── Writer: one more batch to prove repeated polling works ──────
+    const doc5 = try bson.fmt.serialize(.{ .seq = @as(i32, 5), .msg = "baz" }, w_ally);
+    _ = try writer.insert(doc5);
+    try writer.flush();
+
+    var seen_final: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const seq = doc.get("seq").?.int32.value;
+        try testing.expectEqual(@as(i32, 5), seq);
+        seen_final += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), seen_final);
+
+    // Total: 5 documents via live-tail.
+    try testing.expectEqual(@as(usize, 5), seen + seen_after + seen_final);
 }
