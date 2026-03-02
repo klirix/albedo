@@ -1652,7 +1652,12 @@ pub const Bucket = struct {
         pub fn step(self: *ScanIterator) !?DocumentMeta {
             if (!self.initialized) {
                 self.initialized = true;
-                self.page = try self.pageIterator.next() orelse return null;
+                self.page = try self.pageIterator.next() orelse {
+                    // No data pages yet.  Reset so the next call retries
+                    // (WAL mode: another connection may create pages later).
+                    self.initialized = false;
+                    return null;
+                };
                 // std.debug.print("List iterator initialized, page {d} loaded\n", .{self.page.header.page_id});
             }
 
@@ -4706,4 +4711,62 @@ test "WAL live-tail: reader polls for docs written by another connection" {
 
     // Total: 5 documents via live-tail.
     try testing.expectEqual(@as(usize, 5), seen + seen_after + seen_final);
+}
+
+test "WAL live-tail: reader polls empty DB then sees docs after writer inserts" {
+    if (comptime !is_posix) return;
+
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/albedo_test_wal_empty_poll.bucket";
+    const wal_path = "/tmp/albedo_test_wal_empty_poll.bucket-wal";
+    const shm_path = "/tmp/albedo_test_wal_empty_poll.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    // ── Reader: open an empty DB and create an iterator ─────────────
+    var reader_arena = std.heap.ArenaAllocator.init(allocator);
+    defer reader_arena.deinit();
+    const r_ally = reader_arena.allocator();
+
+    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    defer reader.deinit();
+
+    var iter_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iter_arena.deinit();
+
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, iter_arena.allocator());
+    defer qDoc.deinit(iter_arena.allocator());
+    const q = try query.Query.parse(iter_arena.allocator(), qDoc);
+
+    var iter = try reader.listIterate(&iter_arena, q);
+
+    // First poll on empty DB — must return null, not crash.
+    const first = try iter.next(iter);
+    try testing.expect(first == null);
+
+    // ── Writer: open the same file and insert docs ──────────────────
+    var writer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer writer_arena.deinit();
+    const w_ally = writer_arena.allocator();
+
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    defer writer.deinit();
+
+    const doc1 = try bson.fmt.serialize(.{ .name = "A" }, w_ally);
+    _ = try writer.insert(doc1);
+    const doc2 = try bson.fmt.serialize(.{ .name = "B" }, w_ally);
+    _ = try writer.insert(doc2);
+    try writer.flush();
+
+    // ── Reader: poll again — should see both docs ───────────────────
+    var seen: usize = 0;
+    while (try iter.next(iter)) |_| {
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
 }
