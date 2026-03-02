@@ -22,7 +22,9 @@ network round-trips.
 - **Single-file storage** — one `.bucket` file holds documents, indexes, and metadata.
 - **BSON native** — documents are stored and queried in BSON; no intermediate format.
 - **B⁺-tree indexing** — create indexes on any field path, including nested and array fields.
+- **Write-Ahead Log (WAL)** — enabled by default on Linux/macOS; provides crash recovery, MVCC reads, and cross-process live-tail without blocking writers.
 - **Built-in replication** — page-level dirty tracking with batched sync and automatic retry.
+- **Tunable durability** — choose between per-write fsync (`.all`), periodic fsync (`.periodic(N)`), or fully manual (`.manual`) to trade safety for throughput.
 - **Zero external dependencies** — the core is pure Zig; bindings are thin wrappers around the C ABI.
 - **Runs everywhere** — the storage layer only needs basic file-handle read/write operations, so it cross-compiles cleanly for Linux, macOS, Windows, iOS, Android, and WASM.
 
@@ -81,13 +83,13 @@ albedo_close(db);
 
 | Operation | Function | Notes |
 |-----------|----------|-------|
-| Open / close | `albedo_open`, `albedo_close` | Pass `":memory:"` for an in-memory bucket |
+| Open / close | `albedo_open`, `albedo_close` | Pass `":memory:"` for an in-memory bucket; WAL is enabled by default on POSIX |
 | Insert | `albedo_insert` | Accepts a raw BSON document buffer |
 | Query | `albedo_list` → `albedo_data` | `albedo_data` returns `ALBEDO_OK` with a document pointer, `ALBEDO_EOS` when done |
 | Delete | `albedo_delete` | Tombstones matching docs; triggers auto-vacuum when deleted > live |
 | Update | `albedo_transform` → `albedo_transform_data` / `albedo_transform_apply` | Iterate matches and apply per-document transforms |
 | Indexes | `albedo_ensure_index`, `albedo_drop_index`, `albedo_list_indexes` | B⁺-tree indexes on arbitrary field paths |
-| Maintenance | `albedo_vacuum`, `albedo_flush` | Compact the file or force-sync to disk |
+| Maintenance | `albedo_vacuum`, `albedo_flush` | Compact the file or force-sync to disk (`flush` fsyncs the WAL in WAL mode) |
 | Replication | `albedo_set_replication_callback`, `albedo_apply_batch` | Page-level batched sync — see [REPLICATION.md](REPLICATION.md) |
 
 See [include/albedo.h](include/albedo.h) for the full C API surface.
@@ -111,6 +113,34 @@ zig build test
 
 Build artifacts land in `zig-out/`. See [build.md](build.md) for
 platform-specific notes and Android cross-compilation.
+
+---
+
+## Write-Ahead Log (WAL)
+
+On Linux and macOS, Albedo opens databases in WAL mode by default. Every page
+write is appended to a `<name>-wal` file instead of modifying the main DB file
+directly. A memory-mapped shared-memory index (`<name>-wal-shm`) lets multiple
+processes read the latest page versions without blocking each other.
+
+**What WAL gives you:**
+
+- **Crash recovery** — uncommitted data in the WAL is replayed on the next open.
+- **MVCC reads** — readers always see a consistent snapshot; writers never block readers.
+- **Live-tail / document streaming** — a reader can keep a `listIterate` iterator open and call `next()` in a poll loop. When the iterator is exhausted it automatically refreshes from the WAL and picks up documents added by another connection.
+- **Throughput** — page writes bypass `fsync` by default (`.manual` durability mode), matching SQLite's `synchronous=NORMAL` in WAL mode.
+
+**Durability modes** (set via `OpenBucketOptions.durability` in Zig, or the `durability` field of the C open-options struct):
+
+| Mode | Behaviour |
+|------|-----------|
+| `.all` | `fsync` after every page write — safest, slowest |
+| `.{ .periodic = N }` | `fsync` every N page writes (default: 100) |
+| `.manual` | Never auto-`fsync`; call `albedo_flush` / `flush()` when you need a durability guarantee |
+
+The WAL is checkpointed (applied to the main DB file and deleted) automatically
+when the last connection closes. While any connection is open the WAL is kept
+alive so other readers can continue using it.
 
 ---
 
