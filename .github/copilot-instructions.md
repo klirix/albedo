@@ -1,14 +1,13 @@
 # Albedo — Quick orientation for AI coding agents
 
-Albedo is a small experimental document store written in Zig with two primary consumption paths: a C-style FFI (shared/static library) and Node/Bun bindings. The codebase is intentionally compact and favors explicit, manual memory and file layout operations. This file gives the most important, discoverable facts to get productive quickly.
+Albedo is a small experimental document store written in Zig with a primary consumption path via C-style FFI (shared/static library). The codebase is intentionally compact and favors explicit, manual memory and file layout operations. This file gives the most important, discoverable facts to get productive quickly.
 
 ## Big-picture architecture (why & what)
 
 - Storage: fixed page size (DEFAULT_PAGE_SIZE = 8192) with a 64-byte bucket header at file start and 32-byte page headers. Page types: Data, Index, Free, Meta. The meta page (page 0) is authoritative for index registration.
   - See: `src/albedo.zig` (core bucket, pages, document layout) and `src/bplusindex.zig` (index implementation).
 - API surfaces:
-  - C-style exports for direct FFI: `src/lib.zig` (used by Bun FFI in `bun/albedo.ts`).
-  - N-API/napigen Node binding: `src/napi.zig` (build with `-Dnode=true`).
+  - C-style exports for direct FFI: `src/lib.zig`.
 - Memory model: explicit allocators (often `ArenaAllocator` or caller-provided allocator). Many APIs return slices backed by buffers — pay attention to ownership and use `defer allocator.free(...)` or `deinit()` where present.
 - Concurrency: `Bucket` operations use a `RwLock` for read/write safety. Follow existing lock patterns (lockShared/lock/ unlock) in `src/albedo.zig`.
 
@@ -16,20 +15,16 @@ Albedo is a small experimental document store written in Zig with two primary co
 
 - Build native shared library:
   zig build
-- Build Node (N-API) extension:
-  zig build -Dnode=true
 - Build static library:
   zig build -Dstatic=true
 - Run Zig unit tests (tests are embedded in sources):
   zig test src/albedo.zig
   or run full suite via build system:
   zig build test
-- Bun example (after building shared lib):
-  cd bun
-  bun install
-  bun run index.ts
+- Run benchmarks:
+  cd benchmark && zig build && ./zig-out/bin/benchmark
 
-Artifacts appear in `zig-out/` (`zig-out/lib/libalbedo.dylib`, and `zig-out/bin/*` for tests). The Bun example expects `libalbedo.${suffix}` in `bun/` (see `bun/albedo.ts`).
+Artifacts appear in `zig-out/` (`zig-out/lib/libalbedo.dylib`, and `zig-out/bin/*` for tests).
 
 ## Project-specific conventions & gotchas
 
@@ -41,17 +36,23 @@ Artifacts appear in `zig-out/` (`zig-out/lib/libalbedo.dylib`, and `zig-out/bin/
 
 ## Integration points & cross-component communication
 
-- Bun FFI (dlopen) usage: `bun/albedo.ts` calls C exports from `libalbedo.dylib` (see `bun/index.ts` and `bun/albedo.ts`). The N-API binding lives in `src/napi.zig` and is produced by building with `-Dnode=true`.
-- WASM: `zig-out/bin/albedo.wasm` and `bun/albedo-wasm/` contain examples for the WASM target.
+- WASM: `zig-out/bin/albedo.wasm` for the WASM target.
 
 ## Key files to inspect (fast lookup)
 
 - `src/albedo.zig` — core bucket, pages, document layout, insert/list/delete, meta page handling.
-- `src/lib.zig` — C-compatible exported API used by Bun FFI.
-- `src/napi.zig` — Node/N-API exports (napigen) for richer JS ergonomics.
+- `src/lib.zig` — C-compatible exported API.
 - `src/bplusindex.zig` — index implementation and B+ tree details.
+- `src/btree.zig` — B-tree implementation.
 - `src/bson.zig` — BSON parsing/serialization examples and many embedded tests (useful patterns for binary layout and tests).
-- `bun/albedo.ts`, `bun/index.ts` — how consumers load the library (dlopen) and use the FFI.
+- `src/bson_formatter.zig` — BSON formatting utilities.
+- `src/ejson.zig` — Extended JSON handling.
+- `src/object_id.zig` — Object ID generation and handling.
+- `src/platform.zig` — Platform-specific code.
+- `src/query.zig` — Query processing and execution.
+- `src/wal.zig` — Write-ahead logging.
+- `AGENTS.md` — Detailed notes on the core database machinery.
+- `REPLICATION.md` — Replication documentation.
 - `build.zig` / `build.md` — useful flags and build targets.
 
 ## How to add small features safely
@@ -63,7 +64,7 @@ Artifacts appear in `zig-out/` (`zig-out/lib/libalbedo.dylib`, and `zig-out/bin/
 ## Quick troubleshooting tips
 
 - If a test fails with memory/offset errors, add debugging prints near `writePage`/`loadPage` and verify sizes against constants at the top of `src/albedo.zig`.
-- If Node binding fails to load, ensure you built with `-Dnode=true` and that `libalbedo.node` or `libalbedo.dylib` is placed/copied into `bun/`.
+- If WASM build fails, ensure the WASM target is properly configured in `build.zig`.
 
 ## Examples to cite in PRs
 
