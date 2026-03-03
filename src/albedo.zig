@@ -316,15 +316,15 @@ pub const ReplicationError = enum(u8) {
     UnknownError = 255,
 };
 
-/// Controls when fsync is called to guarantee durability.
-pub const Durability = union(enum) {
+/// Controls when fsync is called to guarantee write durability.
+pub const WriteDurability = union(enum) {
     /// Every write is fsynced immediately (safest, slowest).
     all,
     /// Fsync every N page writes (balanced).
     periodic: u32,
     /// Never fsync automatically; rely on OS page cache.
     /// Data is visible to readers immediately but may be lost on crash.
-    /// Use `flush()` for explicit durability when needed.
+    /// Use `flush()` for explicit write durability when needed.
     manual,
 };
 
@@ -355,7 +355,7 @@ pub const Bucket = struct {
     objectIdGenerator: ObjectIdGenerator,
     in_memory: bool = false,
     writes_since_sync: u32 = 0,
-    durability: Durability = .{ .periodic = 100 },
+    write_durability: WriteDurability = .{ .periodic = 100 },
     replication_callback: PageChangeCallback = null,
     replication_context: ?*anyopaque = null,
     dirty_pages: std.AutoHashMap(u64, void),
@@ -424,7 +424,7 @@ pub const Bucket = struct {
         ///  - .all        — fsync every write (safest, slowest)
         ///  - .periodic(N) — fsync every N page writes
         ///  - .manual      — never auto-fsync; call flush() manually
-        durability: Durability = .{ .periodic = 100 },
+        write_durability: WriteDurability = .{ .periodic = 100 },
         /// Controls how page reads interact with the WAL.
         ///  - .shared  — always consult WAL (safe for multi-process readers)
         ///  - .process — trust local cache, WAL only on miss (fast single-process)
@@ -596,7 +596,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
-            .durability = options.durability,
+            .write_durability = options.write_durability,
             .read_durability = options.read_durability,
             .wal = if (comptime is_posix) null else {},
         };
@@ -696,7 +696,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
-            .durability = options.durability,
+            .write_durability = options.write_durability,
             .read_durability = options.read_durability,
             .wal = wal_instance,
         };
@@ -1035,8 +1035,8 @@ pub const Bucket = struct {
                     try self.dirty_pages.put(page.header.page_id, {});
                 }
 
-                // Honour the durability setting for WAL writes.
-                switch (self.durability) {
+                // Honour the write_durability setting for WAL writes.
+                switch (self.write_durability) {
                     .all => {
                         w.sync() catch {};
                         self.notifyDirtyPages() catch {};
@@ -1064,8 +1064,8 @@ pub const Bucket = struct {
             try self.dirty_pages.put(page.header.page_id, {});
         }
 
-        // Honour the durability setting for direct-file writes.
-        switch (self.durability) {
+        // Honour the write_durability setting for direct-file writes.
+        switch (self.write_durability) {
             .all => {
                 try file.sync();
                 self.notifyDirtyPages() catch {};

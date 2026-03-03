@@ -151,6 +151,7 @@ fn benchAlbedoInsert(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
     const doc = try bson.fmt.serialize(.{
         .name = "record_000000",
         .age = @as(i32, 0),
+        ._id = @as(i32, 0),
         .email = "user@example.com",
         .active = true,
     }, allocator);
@@ -162,6 +163,7 @@ fn benchAlbedoInsert(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
         const name_buf = (buffer)[4 + 1 + 5 + 4 ..];
         _ = std.fmt.bufPrint(name_buf, "record_{d:0>6}", .{i}) catch unreachable;
         std.mem.writeInt(i32, buffer[33 .. 33 + 4], age, .little);
+        std.mem.writeInt(i32, buffer[42 .. 42 + 4], age, .little);
         _ = try bucket.insert(doc);
     }
     return timer.read();
@@ -334,6 +336,9 @@ pub fn main() !void {
     var bucket = try Bucket.openFileWithOptions(arena.allocator(), "file.bucket", .{
         .wal = true,
         .read_durability = .process,
+        .write_durability = .{
+            .periodic = 2048,
+        },
     });
     defer bucket.deinit();
 
@@ -364,8 +369,8 @@ pub fn main() !void {
     // 1. INSERTION — single bulk run
     // ══════════════════════════════════════════════════════════════════════
     {
-        const a_ns = try benchAlbedoInsert(arena.allocator(), &bucket);
         const s_ns = try benchSqliteInsert(&db);
+        const a_ns = try benchAlbedoInsert(arena.allocator(), &bucket);
 
         var a_buf = [_]u64{a_ns};
         var s_buf = [_]u64{s_ns};

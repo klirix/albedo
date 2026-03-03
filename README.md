@@ -24,7 +24,7 @@ network round-trips.
 - **B⁺-tree indexing** — create indexes on any field path, including nested and array fields.
 - **Write-Ahead Log (WAL)** — enabled by default on Linux/macOS; provides crash recovery, MVCC reads, and cross-process live-tail without blocking writers.
 - **Built-in replication** — page-level dirty tracking with batched sync and automatic retry.
-- **Tunable durability** — choose between per-write fsync (`.all`), periodic fsync (`.periodic(N)`), or fully manual (`.manual`) to trade safety for throughput.
+- **Tunable write durability** — choose between per-write fsync (`.all`), periodic fsync (`.periodic(N)`), or fully manual (`.manual`) to trade safety for throughput.
 - **Zero external dependencies** — the core is pure Zig; bindings are thin wrappers around the C ABI.
 - **Runs everywhere** — the storage layer only needs basic file-handle read/write operations, so it cross-compiles cleanly for Linux, macOS, Windows, iOS, Android, and WASM.
 
@@ -128,9 +128,9 @@ processes read the latest page versions without blocking each other.
 - **Crash recovery** — uncommitted data in the WAL is replayed on the next open.
 - **MVCC reads** — readers always see a consistent snapshot; writers never block readers.
 - **Live-tail / document streaming** — a reader can keep a `listIterate` iterator open and call `next()` in a poll loop. When the iterator is exhausted it automatically refreshes from the WAL and picks up documents added by another connection.
-- **Throughput** — page writes bypass `fsync` by default (`.manual` durability mode), matching SQLite's `synchronous=NORMAL` in WAL mode.
+- **Throughput** — page writes bypass `fsync` by default (`.manual` write-durability mode), matching SQLite’s `synchronous=NORMAL` in WAL mode.
 
-**Durability modes** (set via `OpenBucketOptions.durability` in Zig, or the `durability` field of the C open-options struct):
+**Write-durability modes** (set via `OpenBucketOptions.write_durability` in Zig):
 
 | Mode | Behaviour |
 |------|-----------|
