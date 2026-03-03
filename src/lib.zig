@@ -44,6 +44,23 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     return Result.OK;
 }
 
+pub export fn albedo_open_with_options(path: [*:0]u8, optionsBuffer: [*]u8, out: **albedo.Bucket) Result {
+    const pathProper = std.mem.span(path);
+    const optionsSize = std.mem.readInt(u32, optionsBuffer[0..4], .little);
+    const optionsDoc = bson.BSONDocument.init(optionsBuffer[0..optionsSize]);
+
+    var parsed = bson.fmt.parse(Bucket.OpenBucketOptions, optionsDoc, ally) catch return Result.InvalidFormat;
+    defer parsed.deinit();
+
+    const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
+    db.* = albedo.Bucket.openFileWithOptions(ally, pathProper, parsed.value) catch {
+        ally.destroy(db);
+        return Result.Error;
+    };
+    out.* = db;
+    return Result.OK;
+}
+
 pub export fn albedo_close(bucket: *albedo.Bucket) Result {
     bucket.deinit();
     bucket.allocator.destroy(bucket);
@@ -772,4 +789,119 @@ test "lib API apply batch rejects invalid payload size" {
 
     const bad = [_]u8{ 1, 2, 3, 4 };
     try testing.expectEqual(Result.Error, albedo_apply_batch(bucket, bad[0..].ptr, bad.len, 1));
+}
+
+test "lib API open_with_options" {
+    const allocator = testing.allocator;
+
+    // — defaults (empty options) —
+    {
+        const path = try makeTempPath(allocator, "lib-api-opts-defaults");
+        defer allocator.free(path);
+        platform.deleteFile(path) catch {};
+        defer platform.deleteFile(path) catch {};
+
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        var opts_doc = try bson.BSONDocument.fromJSON(allocator, "{}");
+        defer opts_doc.deinit(allocator);
+
+        var bucket: *Bucket = undefined;
+        try testing.expectEqual(Result.OK, albedo_open_with_options(path_z.ptr, @constCast(opts_doc.buffer.ptr), &bucket));
+        defer _ = albedo_close(bucket);
+
+        try testing.expectEqual(true, bucket.autoVaccuum);
+        try testing.expectEqual(albedo.WriteDurability{ .periodic = 100 }, bucket.write_durability);
+        try testing.expectEqual(albedo.ReadDurability.shared, bucket.read_durability);
+    }
+
+    // — all options set, insert + query —
+    {
+        const path = try makeTempPath(allocator, "lib-api-opts-full");
+        defer allocator.free(path);
+        platform.deleteFile(path) catch {};
+        defer platform.deleteFile(path) catch {};
+
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        var opts_doc = try bson.BSONDocument.fromJSON(allocator,
+            \\{
+            \\  "auto_vaccuum": false,
+            \\  "write_durability": { "periodic": 200 },
+            \\  "read_durability": "process"
+            \\}
+        );
+        defer opts_doc.deinit(allocator);
+
+        var bucket: *Bucket = undefined;
+        try testing.expectEqual(Result.OK, albedo_open_with_options(path_z.ptr, @constCast(opts_doc.buffer.ptr), &bucket));
+        defer _ = albedo_close(bucket);
+
+        try testing.expectEqual(false, bucket.autoVaccuum);
+        try testing.expectEqual(albedo.WriteDurability{ .periodic = 200 }, bucket.write_durability);
+        try testing.expectEqual(albedo.ReadDurability.process, bucket.read_durability);
+
+        // insert and query back
+        var doc = try bson.BSONDocument.fromJSON(allocator,
+            \\{ "name": "Dave", "age": 25 }
+        );
+        defer doc.deinit(allocator);
+        try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+        var list_query = try bson.BSONDocument.fromJSON(allocator,
+            \\{ "query": { "name": "Dave" } }
+        );
+        defer list_query.deinit(allocator);
+
+        var handle: *ListHandle = undefined;
+        try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(list_query.buffer.ptr), &handle));
+        defer _ = albedo_close_iterator(handle);
+
+        var raw_doc_ptr: [*]u8 = undefined;
+        try testing.expectEqual(Result.OK, albedo_data(handle, &raw_doc_ptr));
+
+        const raw_len = std.mem.readInt(u32, raw_doc_ptr[0..4], .little);
+        const listed = bson.BSONDocument.init(raw_doc_ptr[0..raw_len]);
+        const listed_name = listed.get("name") orelse return error.TestExpectedEqual;
+        try testing.expectEqualStrings("Dave", listed_name.string.value);
+
+        try testing.expectEqual(Result.EOS, albedo_data(handle, &raw_doc_ptr));
+    }
+}
+
+test "bson fmt tagged union roundtrip" {
+    const allocator = testing.allocator;
+    const Mode = albedo.WriteDurability;
+
+    // void variant: "all"
+    {
+        const T = struct { mode: Mode };
+        var doc = try bson.fmt.serialize(T{ .mode = .all }, allocator);
+        defer doc.deinit(allocator);
+        var parsed = try bson.fmt.parse(T, doc, allocator);
+        defer parsed.deinit();
+        try testing.expectEqual(Mode.all, parsed.value.mode);
+    }
+
+    // void variant: "manual"
+    {
+        const T = struct { mode: Mode };
+        var doc = try bson.fmt.serialize(T{ .mode = .manual }, allocator);
+        defer doc.deinit(allocator);
+        var parsed = try bson.fmt.parse(T, doc, allocator);
+        defer parsed.deinit();
+        try testing.expectEqual(Mode.manual, parsed.value.mode);
+    }
+
+    // payload variant: { "periodic": 50 }
+    {
+        const T = struct { mode: Mode };
+        var doc = try bson.fmt.serialize(T{ .mode = .{ .periodic = 50 } }, allocator);
+        defer doc.deinit(allocator);
+        var parsed = try bson.fmt.parse(T, doc, allocator);
+        defer parsed.deinit();
+        try testing.expectEqual(Mode{ .periodic = 50 }, parsed.value.mode);
+    }
 }

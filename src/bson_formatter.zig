@@ -93,6 +93,27 @@ fn toBsonValue(
             try nested_docs.append(allocator, nested_doc);
             break :blk bson.BSONValue{ .document = nested_doc };
         },
+        .@"enum" => bson.BSONValue{ .string = .{ .value = @tagName(value) } },
+        .@"union" => |u| if (u.tag_type != null) blk: {
+            const active_tag = std.meta.activeTag(value);
+            inline for (u.fields) |field| {
+                if (active_tag == @field(std.meta.Tag(T), field.name)) {
+                    if (field.type == void) {
+                        break :blk bson.BSONValue{ .string = .{ .value = field.name } };
+                    } else {
+                        const payload = @field(value, field.name);
+                        var pairs = [1]bson.BSONKeyValuePair{.{
+                            .key = field.name,
+                            .value = try toBsonValue(field.type, payload, allocator, nested_docs),
+                        }};
+                        const doc = try bson.BSONDocument.fromPairs(allocator, pairs[0..]);
+                        try nested_docs.append(allocator, doc);
+                        break :blk bson.BSONValue{ .document = doc };
+                    }
+                }
+            }
+            break :blk Error.UnsupportedType;
+        } else Error.UnsupportedType,
         else => Error.UnsupportedType,
     };
 }
@@ -108,12 +129,12 @@ fn parseDocumentToType(comptime T: type, doc: bson.BSONDocument, arena_allocator
 
         if (maybe_value) |bson_value| {
             @field(result, field.name) = try parseValueToType(field_type, bson_value, arena_allocator);
+        } else if (field.defaultValue()) |default| {
+            @field(result, field.name) = default;
+        } else if (@typeInfo(field_type) == .optional) {
+            @field(result, field.name) = null;
         } else {
-            if (@typeInfo(field_type) == .optional) {
-                @field(result, field.name) = null;
-            } else {
-                return Error.MissingField;
-            }
+            return Error.MissingField;
         }
     }
 
@@ -172,6 +193,42 @@ fn parseValueToType(comptime T: type, bson_value: bson.BSONValue, arena_allocato
             .document => try parseDocumentToType(T, bson_value.document, arena_allocator),
             else => Error.TypeMismatch,
         },
+        .@"enum" => |e| switch (bson_value) {
+            .string => {
+                const str = bson_value.string.value;
+                inline for (e.fields) |field| {
+                    if (std.mem.eql(u8, str, field.name)) {
+                        return @enumFromInt(field.value);
+                    }
+                }
+                return Error.TypeMismatch;
+            },
+            else => Error.TypeMismatch,
+        },
+        .@"union" => |u| if (u.tag_type != null) blk: {
+            // String → void-payload variant
+            if (bson_value == .string) {
+                const str = bson_value.string.value;
+                inline for (u.fields) |field| {
+                    if (field.type == void and std.mem.eql(u8, str, field.name)) {
+                        break :blk @unionInit(T, field.name, {});
+                    }
+                }
+                break :blk Error.TypeMismatch;
+            }
+            // Document → payload variant  { "tag_name": value }
+            if (bson_value == .document) {
+                inline for (u.fields) |field| {
+                    if (field.type != void) {
+                        if (bson_value.document.get(field.name)) |inner| {
+                            break :blk @unionInit(T, field.name, try parseValueToType(field.type, inner, arena_allocator));
+                        }
+                    }
+                }
+                break :blk Error.TypeMismatch;
+            }
+            break :blk Error.TypeMismatch;
+        } else Error.UnsupportedType,
         else => Error.UnsupportedType,
     };
 }
@@ -377,4 +434,43 @@ test "serialize/parse nested slice in struct" {
     try std.testing.expectEqualStrings("db", parsed.value.profile.tags[0]);
     try std.testing.expectEqualStrings("zig", parsed.value.profile.tags[1]);
     try std.testing.expectEqualStrings("bson", parsed.value.profile.tags[2]);
+}
+
+test "serialize/parse enum roundtrip" {
+    const Color = enum { red, green, blue };
+    const T = struct { color: Color };
+
+    var doc = try serialize(T{ .color = .green }, std.testing.allocator);
+    defer doc.deinit(std.testing.allocator);
+
+    var parsed = try parse(T, doc, std.testing.allocator);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(Color.green, parsed.value.color);
+}
+
+test "serialize/parse tagged union void variant roundtrip" {
+    const Mode = union(enum) { all, periodic: u32, manual };
+    const T = struct { mode: Mode };
+
+    var doc = try serialize(T{ .mode = .all }, std.testing.allocator);
+    defer doc.deinit(std.testing.allocator);
+
+    var parsed = try parse(T, doc, std.testing.allocator);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(Mode.all, parsed.value.mode);
+}
+
+test "serialize/parse tagged union payload variant roundtrip" {
+    const Mode = union(enum) { all, periodic: u32, manual };
+    const T = struct { mode: Mode };
+
+    var doc = try serialize(T{ .mode = .{ .periodic = 50 } }, std.testing.allocator);
+    defer doc.deinit(std.testing.allocator);
+
+    var parsed = try parse(T, doc, std.testing.allocator);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(Mode{ .periodic = 50 }, parsed.value.mode);
 }
