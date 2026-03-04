@@ -1562,6 +1562,13 @@ pub const Bucket = struct {
         data: []u8,
     };
 
+    const ListRecord = struct {
+        doc: BSONDocument,
+        page_id: u64,
+        offset: u16,
+        doc_id: ObjectId,
+    };
+
     const PlannedIndexInsert = struct {
         index: *Index,
         values: std.ArrayList(BSONValue) = .{},
@@ -1943,6 +1950,8 @@ pub const Bucket = struct {
         point_seen_initialized: bool = false,
         limitLeft: ?u64 = null,
         offsetLeft: u64 = 0,
+        last_emitted: ?query.CursorAnchor = null,
+        cursor_mode_enabled: bool = false,
         next: *const fn (*ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument = nextUnfetched,
 
         fn ensureIndexIterator(self: *ListIterator) error{ScanError}!*Index.RangeIterator {
@@ -1997,7 +2006,17 @@ pub const Bucket = struct {
             return doc;
         }
 
-        pub fn nextUnfetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
+        fn rememberRecord(self: *ListIterator, record: *const ListRecord) void {
+            const user_id = record.doc.get("_id") orelse return;
+            self.last_emitted = .{
+                .doc_id = record.doc_id,
+                .user_id = user_id,
+                .page_id = record.page_id,
+                .offset = record.offset,
+            };
+        }
+
+        fn nextFullScanRecord(self: *ListIterator) error{ OutOfMemory, ScanError }!?ListRecord {
             std.debug.assert(self.plan.source == .full_scan);
 
             while (true) {
@@ -2013,7 +2032,12 @@ pub const Bucket = struct {
                 const bsonDoc: BSONDocument = .{ .buffer = doc.data };
                 if (self.query.match(&bsonDoc) and self.offsetLeft == 0) {
                     if (self.limitLeft != null) self.limitLeft = self.limitLeft.? - 1;
-                    return bsonDoc;
+                    return .{
+                        .doc = bsonDoc,
+                        .page_id = doc.page_id,
+                        .offset = doc.offset,
+                        .doc_id = ObjectId.fromInt(doc.header.doc_id),
+                    };
                 }
 
                 if (self.offsetLeft != 0) {
@@ -2022,54 +2046,68 @@ pub const Bucket = struct {
             }
         }
 
-        fn nextIndex(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
-            std.debug.assert(self.plan.source == .index);
+        pub fn nextUnfetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
+            const record = try self.nextFullScanRecord() orelse return null;
+            self.rememberRecord(&record);
+            return record.doc;
+        }
+
+        fn nextIndexRangeRecord(self: *ListIterator) error{ OutOfMemory, ScanError }!?ListRecord {
             if (self.limitLeft != null and self.limitLeft.? == 0) {
                 return null;
             }
             const ally = self.ally;
-            const use_points = Bucket.planUsesPointStrategy(&self.plan, self.query.filters);
+            const iterator = try self.ensureIndexIterator();
 
-            if (!use_points) {
-                const iterator = try self.ensureIndexIterator();
+            while (true) {
+                const loc = iterator.next() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ScanError,
+                } orelse return null;
+                const header = self.bucket.readDocHeaderAt(.{
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DocumentDeleted => continue,
+                    else => return error.ScanError,
+                };
 
-                while (true) {
-                    const loc = iterator.next() catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => return error.ScanError,
-                    } orelse return null;
-                    var doc = self.bucket.readDocAt(ally, .{
-                        .page_id = loc.pageId,
-                        .offset = loc.offset,
-                    }) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.DocumentDeleted => continue,
-                        else => return error.ScanError,
-                    };
+                var doc = self.bucket.readDocAt(ally, .{
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DocumentDeleted => continue,
+                    else => return error.ScanError,
+                };
 
-                    if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
-                        // ally.free(doc.buffer);
-                        continue;
-                    }
-
-                    if (self.offsetLeft != 0) {
-                        self.offsetLeft -= 1;
-                        // ally.free(doc.buffer);
-                        continue;
-                    }
-
-                    if (self.limitLeft) |*limit| {
-                        if (limit.* == 0) {
-                            // ally.free(doc.buffer);
-                            return null;
-                        }
-                        limit.* -= 1;
-                    }
-
-                    return doc;
+                if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
+                    continue;
                 }
-            }
 
+                if (self.offsetLeft != 0) {
+                    self.offsetLeft -= 1;
+                    continue;
+                }
+
+                if (self.limitLeft) |*limit| {
+                    if (limit.* == 0) {
+                        return null;
+                    }
+                    limit.* -= 1;
+                }
+
+                return .{
+                    .doc = doc,
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                    .doc_id = ObjectId.fromInt(header.doc_id),
+                };
+            }
+        }
+
+        fn nextPointIndexRecord(self: *ListIterator) error{ OutOfMemory, ScanError }!?ListRecord {
             if (self.plan.index == null) {
                 return null;
             }
@@ -2077,6 +2115,8 @@ pub const Bucket = struct {
             if (self.point_value_total == 0) {
                 return null;
             }
+
+            const ally = self.ally;
 
             // Initialize deduplication mechanism based on strategy
             if (!self.point_seen_initialized and self.point_dedup_strategy == .use_hashmap) {
@@ -2151,8 +2191,149 @@ pub const Bucket = struct {
                     limit.* -= 1;
                 }
 
-                return doc;
+                const header = self.bucket.readDocHeaderAt(.{
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DocumentDeleted => continue,
+                    else => return error.ScanError,
+                };
+
+                return .{
+                    .doc = doc,
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                    .doc_id = ObjectId.fromInt(header.doc_id),
+                };
             }
+        }
+
+        fn cursorAnchorMatchesDoc(anchor: *const query.CursorAnchor, doc: *const BSONDocument) bool {
+            const user_id = doc.get("_id") orelse return false;
+            return user_id.eql(&anchor.user_id);
+        }
+
+        fn resumeFullScanFromPhysicalAnchor(self: *ListIterator, anchor: *const query.CursorAnchor) error{ OutOfMemory, ScanError }!bool {
+            const header = self.bucket.readDocHeaderAt(.{
+                .page_id = anchor.page_id,
+                .offset = anchor.offset,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return false,
+            };
+            if (header.doc_id != anchor.doc_id.toInt()) return false;
+
+            self.scanner = try ScanIterator.init(self.bucket, self.ally);
+            self.scanner.page = self.bucket.loadPage(anchor.page_id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.ScanError,
+            };
+            self.scanner.initialized = true;
+            self.scanner.offset = anchor.offset;
+            self.scanner.pageIterator.index = anchor.page_id + 1;
+
+            const record = try self.nextFullScanRecord() orelse return false;
+            if (!cursorAnchorMatchesDoc(anchor, &record.doc)) {
+                return false;
+            }
+            return true;
+        }
+
+        fn skipPastCursorAnchor(self: *ListIterator) error{ OutOfMemory, ScanError, InvalidCursor }!void {
+            const cursor = self.query.cursor orelse return;
+            const anchor = cursor.anchor orelse return;
+
+            if (self.plan.source == .full_scan) {
+                if (try self.resumeFullScanFromPhysicalAnchor(&anchor)) {
+                    return;
+                }
+                self.scanner = try ScanIterator.init(self.bucket, self.ally);
+                while (try self.nextFullScanRecord()) |record| {
+                    if (cursorAnchorMatchesDoc(&anchor, &record.doc)) {
+                        return;
+                    }
+                }
+                return error.InvalidCursor;
+            }
+
+            const use_points = Bucket.planUsesPointStrategy(&self.plan, self.query.filters);
+            std.debug.assert(!use_points);
+            while (try self.nextIndexRangeRecord()) |record| {
+                if (cursorAnchorMatchesDoc(&anchor, &record.doc)) {
+                    return;
+                }
+            }
+            return error.InvalidCursor;
+        }
+
+        pub fn exportCursor(self: *ListIterator, allocator: std.mem.Allocator) error{ OutOfMemory, UnsupportedCursorQuery }!BSONDocument {
+            if (self.plan.eager or self.query.sortConfig != null or self.query.sector != null) {
+                return error.UnsupportedCursorQuery;
+            }
+
+            var root = BSONDocument.initEmpty();
+            var root_owned = false;
+            errdefer if (root_owned) root.deinit(allocator);
+
+            var next_root = try root.set(allocator, "version", .{ .int32 = .{ .value = 1 } });
+            root_owned = true;
+            root = next_root;
+
+            const mode_value: []const u8 = switch (self.plan.source) {
+                .full_scan => "full_scan",
+                .index => if (Bucket.planUsesPointStrategy(&self.plan, self.query.filters))
+                    return error.UnsupportedCursorQuery
+                else
+                    "index_range",
+            };
+            next_root = try root.set(allocator, "mode", .{ .string = .{ .value = mode_value } });
+            root.deinit(allocator);
+            root = next_root;
+
+            if (self.plan.source == .index) {
+                const index_path = self.plan.index_path orelse return error.UnsupportedCursorQuery;
+                next_root = try root.set(allocator, "indexPath", BSONValue.init(index_path));
+                root.deinit(allocator);
+                root = next_root;
+            }
+
+            if (self.last_emitted) |anchor| {
+                var anchor_doc = BSONDocument.initEmpty();
+                var anchor_owned = false;
+                defer if (anchor_owned) anchor_doc.deinit(allocator);
+
+                var next_anchor = try anchor_doc.set(allocator, "docId", BSONValue.init(anchor.doc_id));
+                anchor_owned = true;
+                anchor_doc = next_anchor;
+                next_anchor = try anchor_doc.set(allocator, "_id", anchor.user_id);
+                anchor_doc.deinit(allocator);
+                anchor_doc = next_anchor;
+                next_anchor = try anchor_doc.set(allocator, "pageId", .{ .int64 = .{ .value = @intCast(anchor.page_id) } });
+                anchor_doc.deinit(allocator);
+                anchor_doc = next_anchor;
+                next_anchor = try anchor_doc.set(allocator, "offset", .{ .int32 = .{ .value = @intCast(anchor.offset) } });
+                anchor_doc.deinit(allocator);
+                anchor_doc = next_anchor;
+
+                next_root = try root.set(allocator, "anchor", BSONValue.init(anchor_doc));
+                root.deinit(allocator);
+                root = next_root;
+            }
+
+            return root;
+        }
+
+        fn nextIndex(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
+            std.debug.assert(self.plan.source == .index);
+            const use_points = Bucket.planUsesPointStrategy(&self.plan, self.query.filters);
+            const record = if (use_points)
+                try self.nextPointIndexRecord()
+            else
+                try self.nextIndexRangeRecord();
+            const final_record = record orelse return null;
+            self.rememberRecord(&final_record);
+            return final_record.doc;
         }
 
         fn nextPointFilterValue(self: *ListIterator) ?bson.BSONValue {
@@ -2440,6 +2621,33 @@ pub const Bucket = struct {
         };
     }
 
+    fn validateCursorQuery(self: *Bucket, q: *const query.Query, plan: *const QueryPlan) error{ InvalidCursor, UnsupportedCursorQuery }!void {
+        _ = self;
+        const cursor = q.cursor orelse return;
+
+        if (q.sortConfig != null or q.sector != null or plan.eager) {
+            return error.UnsupportedCursorQuery;
+        }
+
+        if (plan.source == .index and plan.index_strategy == .points) {
+            return error.UnsupportedCursorQuery;
+        }
+
+        switch (cursor.mode) {
+            .full_scan => {
+                if (plan.source != .full_scan) return error.InvalidCursor;
+            },
+            .index_range => {
+                if (plan.source != .index or plan.index_strategy != .range) return error.InvalidCursor;
+                const plan_index_path = plan.index_path orelse return error.InvalidCursor;
+                const cursor_index_path = cursor.index_path orelse return error.InvalidCursor;
+                if (!mem.eql(u8, plan_index_path, cursor_index_path)) {
+                    return error.InvalidCursor;
+                }
+            },
+        }
+    }
+
     fn collectDocs(
         self: *Bucket,
         docList: *std.ArrayList(BSONDocument),
@@ -2553,6 +2761,7 @@ pub const Bucket = struct {
     pub fn listIterate(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*ListIterator {
         var ally = arena.allocator();
         const plan = self.planQuery(&q);
+        try self.validateCursorQuery(&q, &plan);
 
         var scanner_instance: ScanIterator = undefined;
         if (plan.source == .full_scan) {
@@ -2582,6 +2791,8 @@ pub const Bucket = struct {
             .limitLeft = null,
             .offsetLeft = 0,
             .index = 0,
+            .last_emitted = null,
+            .cursor_mode_enabled = q.cursor != null,
         };
 
         if (Bucket.planUsesPointStrategy(&rc.plan, rc.query.filters)) {
@@ -2629,6 +2840,10 @@ pub const Bucket = struct {
                 }
                 rc.next = ListIterator.nextUnfetched;
             }
+        }
+
+        if (q.cursor != null) {
+            try rc.skipPastCursorAnchor();
         }
 
         return rc;
@@ -3096,6 +3311,29 @@ pub const Bucket = struct {
         }
 
         return BSONDocument{ .buffer = docBuffer };
+    }
+
+    fn readDocHeaderAt(
+        self: *Bucket,
+        loc: DocumentLocation,
+    ) error{ OutOfMemory, PageNotFound, DocumentDeleted }!DocHeader {
+        const page = self.loadPage(loc.page_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PageNotFound,
+        };
+
+        if (loc.offset + @sizeOf(DocHeader) > page.data.len) {
+            return error.PageNotFound;
+        }
+
+        const header = std.mem.bytesToValue(DocHeader, page.data[loc.offset .. loc.offset + @sizeOf(DocHeader)]);
+        if (header.is_deleted == 1) {
+            return error.DocumentDeleted;
+        }
+        if (header.reserved != 0 or header.is_deleted > 1 or header.doc_id == 0) {
+            return error.PageNotFound;
+        }
+        return header;
     }
 
     pub fn delete(self: *Bucket, q: query.Query) !void {
@@ -3638,6 +3876,286 @@ fn setupIndexQueryBucket(bucket: *Bucket, allocator: std.mem.Allocator) !void {
     var dora_doc = try bson.fmt.serialize(.{ .name = "Dora", .age = 35, .scores = [_]i32{7} }, allocator);
     defer dora_doc.deinit(allocator);
     _ = try bucket.insert(dora_doc);
+}
+
+fn queryDocWithCursor(allocator: std.mem.Allocator, base: BSONDocument, cursor: BSONDocument) !BSONDocument {
+    return try base.set(allocator, "cursor", BSONValue.init(cursor));
+}
+
+test "Bucket.full scan cursor resumes after partial consumption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-full-scan.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-full-scan.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-full-scan.bucket") catch {};
+
+    const docs = [_][]const u8{ "A", "B", "C" };
+    for (docs) |name| {
+        var doc = try bson.fmt.serialize(.{ .name = name }, allocator);
+        defer doc.deinit(allocator);
+        _ = try bucket.insert(doc);
+    }
+
+    var qdoc = try bson.fmt.serialize(.{}, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+
+    const first = (try iter.next(iter)).?;
+    const second = (try iter.next(iter)).?;
+    try testing.expectEqualStrings("A", first.get("name").?.string.value);
+    try testing.expectEqualStrings("B", second.get("name").?.string.value);
+
+    var cursor_doc = try iter.exportCursor(allocator);
+    defer cursor_doc.deinit(allocator);
+
+    var resume_doc = try queryDocWithCursor(allocator, qdoc, cursor_doc);
+    defer resume_doc.deinit(allocator);
+    var resume_query = try query.Query.parse(allocator, resume_doc);
+    defer resume_query.deinit(allocator);
+
+    var resume_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer resume_arena.deinit();
+    var resumed = try bucket.listIterate(&resume_arena, resume_query);
+    defer resumed.deinit() catch {};
+
+    const final = (try resumed.next(resumed)).?;
+    try testing.expectEqualStrings("C", final.get("name").?.string.value);
+    try testing.expectEqual(@as(?BSONDocument, null), try resumed.next(resumed));
+}
+
+test "Bucket.index range cursor resumes after partial consumption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-index-range.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-index-range.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-index-range.bucket") catch {};
+
+    var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = .{ .@"$gte" = 35 } } }, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+
+    const first = (try iter.next(iter)).?;
+    try testing.expectEqualStrings("Dora", first.get("name").?.string.value);
+
+    var cursor_doc = try iter.exportCursor(allocator);
+    defer cursor_doc.deinit(allocator);
+
+    var resume_doc = try queryDocWithCursor(allocator, qdoc, cursor_doc);
+    defer resume_doc.deinit(allocator);
+    var resume_query = try query.Query.parse(allocator, resume_doc);
+    defer resume_query.deinit(allocator);
+
+    var resume_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer resume_arena.deinit();
+    var resumed = try bucket.listIterate(&resume_arena, resume_query);
+    defer resumed.deinit() catch {};
+
+    const next = (try resumed.next(resumed)).?;
+    const last = (try resumed.next(resumed)).?;
+    try testing.expectEqualStrings("Bob", next.get("name").?.string.value);
+    try testing.expectEqualStrings("Carol", last.get("name").?.string.value);
+    try testing.expectEqual(@as(?BSONDocument, null), try resumed.next(resumed));
+}
+
+test "Bucket.cursor exported before first read resumes from beginning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-before-first-read.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-before-first-read.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-before-first-read.bucket") catch {};
+
+    var doc = try bson.fmt.serialize(.{ .name = "Alpha" }, allocator);
+    defer doc.deinit(allocator);
+    _ = try bucket.insert(doc);
+
+    var qdoc = try bson.fmt.serialize(.{}, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var cursor_doc = try iter.exportCursor(allocator);
+    defer cursor_doc.deinit(allocator);
+
+    var resume_doc = try queryDocWithCursor(allocator, qdoc, cursor_doc);
+    defer resume_doc.deinit(allocator);
+    var resume_query = try query.Query.parse(allocator, resume_doc);
+    defer resume_query.deinit(allocator);
+
+    var resume_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer resume_arena.deinit();
+    var resumed = try bucket.listIterate(&resume_arena, resume_query);
+    defer resumed.deinit() catch {};
+
+    const first = (try resumed.next(resumed)).?;
+    try testing.expectEqualStrings("Alpha", first.get("name").?.string.value);
+}
+
+test "Bucket.cursor exported after eos resumes from end and sees later inserts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-after-eos.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-after-eos.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-after-eos.bucket") catch {};
+
+    var doc1 = try bson.fmt.serialize(.{ .name = "A" }, allocator);
+    defer doc1.deinit(allocator);
+    _ = try bucket.insert(doc1);
+    var doc2 = try bson.fmt.serialize(.{ .name = "B" }, allocator);
+    defer doc2.deinit(allocator);
+    _ = try bucket.insert(doc2);
+
+    var qdoc = try bson.fmt.serialize(.{}, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    while (try iter.next(iter)) |_| {}
+
+    var cursor_doc = try iter.exportCursor(allocator);
+    defer cursor_doc.deinit(allocator);
+
+    var doc3 = try bson.fmt.serialize(.{ .name = "C" }, allocator);
+    defer doc3.deinit(allocator);
+    _ = try bucket.insert(doc3);
+
+    var resume_doc = try queryDocWithCursor(allocator, qdoc, cursor_doc);
+    defer resume_doc.deinit(allocator);
+    var resume_query = try query.Query.parse(allocator, resume_doc);
+    defer resume_query.deinit(allocator);
+
+    var resume_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer resume_arena.deinit();
+    var resumed = try bucket.listIterate(&resume_arena, resume_query);
+    defer resumed.deinit() catch {};
+
+    const next = (try resumed.next(resumed)).?;
+    try testing.expectEqualStrings("C", next.get("name").?.string.value);
+    try testing.expectEqual(@as(?BSONDocument, null), try resumed.next(resumed));
+}
+
+test "Bucket.cursor with deleted anchor returns invalid cursor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-deleted-anchor.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-deleted-anchor.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-deleted-anchor.bucket") catch {};
+
+    var doc1 = try bson.fmt.serialize(.{ .name = "A" }, allocator);
+    defer doc1.deinit(allocator);
+    _ = try bucket.insert(doc1);
+    var doc2 = try bson.fmt.serialize(.{ .name = "B" }, allocator);
+    defer doc2.deinit(allocator);
+    _ = try bucket.insert(doc2);
+
+    var qdoc = try bson.fmt.serialize(.{}, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    _ = (try iter.next(iter)).?;
+    var cursor_doc = try iter.exportCursor(allocator);
+    defer cursor_doc.deinit(allocator);
+
+    var delete_qdoc = try bson.fmt.serialize(.{ .query = .{ .name = "A" } }, allocator);
+    defer delete_qdoc.deinit(allocator);
+    var delete_query = try query.Query.parse(allocator, delete_qdoc);
+    defer delete_query.deinit(allocator);
+    try bucket.delete(delete_query);
+
+    var resume_doc = try queryDocWithCursor(allocator, qdoc, cursor_doc);
+    defer resume_doc.deinit(allocator);
+    var resume_query = try query.Query.parse(allocator, resume_doc);
+    defer resume_query.deinit(allocator);
+
+    var resume_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer resume_arena.deinit();
+    try testing.expectError(error.InvalidCursor, bucket.listIterate(&resume_arena, resume_query));
+}
+
+test "Bucket.cursor query rejects sort" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-sort-unsupported.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-sort-unsupported.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-sort-unsupported.bucket") catch {};
+
+    var qdoc = try bson.fmt.serialize(.{
+        .sort = .{ .asc = "name" },
+        .cursor = .{ .version = 1, .mode = "full_scan"[0..] },
+    }, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    try testing.expectError(error.UnsupportedCursorQuery, bucket.listIterate(&arena, q));
+}
+
+test "Bucket.cursor query rejects sector" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-sector-unsupported.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-sector-unsupported.bucket");
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-sector-unsupported.bucket") catch {};
+
+    var qdoc = try bson.fmt.serialize(.{
+        .sector = .{ .limit = 1 },
+        .cursor = .{ .version = 1, .mode = "full_scan"[0..] },
+    }, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    try testing.expectError(error.UnsupportedCursorQuery, bucket.listIterate(&arena, q));
+}
+
+test "Bucket.cursor query rejects point strategy index scans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("cursor-point-unsupported.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "cursor-point-unsupported.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("cursor-point-unsupported.bucket") catch {};
+
+    var qdoc = try bson.fmt.serialize(.{
+        .query = .{ .age = .{ .@"$in" = [_]i32{ 30, 40 } } },
+        .cursor = .{ .version = 1, .mode = "index_range"[0..], .indexPath = "age"[0..] },
+    }, allocator);
+    defer qdoc.deinit(allocator);
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    try testing.expectError(error.UnsupportedCursorQuery, bucket.listIterate(&arena, q));
 }
 
 test "Bucket.indexed query equality uses range" {

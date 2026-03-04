@@ -29,7 +29,34 @@ const Result = enum(u8) {
     NotFound,
     InvalidFormat,
     DuplicateKey,
+    InvalidCursor,
+    UnsupportedCursorQuery,
 };
+
+fn mapQueryParseError(err: anyerror) Result {
+    return switch (err) {
+        Query.QueryParsingErrors.InvalidCursor,
+        Query.QueryParsingErrors.InvalidCursorVersion,
+        Query.QueryParsingErrors.InvalidCursorMode,
+        Query.QueryParsingErrors.MissingCursorIndexPath,
+        Query.QueryParsingErrors.InvalidCursorAnchor,
+        Query.QueryParsingErrors.InvalidCursorDocId,
+        Query.QueryParsingErrors.InvalidCursorPageId,
+        Query.QueryParsingErrors.InvalidCursorOffset,
+        => Result.InvalidCursor,
+        Query.QueryParsingErrors.OutOfMemory => Result.OutOfMemory,
+        else => Result.Error,
+    };
+}
+
+fn mapListError(err: anyerror) Result {
+    return switch (err) {
+        error.InvalidCursor => Result.InvalidCursor,
+        error.UnsupportedCursorQuery => Result.UnsupportedCursorQuery,
+        error.OutOfMemory => Result.OutOfMemory,
+        else => Result.Error,
+    };
+}
 
 pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     const pathProper = std.mem.span(path);
@@ -239,19 +266,9 @@ pub export fn albedo_list(bucket: *albedo.Bucket, queryBuffer: [*]u8, outIterato
     const local_ally = queryArena.allocator();
     const queryBufferProper = local_ally.dupe(u8, queryBuffer[0..queryLen]) catch return Result.OutOfMemory;
 
-    const query = Query.parseRaw(local_ally, queryBufferProper) catch |err| switch (err) {
-        else => {
-            // std.debug.print("Failed to parse query, {any}", .{qErr});
-            return Result.Error;
-        },
-    };
+    const query = Query.parseRaw(local_ally, queryBufferProper) catch |err| return mapQueryParseError(err);
 
-    const iterator = bucket.listIterate(queryArena, query) catch |err| switch (err) {
-        else => {
-            // std.debug.print("Failed to list documents, {any}", .{rErr});
-            return Result.Error;
-        },
-    };
+    const iterator = bucket.listIterate(queryArena, query) catch |err| return mapListError(err);
     const listHandle = local_ally.create(ListHandle) catch return Result.OutOfMemory;
     listHandle.* = ListHandle{
         .iterator = iterator,
@@ -275,6 +292,16 @@ pub export fn albedo_data(handle: *ListHandle, outDoc: *[*]u8) Result {
 
     outDoc.* = @constCast(doc.buffer.ptr);
 
+    return Result.OK;
+}
+
+pub export fn albedo_list_cursor_export(handle: *ListHandle, outCursor: *[*]u8) Result {
+    var cursor_doc = handle.iterator.exportCursor(ally) catch |err| return mapListError(err);
+    defer cursor_doc.deinit(ally);
+
+    const out_buf = ally.alloc(u8, cursor_doc.buffer.len) catch return Result.OutOfMemory;
+    @memcpy(out_buf, cursor_doc.buffer);
+    outCursor.* = out_buf.ptr;
     return Result.OK;
 }
 
@@ -685,6 +712,117 @@ test "lib API returns errors for invalid query payloads" {
         Result.Error,
         albedo_transform(bucket, @constCast(bad_query.buffer.ptr), &transform_iterator),
     );
+}
+
+test "lib API list cursor export resumes stream" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-list-cursor-export");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    for ([_][]const u8{ "A", "B", "C" }) |name| {
+        const json = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\"}}", .{name});
+        defer allocator.free(json);
+        var doc = try bson.BSONDocument.fromJSON(allocator, json);
+        defer doc.deinit(allocator);
+        try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+    }
+
+    var list_query = try bson.BSONDocument.fromJSON(allocator, "{}");
+    defer list_query.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(list_query.buffer.ptr), &handle));
+    defer _ = albedo_close_iterator(handle);
+
+    var raw_doc_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_data(handle, &raw_doc_ptr));
+
+    var raw_cursor_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_list_cursor_export(handle, &raw_cursor_ptr));
+    const raw_cursor_len = std.mem.readInt(u32, raw_cursor_ptr[0..4], .little);
+    defer albedo_free(raw_cursor_ptr, raw_cursor_len);
+
+    const cursor_doc = bson.BSONDocument.init(raw_cursor_ptr[0..raw_cursor_len]);
+    var resume_query = try list_query.set(allocator, "cursor", bson.BSONValue.init(cursor_doc));
+    defer resume_query.deinit(allocator);
+
+    var resumed_handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(resume_query.buffer.ptr), &resumed_handle));
+    defer _ = albedo_close_iterator(resumed_handle);
+
+    var resumed_doc_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_data(resumed_handle, &resumed_doc_ptr));
+    const resumed_len = std.mem.readInt(u32, resumed_doc_ptr[0..4], .little);
+    const resumed_doc = bson.BSONDocument.init(resumed_doc_ptr[0..resumed_len]);
+    try testing.expectEqualStrings("B", resumed_doc.get("name").?.string.value);
+}
+
+test "lib API list rejects invalid cursor" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-invalid-cursor");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var query_doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "cursor": {
+        \\    "version": 2,
+        \\    "mode": "full_scan"
+        \\  }
+        \\}
+    );
+    defer query_doc.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.InvalidCursor, albedo_list(bucket, @constCast(query_doc.buffer.ptr), &handle));
+}
+
+test "lib API list rejects unsupported cursor query" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-unsupported-cursor-query");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var query_doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "sort": {
+        \\    "asc": "name"
+        \\  },
+        \\  "cursor": {
+        \\    "version": 1,
+        \\    "mode": "full_scan"
+        \\  }
+        \\}
+    );
+    defer query_doc.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.UnsupportedCursorQuery, albedo_list(bucket, @constCast(query_doc.buffer.ptr), &handle));
 }
 
 test "lib API insert reports duplicate key" {

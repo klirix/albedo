@@ -144,6 +144,102 @@ alive so other readers can continue using it.
 
 ---
 
+## Streaming Queries
+
+`albedo_list` can be used as a document stream even without cursors. Open a
+list iterator, call `albedo_data` / `next()`, and keep polling after `EOS` if
+you want live-tail behavior. In WAL mode the iterator can pick up documents
+written later by another connection.
+
+Basic C flow:
+
+```c
+albedo_list_handle *it;
+albedo_list(db, query_buf, &it);
+
+uint8_t *doc;
+while (albedo_data(it, &doc) == ALBEDO_OK) {
+  // consume doc
+}
+
+// Later, poll again on the same iterator if you want to keep streaming.
+while (albedo_data(it, &doc) == ALBEDO_OK) {
+  // consume newly visible docs
+}
+```
+
+Streaming queries are useful for:
+
+- Full-scan streams over the whole bucket
+- Range-index streams such as `{ "query": { "age": { "$gte": 30 } } }`
+- Long-lived readers that want to keep an iterator open and observe new writes
+
+Current streaming limitations:
+
+- Queries with `sort` are materialized eagerly and are not stream-shaped
+- `sector` is pagination, not streaming state
+- Point-strategy index scans such as `$in` are supported as normal queries, but
+  not as resumable cursor streams
+
+## Streaming Cursors
+
+A cursor is an exported snapshot of stream progress. Use it when you want to
+close an iterator, hand the state to a client, and reopen the same streaming
+query later without replaying already delivered documents.
+
+Cursor shape:
+
+```bson
+{
+  "query": { ... },
+  "cursor": {
+    "version": 1,
+    "mode": "full_scan" | "index_range",
+    "indexPath": "field.path",
+    "anchor": {
+      "docId": ObjectId("..."),
+      "_id": <BSON value>,
+      "pageId": 42,
+      "offset": 128
+    }
+  }
+}
+```
+
+C API flow:
+
+```c
+albedo_list_handle *it;
+albedo_list(db, query_buf, &it);
+
+uint8_t *doc;
+albedo_data(it, &doc);
+
+uint8_t *cursor_buf;
+albedo_list_cursor_export(it, &cursor_buf);
+albedo_close_iterator(it);
+
+// Build a new query buffer with {"cursor": <cursor_buf>}
+albedo_list(db, resumed_query_buf, &it);
+```
+
+Cursor-specific limitations in v1:
+
+- No `sort` with `cursor`
+- No `sector` with `cursor`
+- No point-strategy index cursors such as `$in`
+- Cursor iterators are not thread-safe
+- Best-effort continuation only; this is not snapshot pagination
+
+Invalidation and resume errors:
+
+- A cursor is tied to the current document layout and stream anchor
+- After `vacuum()`, previously exported cursors are not accepted
+- If the anchor can no longer be found when reopening, resume fails with
+  `InvalidCursor` in Zig and `ALBEDO_INVALID_CURSOR` in the C API
+
+---
+
 ## Replication
 
 Albedo ships with a page-level replication system that batches dirty pages and
@@ -162,4 +258,3 @@ change between versions. Contributions and bug reports are welcome.
 ## License
 
 Released under the [MIT License](license). © 2025 Askhat Saiapov.
-

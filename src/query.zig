@@ -568,7 +568,7 @@ const SortConfig = union(SortType) {
         InvalidQueryPath,
     };
 
-    pub fn parse(doc: bson.BSONValue) SortParsingErrors!SortConfig {
+    pub fn parse(ally: Allocator, doc: bson.BSONValue) (SortParsingErrors || Allocator.Error)!SortConfig {
         if (doc != bson.BSONValueType.document) return error.InvalidQuerySort;
 
         if (doc.document.keyNumber() != 1) return error.InvalidQuerySortParamLength;
@@ -580,10 +580,12 @@ const SortConfig = union(SortType) {
 
         const path = pair.value.string.value;
         if (path.len == 0) return error.InvalidQueryPath;
+        const path_copy = try ally.dupe(u8, path);
+        errdefer ally.free(path_copy);
         if (std.mem.eql(u8, pair.key, "asc")) {
-            return SortConfig{ .asc = path };
+            return SortConfig{ .asc = path_copy };
         } else if (std.mem.eql(u8, pair.key, "desc")) {
-            return SortConfig{ .desc = path };
+            return SortConfig{ .desc = path_copy };
         } else {
             return error.InvalidQuerySort;
         }
@@ -594,7 +596,11 @@ test "Sort.parse" {
     const ally = std.testing.allocator;
     const sortDoc = try bson.fmt.serialize(.{ .asc = "field" }, ally);
     defer sortDoc.deinit(ally);
-    const sort = try SortConfig.parse(bson.BSONValue{ .document = sortDoc });
+    const sort = try SortConfig.parse(ally, bson.BSONValue{ .document = sortDoc });
+    defer switch (sort) {
+        .asc => |path| ally.free(path),
+        .desc => |path| ally.free(path),
+    };
 
     switch (sort) {
         .asc => |ascSort| {
@@ -672,10 +678,115 @@ test "Sector.parse" {
     try std.testing.expectEqual(sector.limit, 10);
 }
 
+pub const CursorMode = enum {
+    full_scan,
+    index_range,
+};
+
+pub const CursorAnchor = struct {
+    doc_id: bson.ObjectId,
+    user_id: bson.BSONValue,
+    page_id: u64,
+    offset: u16,
+};
+
+pub const Cursor = struct {
+    version: u32,
+    mode: CursorMode,
+    index_path: ?[]const u8,
+    anchor: ?CursorAnchor,
+
+    pub const CursorParsingErrors = error{
+        InvalidCursor,
+        InvalidCursorVersion,
+        InvalidCursorMode,
+        MissingCursorIndexPath,
+        InvalidCursorAnchor,
+        InvalidCursorDocId,
+        InvalidCursorPageId,
+        InvalidCursorOffset,
+    };
+
+    fn parsePositiveInteger(value: bson.BSONValue) CursorParsingErrors!u64 {
+        return switch (value) {
+            .int32 => |v| blk: {
+                if (v.value < 0) return error.InvalidCursor;
+                break :blk @intCast(v.value);
+            },
+            .int64 => |v| blk: {
+                if (v.value < 0) return error.InvalidCursor;
+                break :blk @intCast(v.value);
+            },
+            .double => |v| blk: {
+                if (v.value < 0) return error.InvalidCursor;
+                break :blk @intFromFloat(v.value);
+            },
+            else => return error.InvalidCursor,
+        };
+    }
+
+    pub fn parse(doc: *const bson.BSONValue) CursorParsingErrors!Cursor {
+        if (doc.* != .document) return error.InvalidCursor;
+        const cursor_doc = doc.document;
+
+        const version_value = cursor_doc.get("version") orelse return error.InvalidCursorVersion;
+        const version = try parsePositiveInteger(version_value);
+        if (version != 1) return error.InvalidCursorVersion;
+
+        const mode_value = cursor_doc.get("mode") orelse return error.InvalidCursorMode;
+        if (mode_value != .string) return error.InvalidCursorMode;
+        const mode = if (std.mem.eql(u8, mode_value.string.value, "full_scan"))
+            CursorMode.full_scan
+        else if (std.mem.eql(u8, mode_value.string.value, "index_range"))
+            CursorMode.index_range
+        else
+            return error.InvalidCursorMode;
+
+        const index_path = if (cursor_doc.get("indexPath")) |value| blk: {
+            if (value != .string or value.string.value.len == 0) return error.MissingCursorIndexPath;
+            break :blk value.string.value;
+        } else null;
+
+        if (mode == .index_range and index_path == null) {
+            return error.MissingCursorIndexPath;
+        }
+
+        const anchor = if (cursor_doc.get("anchor")) |anchor_value| blk: {
+            if (anchor_value != .document) return error.InvalidCursorAnchor;
+            const anchor_doc = anchor_value.document;
+
+            const doc_id_value = anchor_doc.get("docId") orelse return error.InvalidCursorDocId;
+            if (doc_id_value != .objectId) return error.InvalidCursorDocId;
+
+            const user_id = anchor_doc.get("_id") orelse return error.InvalidCursorAnchor;
+            const page_id_value = anchor_doc.get("pageId") orelse return error.InvalidCursorPageId;
+            const offset_value = anchor_doc.get("offset") orelse return error.InvalidCursorOffset;
+            const page_id = try parsePositiveInteger(page_id_value);
+            const offset_u64 = try parsePositiveInteger(offset_value);
+            if (offset_u64 > std.math.maxInt(u16)) return error.InvalidCursorOffset;
+
+            break :blk CursorAnchor{
+                .doc_id = doc_id_value.objectId.value,
+                .user_id = user_id,
+                .page_id = page_id,
+                .offset = @intCast(offset_u64),
+            };
+        } else null;
+
+        return .{
+            .version = @intCast(version),
+            .mode = mode,
+            .index_path = index_path,
+            .anchor = anchor,
+        };
+    }
+};
+
 pub const Query = struct {
     filters: []Filter,
     sortConfig: ?SortConfig,
     sector: ?Sector,
+    cursor: ?Cursor,
     // projection: bson.Document,
 
     pub fn parseRaw(ally: Allocator, rawQuery: []const u8) QueryParsingErrors!Query {
@@ -686,20 +797,25 @@ pub const Query = struct {
 
     pub const QueryParsingErrors = (SortConfig.SortParsingErrors ||
         Filter.FilterParsingErrors ||
-        Sector.SectorParsingErrors);
+        Sector.SectorParsingErrors ||
+        Cursor.CursorParsingErrors ||
+        Allocator.Error);
 
     pub fn parse(ally: Allocator, queryDoc: bson.BSONDocument) QueryParsingErrors!Query {
         const filterDoc = queryDoc.get("query");
         const filters = if (filterDoc) |doc| try Filter.parse(ally, doc) else try ally.alloc(Filter, 0);
         const sortDoc = queryDoc.get("sort");
-        const sortConfig = if (sortDoc) |doc| try SortConfig.parse(doc) else null;
+        const sortConfig = if (sortDoc) |doc| try SortConfig.parse(ally, doc) else null;
         const sectorDoc = queryDoc.get("sector");
         const sector = if (sectorDoc) |*doc| try Sector.parse(doc) else null;
+        const cursorDoc = queryDoc.get("cursor");
+        const cursor = if (cursorDoc) |*doc| try Cursor.parse(doc) else null;
 
         const query = Query{
             .filters = filters,
             .sortConfig = sortConfig,
             .sector = sector,
+            .cursor = cursor,
             // .projection = queryDoc.get("projection") catch bson.Document{},
         };
 
@@ -771,6 +887,129 @@ test "Query.parse" {
     // queryDoc.serializeToMemory(buffer);
     var query = try Query.parse(ally, queryDoc);
     defer query.deinit(ally);
+}
+
+test "Query.parse cursor full_scan" {
+    const ally = std.testing.allocator;
+    const doc_id = try bson.ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
+
+    var anchor = bson.BSONDocument.initEmpty();
+    var next_anchor = try anchor.set(ally, "docId", bson.BSONValue.init(doc_id));
+    defer anchor.deinit(ally);
+    anchor = next_anchor;
+    next_anchor = try anchor.set(ally, "_id", .{ .string = .{ .value = "user-1" } });
+    anchor.deinit(ally);
+    anchor = next_anchor;
+    next_anchor = try anchor.set(ally, "pageId", .{ .int64 = .{ .value = 4 } });
+    anchor.deinit(ally);
+    anchor = next_anchor;
+    next_anchor = try anchor.set(ally, "offset", .{ .int32 = .{ .value = 16 } });
+    anchor.deinit(ally);
+    anchor = next_anchor;
+
+    var cursor = bson.BSONDocument.initEmpty();
+    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 1 } });
+    defer cursor.deinit(ally);
+    cursor = next_cursor;
+    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "full_scan" } });
+    cursor.deinit(ally);
+    cursor = next_cursor;
+    next_cursor = try cursor.set(ally, "anchor", bson.BSONValue.init(anchor));
+    cursor.deinit(ally);
+    cursor = next_cursor;
+
+    var queryDoc = bson.BSONDocument.initEmpty();
+    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    defer queryDoc.deinit(ally);
+    queryDoc = next_query_doc;
+
+    var parsed = try Query.parse(ally, queryDoc);
+    defer parsed.deinit(ally);
+    try std.testing.expect(parsed.cursor != null);
+    try std.testing.expectEqual(CursorMode.full_scan, parsed.cursor.?.mode);
+    try std.testing.expectEqual(doc_id.toInt(), parsed.cursor.?.anchor.?.doc_id.toInt());
+    try std.testing.expectEqual(@as(u64, 4), parsed.cursor.?.anchor.?.page_id);
+    try std.testing.expectEqual(@as(u16, 16), parsed.cursor.?.anchor.?.offset);
+}
+
+test "Query.parse cursor index_range" {
+    const ally = std.testing.allocator;
+    const doc_id = try bson.ObjectId.parseString("507c7f79bcf86cd7994f6c0f");
+
+    var anchor = bson.BSONDocument.initEmpty();
+    var next_anchor = try anchor.set(ally, "docId", bson.BSONValue.init(doc_id));
+    defer anchor.deinit(ally);
+    anchor = next_anchor;
+    next_anchor = try anchor.set(ally, "_id", .{ .string = .{ .value = "user-2" } });
+    anchor.deinit(ally);
+    anchor = next_anchor;
+    next_anchor = try anchor.set(ally, "pageId", .{ .int64 = .{ .value = 8 } });
+    anchor.deinit(ally);
+    anchor = next_anchor;
+    next_anchor = try anchor.set(ally, "offset", .{ .int32 = .{ .value = 24 } });
+    anchor.deinit(ally);
+    anchor = next_anchor;
+
+    var cursor = bson.BSONDocument.initEmpty();
+    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 1 } });
+    defer cursor.deinit(ally);
+    cursor = next_cursor;
+    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "index_range" } });
+    cursor.deinit(ally);
+    cursor = next_cursor;
+    next_cursor = try cursor.set(ally, "indexPath", .{ .string = .{ .value = "age" } });
+    cursor.deinit(ally);
+    cursor = next_cursor;
+    next_cursor = try cursor.set(ally, "anchor", bson.BSONValue.init(anchor));
+    cursor.deinit(ally);
+    cursor = next_cursor;
+
+    var queryDoc = bson.BSONDocument.initEmpty();
+    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    defer queryDoc.deinit(ally);
+    queryDoc = next_query_doc;
+
+    var parsed = try Query.parse(ally, queryDoc);
+    defer parsed.deinit(ally);
+    try std.testing.expect(parsed.cursor != null);
+    try std.testing.expectEqual(CursorMode.index_range, parsed.cursor.?.mode);
+    try std.testing.expect(std.mem.eql(u8, parsed.cursor.?.index_path.?, "age"));
+}
+
+test "Query.parse cursor rejects invalid version" {
+    const ally = std.testing.allocator;
+    var cursor = bson.BSONDocument.initEmpty();
+    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 2 } });
+    defer cursor.deinit(ally);
+    cursor = next_cursor;
+    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "full_scan" } });
+    cursor.deinit(ally);
+    cursor = next_cursor;
+
+    var queryDoc = bson.BSONDocument.initEmpty();
+    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    defer queryDoc.deinit(ally);
+    queryDoc = next_query_doc;
+
+    try std.testing.expectError(error.InvalidCursorVersion, Query.parse(ally, queryDoc));
+}
+
+test "Query.parse cursor rejects missing index path" {
+    const ally = std.testing.allocator;
+    var cursor = bson.BSONDocument.initEmpty();
+    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 1 } });
+    defer cursor.deinit(ally);
+    cursor = next_cursor;
+    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "index_range" } });
+    cursor.deinit(ally);
+    cursor = next_cursor;
+
+    var queryDoc = bson.BSONDocument.initEmpty();
+    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    defer queryDoc.deinit(ally);
+    queryDoc = next_query_doc;
+
+    try std.testing.expectError(error.MissingCursorIndexPath, Query.parse(ally, queryDoc));
 }
 
 test "Query.match matches objectId correctly" {

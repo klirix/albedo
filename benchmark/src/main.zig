@@ -172,7 +172,7 @@ fn benchAlbedoInsert(allocator: std.mem.Allocator, bucket: *Bucket) !u64 {
 fn benchSqliteInsert(db: *sqlite.Db) !u64 {
     var timer = try std.time.Timer.start();
 
-    var stmt = try db.prepare("INSERT INTO docs (name, age, email, active) VALUES (?, ?, ?, ?)");
+    var stmt = try db.prepare("INSERT INTO docs (id, name, age, email, active) VALUES (?, ?, ?, ?, ?)");
     defer stmt.deinit();
 
     for (0..NUM_RECORDS) |i| {
@@ -181,6 +181,7 @@ fn benchSqliteInsert(db: *sqlite.Db) !u64 {
         const name = std.fmt.bufPrint(&name_buf, "record_{d}", .{i}) catch unreachable;
 
         stmt.exec(.{}, .{
+            i,
             @as([]const u8, name),
             age,
             @as([]const u8, "user@example.com"),
@@ -341,6 +342,9 @@ pub fn main() !void {
         },
     });
     defer bucket.deinit();
+    defer std.fs.cwd().deleteFile("file.bucket") catch {};
+
+    // try bucket.dropIndex("_id");
 
     // ── Setup SQLite ─────────────────────────────────────────────────────
     var db = try sqlite.Db.init(.{
@@ -349,15 +353,17 @@ pub fn main() !void {
         .threading_mode = .Serialized,
     });
     defer db.deinit();
+    defer std.fs.cwd().deleteFile("file.sqlite") catch {};
 
     // No WAL — use rollback journal like Albedo's direct-write model.
     _ = try db.pragma(void, .{}, "journal_mode", "WAL");
     // _ = try db.pragma(void, .{}, "synchronous", "NORMAL");
     try db.exec(
-        "CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age INTEGER, email TEXT, active INTEGER)",
+        "CREATE TABLE IF NOT EXISTS docs (id INTEGER, name TEXT, age INTEGER, email TEXT, active INTEGER)",
         .{},
         .{},
     );
+    try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_id ON docs(id)", .{}, .{});
 
     // ── Print header ─────────────────────────────────────────────────────
     print("\n  {s}{s}◆  ALBEDO vs SQLITE  ◆{s}", .{ C.bold, C.cyan, C.reset });
@@ -419,7 +425,7 @@ pub fn main() !void {
     // ══════════════════════════════════════════════════════════════════════
     {
         try bucket.ensureIndex("age", .{});
-        try db.exec("CREATE INDEX IF NOT EXISTS idx_age ON docs(age)", .{}, .{});
+        try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_age ON docs(age)", .{}, .{});
 
         var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
         var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
