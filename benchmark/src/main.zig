@@ -11,6 +11,9 @@ const NUM_RECORDS: usize = 100_000;
 const SEARCH_ITERATIONS: usize = 1000;
 const SEARCH_TARGET_NAME = std.fmt.comptimePrint("record_{}", .{NUM_RECORDS - 2});
 const SEARCH_TARGET_AGE: i32 = 42;
+const UPDATE_TARGET_AGE: i32 = 42;
+const UPDATE_TARGET_NAME = std.fmt.comptimePrint("record_{d:0>6}", .{UPDATE_TARGET_AGE});
+const BATCH_UPDATE_SIZE: i32 = 100; // docs updated per iteration
 
 // ─── Output Helper ───────────────────────────────────────────────────────────
 
@@ -309,6 +312,134 @@ fn benchAlbedoReadAll(allocator: std.mem.Allocator, bucket: *Bucket, samples: []
     }
 }
 
+fn benchAlbedoUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
+    // Pre-build two replacement docs with alternating email so each iteration
+    // writes a different value, preventing any short-circuit optimisation.
+    var doc_a = try bson.fmt.serialize(.{
+        .name = @as([]const u8, UPDATE_TARGET_NAME),
+        .age = UPDATE_TARGET_AGE,
+        .email = @as([]const u8, "updated_a@example.com"),
+        .active = true,
+    }, allocator);
+    defer doc_a.deinit(allocator);
+
+    var doc_b = try bson.fmt.serialize(.{
+        .name = @as([]const u8, UPDATE_TARGET_NAME),
+        .age = UPDATE_TARGET_AGE,
+        .email = @as([]const u8, "updated_b@example.com"),
+        .active = true,
+    }, allocator);
+    defer doc_b.deinit(allocator);
+
+    for (samples, 0..) |*sample, i| {
+        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+        defer arena_alloc.deinit();
+
+        const qdoc = try bson.fmt.serialize(.{
+            .query = .{ .age = UPDATE_TARGET_AGE },
+        }, arena_alloc.allocator());
+
+        const q = try Query.parse(arena_alloc.allocator(), qdoc);
+
+        var timer = try std.time.Timer.start();
+
+        var iter = try bucket.transformIterate(&arena_alloc, q);
+        defer iter.close() catch {};
+
+        const replacement = if (i % 2 == 0) &doc_a else &doc_b;
+        try iter.transform(replacement);
+
+        sample.* = timer.read();
+    }
+}
+
+fn benchSqliteUpdate(db: *sqlite.Db, samples: []u64) !void {
+    var stmt = try db.prepare("UPDATE docs SET email = ? WHERE age = ?");
+    defer stmt.deinit();
+
+    const emails = [2][]const u8{ "updated_a@example.com", "updated_b@example.com" };
+
+    for (samples, 0..) |*sample, i| {
+        var timer = try std.time.Timer.start();
+
+        try stmt.exec(.{}, .{ emails[i % 2], UPDATE_TARGET_AGE });
+        stmt.reset();
+
+        sample.* = timer.read();
+    }
+}
+
+fn benchAlbedoBatchUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
+    const emails = [2][]const u8{ "batch_a@example.com", "batch_b@example.com" };
+
+    for (samples, 0..) |*sample, i| {
+        // Cycle through non-overlapping batches of BATCH_UPDATE_SIZE docs by age range.
+        const batch_start: i32 = @intCast((i * @as(usize, @intCast(BATCH_UPDATE_SIZE))) % NUM_RECORDS);
+        const batch_end: i32 = batch_start + BATCH_UPDATE_SIZE;
+
+        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+        defer arena_alloc.deinit();
+
+        const qdoc = try bson.fmt.serialize(.{
+            .query = .{ .age = .{ .@"$gte" = batch_start, .@"$lt" = batch_end } },
+        }, arena_alloc.allocator());
+        const q = try Query.parse(arena_alloc.allocator(), qdoc);
+
+        var timer = try std.time.Timer.start();
+
+        var iter = try bucket.transformIterate(&arena_alloc, q);
+        defer iter.close() catch {};
+
+        const email = emails[i % 2];
+        while (true) {
+            // Read current doc's age to preserve it in the replacement.
+            const maybe_doc = try iter.data();
+            if (maybe_doc == null) break;
+            const orig = maybe_doc.?;
+
+            const age = orig.get("age").?.int32.value;
+
+            // Reconstruct name deterministically from age (avoids holding a
+            // slice into the iter's arena past the transform() arena-reset).
+            var name_buf: [16]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "record_{d:0>6}", .{@as(usize, @intCast(age))}) catch unreachable;
+
+            var replacement = try bson.fmt.serialize(.{
+                .name   = name,
+                .age    = age,
+                .email  = email,
+                .active = true,
+            }, arena_alloc.allocator());
+
+            iter.transform(&replacement) catch |err| {
+                if (err == error.IteratorDrained) break;
+                return err;
+            };
+        }
+
+        sample.* = timer.read();
+    }
+}
+
+fn benchSqliteBatchUpdate(db: *sqlite.Db, samples: []u64) !void {
+    var stmt = try db.prepare("UPDATE docs SET email = ? WHERE age >= ? AND age < ?");
+    defer stmt.deinit();
+
+    const emails = [2][]const u8{ "batch_a@example.com", "batch_b@example.com" };
+
+    for (samples, 0..) |*sample, i| {
+        const batch_start: i32 = @intCast((i * @as(usize, @intCast(BATCH_UPDATE_SIZE))) % NUM_RECORDS);
+        const batch_end: i32 = batch_start + BATCH_UPDATE_SIZE;
+
+        var timer = try std.time.Timer.start();
+
+        try stmt.exec(.{}, .{ emails[i % 2], batch_start, batch_end });
+        stmt.reset();
+
+        sample.* = timer.read();
+    }
+}
+
 fn benchSqliteReadAll(db: *sqlite.Db, samples: []u64) !void {
     var stmt = try db.prepare("SELECT id, age, active FROM docs LIMIT 1000");
     defer stmt.deinit();
@@ -337,6 +468,7 @@ pub fn main() !void {
     var bucket = try Bucket.openFileWithOptions(arena.allocator(), "file.bucket", .{
         .wal = true,
         .read_durability = .process,
+        .auto_vaccuum = false,
         .write_durability = .{
             .periodic = 2048,
         },
@@ -435,6 +567,39 @@ pub fn main() !void {
 
         printRow("Albedo index search", a_stats, C.cyan);
         printRow("SQLite index search", s_stats, C.blue);
+        printWinner(a_stats, s_stats);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 5. POINT UPDATE via index (age = UPDATE_TARGET_AGE)
+    // ══════════════════════════════════════════════════════════════════════
+    {
+        // age index is already present from benchmark 4
+        var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        try benchAlbedoUpdate(arena.allocator(), &bucket, &a_samples);
+        try benchSqliteUpdate(&db, &s_samples);
+        const a_stats = computeStats(&a_samples);
+        const s_stats = computeStats(&s_samples);
+
+        printRow("Albedo update (point)", a_stats, C.cyan);
+        printRow("SQLite update (point)", s_stats, C.blue);
+        printWinner(a_stats, s_stats);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 6. BATCH UPDATE — 100 docs per iteration via age range index
+    // ══════════════════════════════════════════════════════════════════════
+    {
+        var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
+        try benchAlbedoBatchUpdate(arena.allocator(), &bucket, &a_samples);
+        try benchSqliteBatchUpdate(&db, &s_samples);
+        const a_stats = computeStats(&a_samples);
+        const s_stats = computeStats(&s_samples);
+
+        printRow("Albedo batch upd 100", a_stats, C.cyan);
+        printRow("SQLite batch upd 100", s_stats, C.blue);
         printWinner(a_stats, s_stats);
     }
 
