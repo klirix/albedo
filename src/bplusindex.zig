@@ -498,7 +498,7 @@ pub const Index = struct {
             return self.internalEndOffset() > self.page.data.len - 20;
         }
 
-        fn splitLeaf(self: *Node) !SplitPayload {
+        fn splitLeaf(self: *Node, insert_value: ?BSONValue) !SplitPayload {
             const new_page = try self.index.bucket.createNewPage(.Index);
             new_page.data[0] = 1;
 
@@ -506,7 +506,19 @@ pub const Index = struct {
 
             const total = self.leafEntryCount();
             if (total == 0) return error.CorruptedNode;
-            const mid = @divFloor(total, 2);
+            
+            var mid = @divFloor(total, 2);
+            if (insert_value) |iv| {
+                const rightmost_entry = self.leafEntryAt(total - 1).?;
+                const leftmost_entry = self.leafEntryAt(0).?;
+                
+                if (self.index.compare(iv, rightmost_entry.value()) == .gt) {
+                    mid = total - 1;
+                } else if (self.index.compare(iv, leftmost_entry.value()) == .lt) {
+                    mid = 1;
+                }
+            }
+            
             const first_right = self.leafEntryAt(mid) orelse return error.CorruptedNode;
 
             const move_start = first_right.offset;
@@ -633,7 +645,7 @@ pub const Index = struct {
             const needed_space = Node.leafEntrySize(&value);
             const current_end = @as(usize, node.leafEndOffset());
             if (current_end + needed_space > node.page.data.len) {
-                var payload = try node.splitLeaf();
+                var payload = try node.splitLeaf(value);
                 const separator = payload.value();
                 if (self.compare(separator, value) == .gt) {
                     try node.leafInsert(value, loc);
@@ -648,7 +660,7 @@ pub const Index = struct {
 
             try node.leafInsert(value, loc);
             if (node.leafNeedsSplit()) {
-                return try node.splitLeaf();
+                return try node.splitLeaf(value);
             } else {
                 try self.bucket.writePage(node.page);
                 return null;

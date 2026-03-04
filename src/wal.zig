@@ -343,7 +343,7 @@ pub const WAL = struct {
                     self.nodePtr(current).forward[lvl];
                 while (fwd != SENTINEL) {
                     const n = self.nodePtr(fwd);
-                    if (keyLessThan(n.page_id, n.tx_timestamp, page_id, tx_timestamp)) {
+                    if (keyLessOrEqual(n.page_id, n.tx_timestamp, page_id, tx_timestamp)) {
                         current = fwd;
                         fwd = n.forward[lvl];
                     } else break;

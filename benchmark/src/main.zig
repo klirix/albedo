@@ -341,8 +341,8 @@ pub fn main() !void {
             .periodic = 2048,
         },
     });
-    defer bucket.deinit();
     defer std.fs.cwd().deleteFile("file.bucket") catch {};
+    defer bucket.deinit();
 
     // try bucket.dropIndex("_id");
 
@@ -352,8 +352,8 @@ pub fn main() !void {
         .open_flags = .{ .write = true, .create = true },
         .threading_mode = .Serialized,
     });
-    defer db.deinit();
     defer std.fs.cwd().deleteFile("file.sqlite") catch {};
+    defer db.deinit();
 
     // No WAL — use rollback journal like Albedo's direct-write model.
     _ = try db.pragma(void, .{}, "journal_mode", "WAL");
@@ -363,7 +363,7 @@ pub fn main() !void {
         .{},
         .{},
     );
-    try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_id ON docs(id)", .{}, .{});
+    // try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_id ON docs(id)", .{}, .{});
 
     // ── Print header ─────────────────────────────────────────────────────
     print("\n  {s}{s}◆  ALBEDO vs SQLITE  ◆{s}", .{ C.bold, C.cyan, C.reset });
@@ -388,21 +388,21 @@ pub fn main() !void {
         printWinner(a_stats, s_stats);
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 2. COLUMN SCAN (no index)
-    // ══════════════════════════════════════════════════════════════════════
-    {
-        var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
-        var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
-        try benchAlbedoScan(arena.allocator(), &bucket, &a_samples);
-        try benchSqliteScan(&db, &s_samples);
-        const a_stats = computeStats(&a_samples);
-        const s_stats = computeStats(&s_samples);
+    // // ══════════════════════════════════════════════════════════════════════
+    // // 2. COLUMN SCAN (no index)
+    // // ══════════════════════════════════════════════════════════════════════
+    // {
+    //     var a_samples: [SEARCH_ITERATIONS]u64 = undefined;
+    //     var s_samples: [SEARCH_ITERATIONS]u64 = undefined;
+    //     try benchAlbedoScan(arena.allocator(), &bucket, &a_samples);
+    //     try benchSqliteScan(&db, &s_samples);
+    //     const a_stats = computeStats(&a_samples);
+    //     const s_stats = computeStats(&s_samples);
 
-        printRow("Albedo scan", a_stats, C.cyan);
-        printRow("SQLite scan", s_stats, C.blue);
-        printWinner(a_stats, s_stats);
-    }
+    //     printRow("Albedo scan", a_stats, C.cyan);
+    //     printRow("SQLite scan", s_stats, C.blue);
+    //     printWinner(a_stats, s_stats);
+    // }
 
     // ══════════════════════════════════════════════════════════════════════
     // 3. READ 1000 DOCUMENTS
