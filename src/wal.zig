@@ -114,7 +114,7 @@ pub const WAL = struct {
 
     pub const MAX_LEVEL: u8 = 12;
     const SENTINEL: u32 = 0xFFFF_FFFF;
-    const DEFAULT_INDEX_CAPACITY: u32 = 4096;
+    const DEFAULT_INDEX_CAPACITY: u32 = 65536;
 
     // ── Shared-memory layout types ────────────────────────────────────
 
@@ -672,6 +672,9 @@ pub const WAL = struct {
 
         const fh = FrameHeader.fromBytes(buf[0..FrameHeader.byte_size]);
         const data = buf[FrameHeader.byte_size..];
+
+        // Verify the frame actually belongs to the requested page.
+        if (fh.page_id != page_id) return Error.WalCorrupted;
 
         const expected = std.hash.XxHash3.hash(self.header.salt, data);
         if (fh.checksum != expected) return Error.WalCorrupted;

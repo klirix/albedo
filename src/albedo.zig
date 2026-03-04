@@ -359,6 +359,8 @@ pub const Bucket = struct {
     replication_callback: PageChangeCallback = null,
     replication_context: ?*anyopaque = null,
     dirty_pages: std.AutoHashMap(u64, void),
+    wal_pending_pages: std.AutoHashMap(u64, void),
+    wal_header_pending: bool = false,
     replication_retry_count: u32 = 0,
     max_replication_retries: u32 = 3,
     cached_last_data_page: ?*Page = null,
@@ -596,6 +598,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .write_durability = options.write_durability,
             .read_durability = options.read_durability,
             .wal = if (comptime is_posix) null else {},
@@ -606,6 +609,8 @@ pub const Bucket = struct {
         bucket.ensureIndex("_id", .{ .unique = 1 }) catch return BucketInitErrors.InitializationError;
 
         bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
+
+        bucket.commitWalTransaction();
 
         // Sync the baseline to disk before activating the WAL.
         if (bucket.file) |*f| f.sync() catch {};
@@ -633,6 +638,7 @@ pub const Bucket = struct {
             .objectIdGenerator = generator,
             .in_memory = true,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .read_durability = options.read_durability,
         };
 
@@ -696,6 +702,7 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .dirty_pages = std.AutoHashMap(u64, void).init(ally),
+            .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .write_durability = options.write_durability,
             .read_durability = options.read_durability,
             .wal = wal_instance,
@@ -734,9 +741,22 @@ pub const Bucket = struct {
     /// that were committed to the WAL but not yet checkpointed.
     fn loadHeaderFromWal(self: *Bucket) void {
         if (comptime !is_posix) return;
+        // Never call during an in-flight transaction: the pending header has a
+        // higher page_count than whatever is in the WAL, so reading it would
+        // silently decrease header.page_count and cause createNewPage to
+        // re-use an already-allocated page_id.
+        if (self.wal_header_pending) return;
+        if (self.wal_pending_pages.count() > 0) return;
         const w = &(self.wal orelse return);
         const data = w.page_data(WAL.HEADER_PAGE_ID, std.math.maxInt(i64)) catch return;
-        self.header = BucketHeader.read(data[0..BucketHeader.byteSize]);
+        const wal_header = BucketHeader.read(data[0..BucketHeader.byteSize]);
+        // Monotonically advance page_count — never let a stale WAL frame shrink it.
+        if (wal_header.page_count > self.header.page_count) {
+            self.header.page_count = wal_header.page_count;
+        }
+        if (wal_header.doc_count > self.header.doc_count) {
+            self.header.doc_count = wal_header.doc_count;
+        }
     }
 
     /// Apply every WAL frame to the main database file.  Called during
@@ -783,23 +803,11 @@ pub const Bucket = struct {
             return;
         }
 
-        const bytes = self.header.toBytes();
-
-        // In WAL mode, persist the header only in the WAL.
-        // The main file is updated at checkpoint time.
-        if (comptime is_posix) {
-            if (self.wal) |*w| {
-                var header_page: [DEFAULT_PAGE_SIZE]u8 = [_]u8{0} ** DEFAULT_PAGE_SIZE;
-                @memcpy(header_page[0..BucketHeader.byteSize], bytes[0..BucketHeader.byteSize]);
-                const tx_ts = walTimestamp();
-                w.appendPage(WAL.HEADER_PAGE_ID, &header_page, tx_ts) catch {};
-                return;
-            }
-        }
-
-        // No WAL: write directly to the main DB file.
-        const file = if (self.file) |*f| f else return error.StorageUnavailable;
-        try file.pwriteAll(bytes[0..], 0);
+        // Always defer: commitWalTransaction() will write the final header
+        // to either the WAL or the main DB file once per logical transaction.
+        // This prevents multiple costly small writes to file offset 0 during
+        // B+ tree splits and index builds.
+        self.wal_header_pending = true;
     }
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
@@ -873,6 +881,9 @@ pub const Bucket = struct {
 
         try self.recordIndexes();
 
+        // Commit all the B+ tree page writes accumulated during index build to WAL.
+        self.commitWalTransaction();
+
         final_index_owner = false;
         key_owner = false;
         inserted_into_map = false;
@@ -899,6 +910,8 @@ pub const Bucket = struct {
         switch (self.read_durability) {
             .process => {
                 // Fast path: cache hit → done.
+                // Pending pages are always in cache (they were modified in-memory
+                // and commitWalTransaction hasn't run yet), so cache is authoritative.
                 if (self.pageCache.get(page_id)) |page| {
                     return page;
                 }
@@ -915,6 +928,16 @@ pub const Bucket = struct {
                 }
             },
             .shared => {
+                // If this page has pending (uncommitted-to-WAL) writes, the
+                // in-memory page cache holds the authoritative state.  Fetching
+                // from the WAL here would return an older committed version and
+                // overwrite the pending in-memory modifications.
+                if (self.wal_pending_pages.contains(page_id)) {
+                    if (self.pageCache.get(page_id)) |page| {
+                        return page;
+                    }
+                }
+
                 // Always consult the WAL first for cross-process visibility.
                 if (comptime is_posix) {
                     if (self.wal) |*w| {
@@ -1016,70 +1039,158 @@ pub const Bucket = struct {
         // untouched until checkpoint. Other processes read new pages from
         // the WAL via the shared-memory index (MVCC).
         if (comptime is_posix) {
-            if (self.wal) |*w| {
-                const tx_ts = walTimestamp();
-                w.appendPage(page.header.page_id, &buf, tx_ts) catch |err| switch (err) {
-                    error.WalIndexFailed => {
-                        // SHM index is full — checkpoint to free space and retry.
-                        self.checkpointWal();
-                        w.checkpoint() catch {};
-                        w.appendPage(page.header.page_id, &buf, tx_ts) catch {
-                            return error.StorageUnavailable;
-                        };
-                    },
-                    else => return error.StorageUnavailable,
-                };
+            if (self.wal) |_| {
+                // Defer the WAL append to commitWalTransaction() so that each
+                // unique page is written to the WAL only once per logical
+                // transaction, regardless of how many times the B+ tree
+                // modified it during a single insert/delete call.
+                // This mirrors SQLite behaviour: only the final committed page
+                // state reaches the WAL, not every intermediate B+ tree write.
+                try self.wal_pending_pages.put(page.header.page_id, {});
 
                 // Track dirty page for replication.
                 if (self.replication_callback != null) {
                     try self.dirty_pages.put(page.header.page_id, {});
                 }
-
-                // Honour the write_durability setting for WAL writes.
-                switch (self.write_durability) {
-                    .all => {
-                        w.sync() catch {};
-                        self.notifyDirtyPages() catch {};
-                    },
-                    .periodic => |threshold| {
-                        self.writes_since_sync += 1;
-                        if (self.writes_since_sync >= threshold) {
-                            w.sync() catch {};
-                            self.writes_since_sync = 0;
-                            self.notifyDirtyPages() catch {};
-                        }
-                    },
-                    .manual => {},
-                }
                 return;
             }
         }
 
-        // Fallback: no WAL — write directly to the main DB file.
-        const file = if (self.file) |*f| f else return error.StorageUnavailable;
-        const offset = BucketHeader.byteSize + (page.header.page_id * DEFAULT_PAGE_SIZE);
-        try file.pwriteAll(buf[0..DEFAULT_PAGE_SIZE], offset);
-
-        if (self.replication_callback != null) {
-            try self.dirty_pages.put(page.header.page_id, {});
+        // Non-WAL mode: also defer to commitWalTransaction() (direct-file path)
+        // so the same page is written to disk only once per logical transaction
+        // regardless of how many intermediate B+ tree modifications touched it.
+        if (!self.in_memory) {
+            try self.wal_pending_pages.put(page.header.page_id, {});
+            if (self.replication_callback != null) {
+                try self.dirty_pages.put(page.header.page_id, {});
+            }
+            return;
         }
+    }
 
-        // Honour the write_durability setting for direct-file writes.
+    /// Called once per logical write transaction (insert / delete / buildIndex).
+    /// Increments the write counter and fsyncs when the periodic threshold is reached.
+    /// This avoids counting every B+ tree node write separately, which would cause
+    /// fsync to fire ~5x more often than intended when an index is present.
+    fn maybeSyncPeriodic(self: *Bucket) void {
         switch (self.write_durability) {
-            .all => {
-                try file.sync();
-                self.notifyDirtyPages() catch {};
-            },
             .periodic => |threshold| {
                 self.writes_since_sync += 1;
                 if (self.writes_since_sync >= threshold) {
-                    try file.sync();
                     self.writes_since_sync = 0;
-                    self.notifyDirtyPages() catch {};
+                    if (comptime is_posix) {
+                        if (self.wal) |*w| {
+                            w.sync() catch {};
+                            self.notifyDirtyPages() catch {};
+                            return;
+                        }
+                    }
+                    if (self.file) |*f| {
+                        f.sync() catch {};
+                        self.notifyDirtyPages() catch {};
+                    }
                 }
             },
-            .manual => {},
+            else => {},
         }
+    }
+
+    /// Flush all pages dirtied during the current write transaction to the WAL,
+    /// then optionally fsync.  Call this once at the end of insert() / delete() /
+    /// buildIndex() instead of appending individual WAL frames inside writePage().
+    ///
+    /// Key invariant: the in-memory page cache already holds the final page state,
+    /// so we just read each pending page_id from the cache and append it once.
+    /// If a page was written multiple times (e.g., same B+ tree leaf touched on
+    /// insert + split), only the most recent state is serialised — exactly the
+    /// same as SQLite's per-transaction WAL write model.
+    fn commitWalTransaction(self: *Bucket) void {
+        if (self.in_memory) {
+            self.wal_pending_pages.clearRetainingCapacity();
+            self.wal_header_pending = false;
+            return;
+        }
+
+        if (comptime is_posix) {
+            if (self.wal) |*w| {
+                const tx_ts = walTimestamp();
+
+                var it = self.wal_pending_pages.keyIterator();
+                while (it.next()) |page_id_ptr| {
+                    const page_id = page_id_ptr.*;
+                    const page = self.pageCache.get(page_id) orelse continue;
+
+                    var buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
+                    const hdr_bytes = PageHeader.write(&page.header);
+                    @memcpy(buf[0..PageHeader.byteSize], hdr_bytes[0..]);
+                    @memcpy(buf[PageHeader.byteSize..], page.data);
+
+                    w.appendPage(page_id, &buf, tx_ts) catch |err| {
+                        if (err == error.WalIndexFailed) {
+                            self.checkpointWal();
+                            w.checkpoint() catch {};
+                            w.appendPage(page_id, &buf, tx_ts) catch {};
+                        }
+                    };
+                }
+                self.wal_pending_pages.clearRetainingCapacity();
+
+                if (self.wal_header_pending) {
+                    var header_page: [DEFAULT_PAGE_SIZE]u8 = [_]u8{0} ** DEFAULT_PAGE_SIZE;
+                    const bytes = self.header.toBytes();
+                    @memcpy(header_page[0..BucketHeader.byteSize], &bytes);
+                    w.appendPage(WAL.HEADER_PAGE_ID, &header_page, tx_ts) catch {};
+                    self.wal_header_pending = false;
+                }
+
+                if (self.write_durability == .all) {
+                    w.sync() catch {};
+                    self.notifyDirtyPages() catch {};
+                    return;
+                }
+                self.maybeSyncPeriodic();
+                return;
+            }
+        }
+
+        // No-WAL path: pwrite each unique dirty page directly to the DB file.
+        const file = if (self.file) |*f| f else {
+            self.wal_pending_pages.clearRetainingCapacity();
+            self.wal_header_pending = false;
+            return;
+        };
+
+        var it = self.wal_pending_pages.keyIterator();
+        while (it.next()) |page_id_ptr| {
+            const page_id = page_id_ptr.*;
+            const page = self.pageCache.get(page_id) orelse continue;
+
+            var buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
+            const hdr_bytes = PageHeader.write(&page.header);
+            @memcpy(buf[0..PageHeader.byteSize], hdr_bytes[0..]);
+            @memcpy(buf[PageHeader.byteSize..], page.data);
+
+            const offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
+            file.pwriteAll(buf[0..], offset) catch {};
+        }
+        self.wal_pending_pages.clearRetainingCapacity();
+
+        if (self.wal_header_pending) {
+            const bytes = self.header.toBytes();
+            file.pwriteAll(bytes[0..], 0) catch {};
+            self.wal_header_pending = false;
+        }
+
+        if (self.replication_callback != null) {
+            self.notifyDirtyPages() catch {};
+        }
+
+        if (self.write_durability == .all) {
+            file.sync() catch {};
+            self.notifyDirtyPages() catch {};
+            return;
+        }
+        self.maybeSyncPeriodic();
     }
 
     /// Notify replication callback of dirty pages and clear the list
@@ -1154,6 +1265,9 @@ pub const Bucket = struct {
         if (self.in_memory) {
             return;
         }
+
+        // Commit any pending WAL transaction (e.g. from a partial write) before syncing.
+        self.commitWalTransaction();
 
         // Sync the WAL (if active) so all appended frames are durable.
         if (comptime is_posix) {
@@ -1539,6 +1653,11 @@ pub const Bucket = struct {
 
         self.header.doc_count += 1;
         try self.flushHeader();
+
+        // Commit WAL transaction: flush each unique dirty page to WAL once and
+        // optionally fsync. This is the correct place to do it — all in-memory
+        // B+ tree modifications are complete and the page cache holds final state.
+        self.commitWalTransaction();
 
         // After writing is done, free the page resources
         return result;
@@ -3104,10 +3223,7 @@ pub const Bucket = struct {
             header.is_deleted = 1;
             const header_bytes = std.mem.toBytes(header);
             @memcpy(page.data[header_offset .. header_offset + header_bytes.len], &header_bytes);
-            self.bucket.writePage(page) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.ScanError,
-            };
+            self.bucket.writePage(page) catch return error.OutOfMemory;
 
             for (planned_index_deletes.items) |plan| {
                 self.bucket.bindIndex(plan.index);
@@ -3422,6 +3538,9 @@ pub const Bucket = struct {
         self.header.deleted_count += locations.items.len;
         try self.flushHeader();
 
+        // Commit WAL transaction once per delete call.
+        self.commitWalTransaction();
+
         if (!self.in_memory and self.header.deleted_count > self.header.doc_count and self.autoVaccuum) {
             // If all documents are deleted, reset the deleted count
             try self.vacuum();
@@ -3517,6 +3636,8 @@ pub const Bucket = struct {
         self.indexes = .init(self.allocator);
         // Reinitialize dirty_pages for replication tracking
         self.dirty_pages = .init(self.allocator);
+        self.wal_pending_pages = .init(self.allocator);
+        self.wal_header_pending = false;
         const meta = try self.loadPage(0);
         try self.loadIndices(meta);
     }
@@ -3556,6 +3677,7 @@ pub const Bucket = struct {
         // Free dirty pages list (only if it has been allocated)
         // Cleanup dirty pages set
         self.dirty_pages.deinit();
+        self.wal_pending_pages.deinit();
 
         // Free path
         self.allocator.free(self.path);
