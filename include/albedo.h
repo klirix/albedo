@@ -32,6 +32,7 @@ typedef uint8_t (*albedo_page_change_callback)(
     uint32_t page_count);
 
 albedo_result albedo_open(char *path, albedo_bucket **out);
+albedo_result albedo_open_with_options(char *path, uint8_t *options_buffer, albedo_bucket **out);
 albedo_result albedo_close(albedo_bucket *bucket);
 
 albedo_result albedo_insert(albedo_bucket *bucket, uint8_t *doc_buffer);
