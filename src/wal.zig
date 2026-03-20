@@ -4,6 +4,49 @@ const builtin = @import("builtin");
 /// Must match `DEFAULT_PAGE_SIZE` in albedo.zig.
 pub const DEFAULT_PAGE_SIZE: u16 = 8192;
 
+/// Native file-descriptor / handle type, selected at compile time:
+///   - POSIX (Linux / macOS): `std.posix.fd_t`  (i32)
+///   - Windows:               `std.os.windows.HANDLE`
+const NativeFd = std.fs.File.Handle;
+
+/// OS handles stored by WalIndex for the mmap'd SHM file.
+/// On POSIX only the fd is required; on Windows a separate mapping
+/// handle created by CreateFileMappingW must also be kept alive.
+const WalIndexHandles = if (builtin.os.tag == .windows) struct {
+    file: NativeFd,
+    mapping: std.os.windows.HANDLE,
+} else NativeFd;
+
+/// Windows-only shims for file-backed virtual memory.
+/// The entire namespace is compiled away on non-Windows targets.
+const win_mmap = if (builtin.os.tag == .windows) struct {
+    const w = std.os.windows;
+
+    pub const PAGE_READWRITE: w.DWORD = 0x04;
+    pub const FILE_MAP_ALL_ACCESS: w.DWORD = 0x000F_001F;
+
+    pub extern "kernel32" fn CreateFileMappingW(
+        hFile: w.HANDLE,
+        lpFileMappingAttributes: ?*anyopaque,
+        flProtect: w.DWORD,
+        dwMaximumSizeHigh: w.DWORD,
+        dwMaximumSizeLow: w.DWORD,
+        lpName: ?[*:0]const u16,
+    ) callconv(.winapi) ?w.HANDLE;
+
+    pub extern "kernel32" fn MapViewOfFile(
+        hFileMappingObject: w.HANDLE,
+        dwDesiredAccess: w.DWORD,
+        dwFileOffsetHigh: w.DWORD,
+        dwFileOffsetLow: w.DWORD,
+        dwNumberOfBytesToMap: w.SIZE_T,
+    ) callconv(.winapi) ?*anyopaque;
+
+    pub extern "kernel32" fn UnmapViewOfFile(
+        lpBaseAddress: *const anyopaque,
+    ) callconv(.winapi) w.BOOL;
+} else struct {};
+
 /// Write-Ahead Log for crash recovery and MVCC snapshot reads.
 ///
 /// Before any page is written to the main database file the full page image
@@ -18,7 +61,7 @@ pub const DEFAULT_PAGE_SIZE: u16 = 8192;
 /// contains a spinlock-protected skip list that maps (page_id, tx_timestamp)
 /// to WAL file offsets. This enables MVCC-style lookups via `page_data()`.
 ///
-/// Only POSIX (Linux / macOS) is supported.
+/// Supported on POSIX (Linux / macOS) and Windows.
 pub const WAL = struct {
 
     // ── WAL Header (40 bytes) ─────────────────────────────────────────
@@ -162,7 +205,7 @@ pub const WAL = struct {
     // ── WalIndex (mmap'd shared-memory skip list) ─────────────────────
 
     pub const WalIndex = struct {
-        fd: std.posix.fd_t,
+        fd: WalIndexHandles,
         map: [*]align(std.heap.page_size_min) u8,
         map_len: usize,
         path: []const u8,
@@ -172,27 +215,66 @@ pub const WAL = struct {
             const stored_path = allocator.dupe(u8, path) catch return Error.WalIndexFailed;
             errdefer allocator.free(stored_path);
 
-            const fd = openPosix(path, .{
-                .ACCMODE = .RDWR,
-                .CREAT = true,
-            }) catch return Error.WalIndexFailed;
-            errdefer std.posix.close(fd);
-
             const desired = ShmHeader.byte_size + @as(usize, capacity) * ShmNode.byte_size;
             const map_len = std.mem.alignForward(usize, desired, std.heap.page_size_min);
 
-            // Ensure the file is at least the required size.
-            std.posix.ftruncate(fd, @intCast(map_len)) catch return Error.WalIndexFailed;
+            // ── Open the SHM file and map it into memory ──────────────────────
 
-            const map_slice = std.posix.mmap(
-                null,
-                map_len,
-                std.posix.PROT.READ | std.posix.PROT.WRITE,
-                .{ .TYPE = .SHARED },
-                fd,
-                0,
-            ) catch return Error.WalIndexFailed;
-            const map: [*]align(std.heap.page_size_min) u8 = map_slice.ptr;
+            const fd: WalIndexHandles = if (builtin.os.tag == .windows) blk: {
+                // Open (or create) the SHM file for read + write.
+                const file_handle = openShmFd(path) catch return Error.WalIndexFailed;
+                errdefer closeFd(file_handle);
+
+                // Ensure the file is at least map_len bytes.
+                ftruncateFile(file_handle, map_len) catch return Error.WalIndexFailed;
+
+                // Create a named-less file-mapping object backed by the file.
+                const high: std.os.windows.DWORD = @truncate(map_len >> 32);
+                const low: std.os.windows.DWORD = @truncate(map_len);
+                const mapping = win_mmap.CreateFileMappingW(
+                    file_handle,
+                    null,
+                    win_mmap.PAGE_READWRITE,
+                    high,
+                    low,
+                    null,
+                ) orelse return Error.WalIndexFailed;
+                errdefer std.os.windows.CloseHandle(mapping);
+
+                break :blk .{ .file = file_handle, .mapping = mapping };
+            } else blk: {
+                // POSIX: open for read+write, create if absent.
+                const raw_fd = openShmFd(path) catch return Error.WalIndexFailed;
+                errdefer std.posix.close(raw_fd);
+
+                // Ensure the file is at least the required size.
+                std.posix.ftruncate(raw_fd, @intCast(map_len)) catch return Error.WalIndexFailed;
+
+                break :blk raw_fd;
+            };
+
+            // ── Map the file into the process address space ────────────────────
+
+            const map: [*]align(std.heap.page_size_min) u8 = if (builtin.os.tag == .windows) blk: {
+                const ptr = win_mmap.MapViewOfFile(
+                    fd.mapping,
+                    win_mmap.FILE_MAP_ALL_ACCESS,
+                    0,
+                    0,
+                    map_len,
+                ) orelse return Error.WalIndexFailed;
+                break :blk @ptrCast(@alignCast(ptr));
+            } else blk: {
+                const map_slice = std.posix.mmap(
+                    null,
+                    map_len,
+                    std.posix.PROT.READ | std.posix.PROT.WRITE,
+                    .{ .TYPE = .SHARED },
+                    fd,
+                    0,
+                ) catch return Error.WalIndexFailed;
+                break :blk map_slice.ptr;
+            };
 
             var idx = WalIndex{
                 .fd = fd,
@@ -228,9 +310,15 @@ pub const WAL = struct {
 
         pub fn deinit(self: *WalIndex) void {
             self.disconnect();
-            const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
-            std.posix.munmap(slice);
-            std.posix.close(self.fd);
+            if (builtin.os.tag == .windows) {
+                _ = win_mmap.UnmapViewOfFile(@ptrCast(self.map));
+                std.os.windows.CloseHandle(self.fd.mapping);
+                closeFd(self.fd.file);
+            } else {
+                const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
+                std.posix.munmap(slice);
+                std.posix.close(self.fd);
+            }
             self.allocator.free(self.path);
         }
 
@@ -256,10 +344,16 @@ pub const WAL = struct {
             const path_copy = self.path;
             const ally = self.allocator;
 
-            // Unmap and close the fd first.
-            const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
-            std.posix.munmap(slice);
-            std.posix.close(self.fd);
+            // Unmap and close the fd(s) first.
+            if (builtin.os.tag == .windows) {
+                _ = win_mmap.UnmapViewOfFile(@ptrCast(self.map));
+                std.os.windows.CloseHandle(self.fd.mapping);
+                closeFd(self.fd.file);
+            } else {
+                const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
+                std.posix.munmap(slice);
+                std.posix.close(self.fd);
+            }
 
             if (remaining == 0) {
                 std.fs.cwd().deleteFile(path_copy) catch {};
@@ -439,8 +533,8 @@ pub const WAL = struct {
 
     // ── WAL state ─────────────────────────────────────────────────────
 
-    write_fd: std.posix.fd_t,
-    read_fd: std.posix.fd_t,
+    write_fd: NativeFd,
+    read_fd: NativeFd,
     header: Header,
     /// Next sequence number to assign.
     next_seq: u64,
@@ -457,24 +551,18 @@ pub const WAL = struct {
 
     /// Open (or create) a WAL file at `path`.
     /// An accompanying `<path>-shm` file is created for the mmap'd page index.
-    /// Only supported on POSIX targets.
+    /// Supported on POSIX (Linux / macOS) and Windows.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) Error!WAL {
         const stored_path = allocator.dupe(u8, path) catch return Error.WalOpenFailed;
         errdefer allocator.free(stored_path);
 
-        // Open the write fd as append-only (O_WRONLY | O_CREAT | O_APPEND).
-        const write_fd = openPosix(path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .APPEND = true,
-        }) catch return Error.WalOpenFailed;
-        errdefer std.posix.close(write_fd);
+        // Open the write fd for append-only writes; create if absent.
+        const write_fd = openWriteFd(path) catch return Error.WalOpenFailed;
+        errdefer closeFd(write_fd);
 
         // Open a separate read-only fd.
-        const read_fd = openPosix(path, .{
-            .ACCMODE = .RDONLY,
-        }) catch return Error.WalOpenFailed;
-        errdefer std.posix.close(read_fd);
+        const read_fd = openReadFd(path) catch return Error.WalOpenFailed;
+        errdefer closeFd(read_fd);
 
         // Try to read an existing header; if the file is empty, write a fresh one.
         var wal_header: Header = .{};
@@ -533,8 +621,8 @@ pub const WAL = struct {
 
     pub fn deinit(self: *WAL) void {
         self.index.deinit();
-        std.posix.close(self.write_fd);
-        std.posix.close(self.read_fd);
+        closeFd(self.write_fd);
+        closeFd(self.read_fd);
         self.allocator.free(self.path);
     }
 
@@ -561,8 +649,8 @@ pub const WAL = struct {
         const last_connection = self.index.deleteFile();
 
         // 4. Close WAL file descriptors.
-        std.posix.close(self.write_fd);
-        std.posix.close(self.read_fd);
+        closeFd(self.write_fd);
+        closeFd(self.read_fd);
 
         // 5. Only delete the WAL file if no other connections remain.
         if (last_connection) {
@@ -691,7 +779,7 @@ pub const WAL = struct {
     /// main database file.
     pub fn checkpoint(self: *WAL) Error!void {
         // Truncate the file to header-only.
-        std.posix.ftruncate(self.write_fd, Header.byte_size) catch return Error.WalWriteFailed;
+        ftruncateFile(self.write_fd, Header.byte_size) catch return Error.WalWriteFailed;
 
         self.header.frame_count = 0;
         self.next_seq = 1;
@@ -727,63 +815,94 @@ pub const WAL = struct {
 
     fn writeHeader(self: *WAL) Error!void {
         // The write fd is append-only, so we open a transient fd without
-        // O_APPEND to pwrite the header at offset 0.
-        const fd = openPosix(self.path, .{
-            .ACCMODE = .WRONLY,
-        }) catch return Error.WalWriteFailed;
-        defer std.posix.close(fd);
+        // append semantics to pwrite the header at offset 0.
+        const fd = openRwFd(self.path) catch return Error.WalWriteFailed;
+        defer closeFd(fd);
 
         const hdr_bytes = self.header.toBytes();
         pwriteAll(fd, &hdr_bytes, 0) catch return Error.WalWriteFailed;
         fsync(fd) catch return Error.WalSyncFailed;
     }
 
-    // ── POSIX thin wrappers ───────────────────────────────────────────
+    // ── Cross-platform file helpers ───────────────────────────────────
 
-    fn isPosix() bool {
-        const os = builtin.os.tag;
-        return os == .linux or os == .macos;
-    }
-
-    fn openPosix(path: []const u8, flags: std.posix.O) !std.posix.fd_t {
-        const path_z = std.posix.toPosixPath(path) catch return error.NameTooLong;
-        return std.posix.openZ(&path_z, flags, 0o644) catch return error.OpenFailed;
-    }
-
-    fn preadAll(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
-        var total: usize = 0;
-        while (total < buf.len) {
-            const n = std.posix.pread(fd, buf[total..], offset + total) catch return error.ReadFailed;
-            if (n == 0) return error.ReadFailed; // EOF
-            total += n;
+    /// Open or create a file for append-only sequential writes.
+    /// On POSIX the O_APPEND flag delegates positioning to the kernel;
+    /// on Windows the file is opened for writing and each `writeAll` call
+    /// seeks to the end before writing (single-writer WAL, so this is safe).
+    fn openWriteFd(path: []const u8) !NativeFd {
+        if (builtin.os.tag == .windows) {
+            // createFile with truncate=false: opens existing or creates new,
+            // positioned at the beginning. writeAll will seek to end each time.
+            const f = std.fs.cwd().createFile(path, .{ .truncate = false }) catch return error.OpenFailed;
+            return f.handle;
+        } else {
+            const path_z = std.posix.toPosixPath(path) catch return error.NameTooLong;
+            return std.posix.openZ(&path_z, .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .APPEND = true,
+            }, 0o644) catch return error.OpenFailed;
         }
     }
 
-    fn pwriteAll(fd: std.posix.fd_t, buf: []const u8, offset: u64) !void {
-        var total: usize = 0;
-        while (total < buf.len) {
-            const n = std.posix.pwrite(fd, buf[total..], offset + total) catch return error.WriteFailed;
-            if (n == 0) return error.WriteFailed;
-            total += n;
+    /// Open an existing file read-only.
+    fn openReadFd(path: []const u8) !NativeFd {
+        const f = std.fs.cwd().openFile(path, .{}) catch return error.OpenFailed;
+        return f.handle;
+    }
+
+    /// Open an existing file for random reads and writes (no append, no create).
+    /// Used to pwrite the WAL header at offset 0.
+    fn openRwFd(path: []const u8) !NativeFd {
+        const f = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch return error.OpenFailed;
+        return f.handle;
+    }
+
+    /// Open (or create) a file for read + write without truncation.
+    /// Used for the SHM index file.
+    fn openShmFd(path: []const u8) !NativeFd {
+        const f = std.fs.cwd().createFile(path, .{
+            .read = true,
+            .truncate = false,
+        }) catch return error.OpenFailed;
+        return f.handle;
+    }
+
+    fn closeFd(fd: NativeFd) void {
+        (std.fs.File{ .handle = fd }).close();
+    }
+
+    fn preadAll(fd: NativeFd, buf: []u8, offset: u64) !void {
+        const n = (std.fs.File{ .handle = fd }).preadAll(buf, offset) catch return error.ReadFailed;
+        if (n != buf.len) return error.ReadFailed; // unexpected EOF
+    }
+
+    fn pwriteAll(fd: NativeFd, buf: []const u8, offset: u64) !void {
+        (std.fs.File{ .handle = fd }).pwriteAll(buf, offset) catch return error.WriteFailed;
+    }
+
+    /// Append `buf` to the file.  On POSIX the fd is O_APPEND so the
+    /// kernel handles positioning atomically.  On Windows we seek to the
+    /// end first (the WAL is single-writer so no race exists).
+    fn writeAll(fd: NativeFd, buf: []const u8) !void {
+        const file = std.fs.File{ .handle = fd };
+        if (builtin.os.tag == .windows) {
+            file.seekFromEnd(0) catch return error.WriteFailed;
         }
+        file.writeAll(buf) catch return error.WriteFailed;
     }
 
-    fn writeAll(fd: std.posix.fd_t, buf: []const u8) !void {
-        var total: usize = 0;
-        while (total < buf.len) {
-            const n = std.posix.write(fd, buf[total..]) catch return error.WriteFailed;
-            if (n == 0) return error.WriteFailed;
-            total += n;
-        }
+    fn fsync(fd: NativeFd) !void {
+        (std.fs.File{ .handle = fd }).sync() catch return error.SyncFailed;
     }
 
-    fn fsync(fd: std.posix.fd_t) !void {
-        std.posix.fsync(fd) catch return error.SyncFailed;
+    fn fileSize(fd: NativeFd) !u64 {
+        return (std.fs.File{ .handle = fd }).getEndPos() catch return error.StatFailed;
     }
 
-    fn fileSize(fd: std.posix.fd_t) !u64 {
-        const stat = std.posix.fstat(fd) catch return error.StatFailed;
-        return @intCast(stat.size);
+    fn ftruncateFile(fd: NativeFd, size: u64) !void {
+        (std.fs.File{ .handle = fd }).setEndPos(size) catch return error.WriteFailed;
     }
 };
 
@@ -933,8 +1052,8 @@ test "WAL SHM struct sizes" {
 
 test "WAL open, append, iterate, checkpoint" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal.wal";
-    const shm_path = "/tmp/albedo_test_wal.wal-shm";
+    const path = "albedo_test_wal.wal";
+    const shm_path = "albedo_test_wal.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -990,8 +1109,8 @@ test "WAL open, append, iterate, checkpoint" {
 
 test "WAL corrupted magic is rejected on open" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_corrupt_magic.wal";
-    const shm_path = "/tmp/albedo_test_wal_corrupt_magic.wal-shm";
+    const path = "albedo_test_wal_corrupt_magic.wal";
+    const shm_path = "albedo_test_wal_corrupt_magic.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1010,8 +1129,8 @@ test "WAL corrupted magic is rejected on open" {
 
 test "WAL sequence numbers increment correctly" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_seq.wal";
-    const shm_path = "/tmp/albedo_test_wal_seq.wal-shm";
+    const path = "albedo_test_wal_seq.wal";
+    const shm_path = "albedo_test_wal_seq.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1039,8 +1158,8 @@ test "WAL sequence numbers increment correctly" {
 
 test "WAL same page can be written multiple times" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_overwrite.wal";
-    const shm_path = "/tmp/albedo_test_wal_overwrite.wal-shm";
+    const path = "albedo_test_wal_overwrite.wal";
+    const shm_path = "albedo_test_wal_overwrite.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1087,8 +1206,8 @@ test "WAL same page can be written multiple times" {
 
 test "WAL checkpoint then append starts fresh sequence" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_checkpoint_seq.wal";
-    const shm_path = "/tmp/albedo_test_wal_checkpoint_seq.wal-shm";
+    const path = "albedo_test_wal_checkpoint_seq.wal";
+    const shm_path = "albedo_test_wal_checkpoint_seq.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1122,8 +1241,8 @@ test "WAL checkpoint then append starts fresh sequence" {
 
 test "WAL checksum validates page data integrity" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_checksum.wal";
-    const shm_path = "/tmp/albedo_test_wal_checksum.wal-shm";
+    const path = "albedo_test_wal_checksum.wal";
+    const shm_path = "albedo_test_wal_checksum.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1157,8 +1276,8 @@ test "WAL checksum validates page data integrity" {
 
 test "WAL many frames stress test" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_stress.wal";
-    const shm_path = "/tmp/albedo_test_wal_stress.wal-shm";
+    const path = "albedo_test_wal_stress.wal";
+    const shm_path = "albedo_test_wal_stress.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1197,8 +1316,8 @@ test "WAL many frames stress test" {
 
 test "WAL empty iterator returns null immediately" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_empty_iter.wal";
-    const shm_path = "/tmp/albedo_test_wal_empty_iter.wal-shm";
+    const path = "albedo_test_wal_empty_iter.wal";
+    const shm_path = "albedo_test_wal_empty_iter.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1211,8 +1330,8 @@ test "WAL empty iterator returns null immediately" {
 
 test "WAL file size matches expected layout" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_filesize.wal";
-    const shm_path = "/tmp/albedo_test_wal_filesize.wal-shm";
+    const path = "albedo_test_wal_filesize.wal";
+    const shm_path = "albedo_test_wal_filesize.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1239,8 +1358,8 @@ test "WAL file size matches expected layout" {
 
 test "WAL page data is preserved byte-for-byte" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_data_fidelity.wal";
-    const shm_path = "/tmp/albedo_test_wal_data_fidelity.wal-shm";
+    const path = "albedo_test_wal_data_fidelity.wal";
+    const shm_path = "albedo_test_wal_data_fidelity.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1271,8 +1390,8 @@ test "WAL page data is preserved byte-for-byte" {
 
 test "WAL latest_committed_tx updates on sync" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_commit_tx.wal";
-    const shm_path = "/tmp/albedo_test_wal_commit_tx.wal-shm";
+    const path = "albedo_test_wal_commit_tx.wal";
+    const shm_path = "albedo_test_wal_commit_tx.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1301,8 +1420,8 @@ test "WAL latest_committed_tx updates on sync" {
 
 test "WAL latest_committed_tx persists across reopen" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_commit_persist.wal";
-    const shm_path = "/tmp/albedo_test_wal_commit_persist.wal-shm";
+    const path = "albedo_test_wal_commit_persist.wal";
+    const shm_path = "albedo_test_wal_commit_persist.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1327,8 +1446,8 @@ test "WAL latest_committed_tx persists across reopen" {
 
 test "WAL page_data returns correct data" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_page_data.wal";
-    const shm_path = "/tmp/albedo_test_wal_page_data.wal-shm";
+    const path = "albedo_test_wal_page_data.wal";
+    const shm_path = "albedo_test_wal_page_data.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1347,8 +1466,8 @@ test "WAL page_data returns correct data" {
 
 test "WAL page_data returns WalPageNotFound for missing page" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_page_missing.wal";
-    const shm_path = "/tmp/albedo_test_wal_page_missing.wal-shm";
+    const path = "albedo_test_wal_page_missing.wal";
+    const shm_path = "albedo_test_wal_page_missing.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1361,8 +1480,8 @@ test "WAL page_data returns WalPageNotFound for missing page" {
 
 test "WAL page_data MVCC returns latest version <= max_tx" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_mvcc.wal";
-    const shm_path = "/tmp/albedo_test_wal_mvcc.wal-shm";
+    const path = "albedo_test_wal_mvcc.wal";
+    const shm_path = "albedo_test_wal_mvcc.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1408,8 +1527,8 @@ test "WAL page_data MVCC returns latest version <= max_tx" {
 
 test "WAL page_data with multiple pages and MVCC" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_mvcc_multi.wal";
-    const shm_path = "/tmp/albedo_test_wal_mvcc_multi.wal-shm";
+    const path = "albedo_test_wal_mvcc_multi.wal";
+    const shm_path = "albedo_test_wal_mvcc_multi.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1452,8 +1571,8 @@ test "WAL page_data with multiple pages and MVCC" {
 
 test "WAL page_data after checkpoint returns not found" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_wal_page_after_ckpt.wal";
-    const shm_path = "/tmp/albedo_test_wal_page_after_ckpt.wal-shm";
+    const path = "albedo_test_wal_page_after_ckpt.wal";
+    const shm_path = "albedo_test_wal_page_after_ckpt.wal-shm";
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
@@ -1480,7 +1599,7 @@ test "WAL page_data after checkpoint returns not found" {
 
 test "WalIndex insert and lookup" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_walindex.shm";
+    const path = "albedo_test_walindex.shm";
     std.fs.cwd().deleteFile(path) catch {};
     defer std.fs.cwd().deleteFile(path) catch {};
 
@@ -1512,7 +1631,7 @@ test "WalIndex insert and lookup" {
 
 test "WalIndex clear resets state" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_walindex_clear.shm";
+    const path = "albedo_test_walindex_clear.shm";
     std.fs.cwd().deleteFile(path) catch {};
     defer std.fs.cwd().deleteFile(path) catch {};
 
@@ -1538,7 +1657,7 @@ test "WalIndex clear resets state" {
 
 test "WalIndex many entries" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_walindex_many.shm";
+    const path = "albedo_test_walindex_many.shm";
     std.fs.cwd().deleteFile(path) catch {};
     defer std.fs.cwd().deleteFile(path) catch {};
 
@@ -1566,8 +1685,8 @@ test "WalIndex many entries" {
 
 test "consumeAndClose deletes WAL and SHM files" {
     const allocator = std.testing.allocator;
-    const wal_path = "/tmp/albedo_test_consume_close.wal";
-    const shm_path = "/tmp/albedo_test_consume_close.wal-shm";
+    const wal_path = "albedo_test_consume_close.wal";
+    const shm_path = "albedo_test_consume_close.wal-shm";
     cleanupTestFiles(wal_path, shm_path);
 
     // Create a WAL, write a frame, then consume and close.
@@ -1597,7 +1716,7 @@ test "consumeAndClose deletes WAL and SHM files" {
 
 test "WalIndex.deleteFile removes file when no readers" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/albedo_test_walindex_delete.shm";
+    const path = "albedo_test_walindex_delete.shm";
     std.fs.cwd().deleteFile(path) catch {};
 
     var idx = try WAL.WalIndex.init(allocator, path, 256);
@@ -1616,8 +1735,8 @@ test "WalIndex.deleteFile removes file when no readers" {
 
 test "deinit does not delete WAL files" {
     const allocator = std.testing.allocator;
-    const wal_path = "/tmp/albedo_test_deinit_no_delete.wal";
-    const shm_path = "/tmp/albedo_test_deinit_no_delete.wal-shm";
+    const wal_path = "albedo_test_deinit_no_delete.wal";
+    const shm_path = "albedo_test_deinit_no_delete.wal-shm";
     cleanupTestFiles(wal_path, shm_path);
     defer cleanupTestFiles(wal_path, shm_path);
 
@@ -1637,8 +1756,8 @@ test "deinit does not delete WAL files" {
 
 test "consumeAndClose preserves files when another connection is active" {
     const allocator = std.testing.allocator;
-    const wal_path = "/tmp/albedo_test_multi_conn.wal";
-    const shm_path = "/tmp/albedo_test_multi_conn.wal-shm";
+    const wal_path = "albedo_test_multi_conn.wal";
+    const shm_path = "albedo_test_multi_conn.wal-shm";
     cleanupTestFiles(wal_path, shm_path);
     defer cleanupTestFiles(wal_path, shm_path);
 

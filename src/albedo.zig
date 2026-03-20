@@ -13,10 +13,8 @@ const bindex = @import("bplusindex.zig");
 const Index = bindex.Index;
 const IndexOptions = bindex.IndexOptions;
 
-/// WAL is only supported on POSIX targets (Linux / macOS).
-const is_posix = builtin.os.tag == .linux or builtin.os.tag == .macos;
-pub const wal_mod = if (is_posix) @import("wal.zig") else struct {};
-pub const WAL = if (is_posix) wal_mod.WAL else void;
+pub const wal_mod = @import("wal.zig");
+pub const WAL = wal_mod.WAL;
 
 const ALBEDO_MAGIC = "ALBEDO";
 const ALBEDO_VERSION: u8 = 1;
@@ -365,7 +363,7 @@ pub const Bucket = struct {
     max_replication_retries: u32 = 3,
     cached_last_data_page: ?*Page = null,
     read_durability: ReadDurability = .shared,
-    wal: if (is_posix) ?WAL else void = if (is_posix) null else {},
+    wal: ?WAL = null,
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -601,7 +599,7 @@ pub const Bucket = struct {
             .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .write_durability = options.write_durability,
             .read_durability = options.read_durability,
-            .wal = if (comptime is_posix) null else {},
+            .wal = null,
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
@@ -616,9 +614,7 @@ pub const Bucket = struct {
         if (bucket.file) |*f| f.sync() catch {};
 
         // Now attach the WAL for subsequent operations (if enabled).
-        bucket.wal = if (comptime is_posix)
-            (if (options.wal) initWal(ally, path) else null)
-        else {};
+        bucket.wal = if (options.wal) initWal(ally, path) else null;
 
         bucket.rwlock = .{};
 
@@ -688,9 +684,7 @@ pub const Bucket = struct {
             return BucketInitErrors.UnexpectedError;
         };
 
-        const wal_instance = if (comptime is_posix)
-            (if (options.wal) initWal(ally, path) else null)
-        else {};
+        const wal_instance: ?WAL = if (options.wal) initWal(ally, path) else null;
 
         var bucket = Bucket{
             .file = file,
@@ -712,18 +706,14 @@ pub const Bucket = struct {
             bucket.pageCache.deinit();
             bucket.indexes.deinit();
             ally.free(bucket.path);
-            if (comptime is_posix) {
-                if (bucket.wal) |*w| w.deinit();
-            }
+            if (bucket.wal) |*w| w.deinit();
         }
 
         // In WAL mode the SHM index (rebuilt inside WAL.init) already
         // makes un-checkpointed frames visible to loadPage.  We only
         // need to pick up the latest BucketHeader from the WAL (if any)
         // so that page_count / doc_count are correct.
-        if (comptime is_posix) {
-            bucket.loadHeaderFromWal();
-        }
+        bucket.loadHeaderFromWal();
 
         const meta = bucket.loadPage(0) catch {
             return BucketInitErrors.FileReadError;
@@ -740,7 +730,6 @@ pub const Bucket = struct {
     /// Called on open so that page_count / doc_count reflect any writes
     /// that were committed to the WAL but not yet checkpointed.
     fn loadHeaderFromWal(self: *Bucket) void {
-        if (comptime !is_posix) return;
         // Never call during an in-flight transaction: the pending header has a
         // higher page_count than whatever is in the WAL, so reading it would
         // silently decrease header.page_count and cause createNewPage to
@@ -763,8 +752,6 @@ pub const Bucket = struct {
     /// close when this is the last active connection so that the main
     /// file is fully up-to-date for the next open.
     fn checkpointWal(self: *Bucket) void {
-        if (comptime !is_posix) return;
-
         const w = &(self.wal orelse return);
         if (w.header.frame_count == 0) return;
 
@@ -788,9 +775,7 @@ pub const Bucket = struct {
     }
 
     /// Build the WAL path (<db_path>-wal) and try to open/create the WAL.
-    /// Only available on POSIX targets.
-    fn initWal(ally: std.mem.Allocator, db_path: []const u8) if (is_posix) ?WAL else void {
-        if (comptime !is_posix) return {};
+    fn initWal(ally: std.mem.Allocator, db_path: []const u8) ?WAL {
         const wal_path = ally.alloc(u8, db_path.len + 4) catch return null;
         defer ally.free(wal_path);
         @memcpy(wal_path[0..db_path.len], db_path);
@@ -916,14 +901,12 @@ pub const Bucket = struct {
                     return page;
                 }
                 // Cache miss — try the WAL, then the main DB file.
-                if (comptime is_posix) {
-                    if (self.wal) |*w| {
-                        if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
-                            return try self.cachePageFromWal(page_id, data);
-                        } else |err| switch (err) {
-                            error.WalPageNotFound => {},
-                            else => {},
-                        }
+                if (self.wal) |*w| {
+                    if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
+                        return try self.cachePageFromWal(page_id, data);
+                    } else |err| switch (err) {
+                        error.WalPageNotFound => {},
+                        else => {},
                     }
                 }
             },
@@ -939,23 +922,21 @@ pub const Bucket = struct {
                 }
 
                 // Always consult the WAL first for cross-process visibility.
-                if (comptime is_posix) {
-                    if (self.wal) |*w| {
-                        if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
-                            const header = PageHeader.read(data[0..PageHeader.byteSize]);
+                if (self.wal) |*w| {
+                    if (w.page_data(page_id, std.math.maxInt(i64))) |data| {
+                        const header = PageHeader.read(data[0..PageHeader.byteSize]);
 
-                            if (self.pageCache.get(page_id)) |existing| {
-                                // Refresh the cached page in-place.
-                                existing.header = header;
-                                @memcpy(existing.data, data[PageHeader.byteSize..]);
-                                return existing;
-                            }
-
-                            return try self.cachePageFromWal(page_id, data);
-                        } else |err| switch (err) {
-                            error.WalPageNotFound => {},
-                            else => {},
+                        if (self.pageCache.get(page_id)) |existing| {
+                            // Refresh the cached page in-place.
+                            existing.header = header;
+                            @memcpy(existing.data, data[PageHeader.byteSize..]);
+                            return existing;
                         }
+
+                        return try self.cachePageFromWal(page_id, data);
+                    } else |err| switch (err) {
+                        error.WalPageNotFound => {},
+                        else => {},
                     }
                 }
 
@@ -1038,22 +1019,20 @@ pub const Bucket = struct {
         // In WAL mode, write ONLY to the WAL — the main DB file stays
         // untouched until checkpoint. Other processes read new pages from
         // the WAL via the shared-memory index (MVCC).
-        if (comptime is_posix) {
-            if (self.wal) |_| {
-                // Defer the WAL append to commitWalTransaction() so that each
-                // unique page is written to the WAL only once per logical
-                // transaction, regardless of how many times the B+ tree
-                // modified it during a single insert/delete call.
-                // This mirrors SQLite behaviour: only the final committed page
-                // state reaches the WAL, not every intermediate B+ tree write.
-                try self.wal_pending_pages.put(page.header.page_id, {});
+        if (self.wal) |_| {
+            // Defer the WAL append to commitWalTransaction() so that each
+            // unique page is written to the WAL only once per logical
+            // transaction, regardless of how many times the B+ tree
+            // modified it during a single insert/delete call.
+            // This mirrors SQLite behaviour: only the final committed page
+            // state reaches the WAL, not every intermediate B+ tree write.
+            try self.wal_pending_pages.put(page.header.page_id, {});
 
-                // Track dirty page for replication.
-                if (self.replication_callback != null) {
-                    try self.dirty_pages.put(page.header.page_id, {});
-                }
-                return;
+            // Track dirty page for replication.
+            if (self.replication_callback != null) {
+                try self.dirty_pages.put(page.header.page_id, {});
             }
+            return;
         }
 
         // Non-WAL mode: also defer to commitWalTransaction() (direct-file path)
@@ -1078,12 +1057,10 @@ pub const Bucket = struct {
                 self.writes_since_sync += 1;
                 if (self.writes_since_sync >= threshold) {
                     self.writes_since_sync = 0;
-                    if (comptime is_posix) {
-                        if (self.wal) |*w| {
-                            w.sync() catch {};
-                            self.notifyDirtyPages() catch {};
-                            return;
-                        }
+                    if (self.wal) |*w| {
+                        w.sync() catch {};
+                        self.notifyDirtyPages() catch {};
+                        return;
                     }
                     if (self.file) |*f| {
                         f.sync() catch {};
@@ -1111,46 +1088,44 @@ pub const Bucket = struct {
             return;
         }
 
-        if (comptime is_posix) {
-            if (self.wal) |*w| {
-                const tx_ts = walTimestamp();
+        if (self.wal) |*w| {
+            const tx_ts = walTimestamp();
 
-                var it = self.wal_pending_pages.keyIterator();
-                while (it.next()) |page_id_ptr| {
-                    const page_id = page_id_ptr.*;
-                    const page = self.pageCache.get(page_id) orelse continue;
+            var it = self.wal_pending_pages.keyIterator();
+            while (it.next()) |page_id_ptr| {
+                const page_id = page_id_ptr.*;
+                const page = self.pageCache.get(page_id) orelse continue;
 
-                    var buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
-                    const hdr_bytes = PageHeader.write(&page.header);
-                    @memcpy(buf[0..PageHeader.byteSize], hdr_bytes[0..]);
-                    @memcpy(buf[PageHeader.byteSize..], page.data);
+                var buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
+                const hdr_bytes = PageHeader.write(&page.header);
+                @memcpy(buf[0..PageHeader.byteSize], hdr_bytes[0..]);
+                @memcpy(buf[PageHeader.byteSize..], page.data);
 
-                    w.appendPage(page_id, &buf, tx_ts) catch |err| {
-                        if (err == error.WalIndexFailed) {
-                            self.checkpointWal();
-                            w.checkpoint() catch {};
-                            w.appendPage(page_id, &buf, tx_ts) catch {};
-                        }
-                    };
-                }
-                self.wal_pending_pages.clearRetainingCapacity();
+                w.appendPage(page_id, &buf, tx_ts) catch |err| {
+                    if (err == error.WalIndexFailed) {
+                        self.checkpointWal();
+                        w.checkpoint() catch {};
+                        w.appendPage(page_id, &buf, tx_ts) catch {};
+                    }
+                };
+            }
+            self.wal_pending_pages.clearRetainingCapacity();
 
-                if (self.wal_header_pending) {
-                    var header_page: [DEFAULT_PAGE_SIZE]u8 = [_]u8{0} ** DEFAULT_PAGE_SIZE;
-                    const bytes = self.header.toBytes();
-                    @memcpy(header_page[0..BucketHeader.byteSize], &bytes);
-                    w.appendPage(WAL.HEADER_PAGE_ID, &header_page, tx_ts) catch {};
-                    self.wal_header_pending = false;
-                }
+            if (self.wal_header_pending) {
+                var header_page: [DEFAULT_PAGE_SIZE]u8 = [_]u8{0} ** DEFAULT_PAGE_SIZE;
+                const bytes = self.header.toBytes();
+                @memcpy(header_page[0..BucketHeader.byteSize], &bytes);
+                w.appendPage(WAL.HEADER_PAGE_ID, &header_page, tx_ts) catch {};
+                self.wal_header_pending = false;
+            }
 
-                if (self.write_durability == .all) {
-                    w.sync() catch {};
-                    self.notifyDirtyPages() catch {};
-                    return;
-                }
-                self.maybeSyncPeriodic();
+            if (self.write_durability == .all) {
+                w.sync() catch {};
+                self.notifyDirtyPages() catch {};
                 return;
             }
+            self.maybeSyncPeriodic();
+            return;
         }
 
         // No-WAL path: pwrite each unique dirty page directly to the DB file.
@@ -1270,10 +1245,8 @@ pub const Bucket = struct {
         self.commitWalTransaction();
 
         // Sync the WAL (if active) so all appended frames are durable.
-        if (comptime is_posix) {
-            if (self.wal) |*w| {
-                w.sync() catch {};
-            }
+        if (self.wal) |*w| {
+            w.sync() catch {};
         }
 
         if (self.file) |*f| {
@@ -1861,18 +1834,16 @@ pub const Bucket = struct {
                 // this page since we last loaded it.  Reload via
                 // loadPage (which refreshes the cached page in-place
                 // from the WAL) and re-check.
-                if (comptime is_posix) {
-                    if (self.bucket.wal != null) {
-                        _ = self.bucket.loadPage(self.page.header.page_id) catch return null;
-                        const refreshed = std.mem.bytesToValue(DocHeader, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)]);
-                        if (refreshed.doc_id != 0 and refreshed.reserved == 0 and refreshed.is_deleted <= 1) {
-                            self.offset += @sizeOf(DocHeader);
-                            return .{
-                                .page_id = self.page.header.page_id,
-                                .offset = self.offset - @sizeOf(DocHeader),
-                                .header = refreshed,
-                            };
-                        }
+                if (self.bucket.wal != null) {
+                    _ = self.bucket.loadPage(self.page.header.page_id) catch return null;
+                    const refreshed = std.mem.bytesToValue(DocHeader, self.page.data[self.offset .. self.offset + @sizeOf(DocHeader)]);
+                    if (refreshed.doc_id != 0 and refreshed.reserved == 0 and refreshed.is_deleted <= 1) {
+                        self.offset += @sizeOf(DocHeader);
+                        return .{
+                            .page_id = self.page.header.page_id,
+                            .offset = self.offset - @sizeOf(DocHeader),
+                            .header = refreshed,
+                        };
                     }
                 }
                 return null; // No more documents
@@ -3603,9 +3574,7 @@ pub const Bucket = struct {
         // Checkpoint now so the temp main file has all the data
         // before we swap it into place.
         try newBucket.flush();
-        if (comptime is_posix) {
-            newBucket.checkpointWal();
-        }
+        newBucket.checkpointWal();
 
         const path = try self.allocator.dupe(u8, self.path);
         iterator.deinit();
@@ -3649,16 +3618,14 @@ pub const Bucket = struct {
         };
 
         // Apply WAL frames to the main file and clean up.
-        if (comptime is_posix) {
-            if (self.wal) |*w| {
-                // Only checkpoint to the main file when we are the last
-                // connection — other processes may still be reading the WAL.
-                if (w.index.activeConnections() <= 1) {
-                    self.checkpointWal();
-                }
-                w.consumeAndClose();
-                self.wal = null;
+        if (self.wal) |*w| {
+            // Only checkpoint to the main file when we are the last
+            // connection — other processes may still be reading the WAL.
+            if (w.index.activeConnections() <= 1) {
+                self.checkpointWal();
             }
+            w.consumeAndClose();
+            self.wal = null;
         }
 
         var idx_iter = self.indexes.iterator();
@@ -5082,12 +5049,10 @@ test "Deleting removes index entries for scalar field" {
 }
 
 test "Bucket WAL restore recovers data after simulated crash" {
-    if (comptime !is_posix) return;
-
     const allocator = std.testing.allocator;
-    const db_path = "/tmp/albedo_test_wal_restore.bucket";
-    const wal_path = "/tmp/albedo_test_wal_restore.bucket-wal";
-    const shm_path = "/tmp/albedo_test_wal_restore.bucket-wal-shm";
+    const db_path = "albedo_test_wal_restore.bucket";
+    const wal_path = "albedo_test_wal_restore.bucket-wal";
+    const shm_path = "albedo_test_wal_restore.bucket-wal-shm";
 
     // Clean up any leftovers from previous runs.
     platform.deleteFile(db_path) catch {};
@@ -5203,12 +5168,10 @@ test "Bucket WAL restore recovers data after simulated crash" {
 }
 
 test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
-    if (comptime !is_posix) return;
-
     const allocator = std.testing.allocator;
-    const db_path = "/tmp/albedo_test_wal_crash.bucket";
-    const wal_path = "/tmp/albedo_test_wal_crash.bucket-wal";
-    const shm_path = "/tmp/albedo_test_wal_crash.bucket-wal-shm";
+    const db_path = "albedo_test_wal_crash.bucket";
+    const wal_path = "albedo_test_wal_crash.bucket-wal";
+    const shm_path = "albedo_test_wal_crash.bucket-wal-shm";
 
     // Clean up any leftovers from previous runs.
     platform.deleteFile(db_path) catch {};
@@ -5310,12 +5273,10 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
 }
 
 test "WAL live-tail: reader polls for docs written by another connection" {
-    if (comptime !is_posix) return;
-
     const allocator = std.testing.allocator;
-    const db_path = "/tmp/albedo_test_wal_live_tail.bucket";
-    const wal_path = "/tmp/albedo_test_wal_live_tail.bucket-wal";
-    const shm_path = "/tmp/albedo_test_wal_live_tail.bucket-wal-shm";
+    const db_path = "albedo_test_wal_live_tail.bucket";
+    const wal_path = "albedo_test_wal_live_tail.bucket-wal";
+    const shm_path = "albedo_test_wal_live_tail.bucket-wal-shm";
 
     // Clean up leftovers.
     platform.deleteFile(db_path) catch {};
@@ -5406,12 +5367,10 @@ test "WAL live-tail: reader polls for docs written by another connection" {
 }
 
 test "WAL live-tail: reader polls empty DB then sees docs after writer inserts" {
-    if (comptime !is_posix) return;
-
     const allocator = std.testing.allocator;
-    const db_path = "/tmp/albedo_test_wal_empty_poll.bucket";
-    const wal_path = "/tmp/albedo_test_wal_empty_poll.bucket-wal";
-    const shm_path = "/tmp/albedo_test_wal_empty_poll.bucket-wal-shm";
+    const db_path = "albedo_test_wal_empty_poll.bucket";
+    const wal_path = "albedo_test_wal_empty_poll.bucket-wal";
+    const shm_path = "albedo_test_wal_empty_poll.bucket-wal-shm";
 
     platform.deleteFile(db_path) catch {};
     std.fs.cwd().deleteFile(wal_path) catch {};
