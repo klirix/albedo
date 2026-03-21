@@ -218,6 +218,13 @@ pub const WAL = struct {
     /// Larger payloads store a physical location reference instead.
     pub const OPLOG_INLINE_MAX: u16 = 1024;
 
+    /// Integer type used for all atomic accesses to oplog_seqno /
+    /// oplog_oldest_seqno.  The fields remain u64 in memory (preserving the
+    /// ABI layout), but we @ptrCast to *seqno_type so that 32-bit targets
+    /// can use a native-width atomic instead of an unavailable 64-bit one.
+    /// On 64-bit platforms seqno_type == u64 and nothing is lost.
+    pub const seqno_type = usize;
+
     /// Operation kind for oplog entries.
     pub const OpKind = enum(u8) {
         insert = 1,
@@ -479,7 +486,8 @@ pub const WAL = struct {
             const shm = self.shmHeader();
             const ring = self.oplogBase();
 
-            const seqno = @atomicLoad(u64, &shm.oplog_seqno, .monotonic) + 1;
+            // Write lock is held — plain read/write is safe and preserves full u64 precision.
+            const seqno: u64 = shm.oplog_seqno + 1;
             const plen: u16 = if (payload) |p| @intCast(p.len) else 0;
             const total: u32 = @intCast(OplogEntryHeader.byte_size + @as(u32, plen));
 
@@ -507,9 +515,13 @@ pub const WAL = struct {
                 write_pos = (write_pos + @as(u32, plen)) % @as(u32, @intCast(OPLOG_REGION_SIZE));
             }
 
-            // Publish: update write_pos then seqno with release ordering.
+            // Publish: update write_pos then seqno with release ordering so
+            // readers' @atomicLoad(seqno, .acquire) establishes happens-before
+            // with all ring writes above.
+            // On 32-bit seqno is truncated to usize (u32); precision is lost
+            // after ~4 billion operations but the ring itself recycles far sooner.
             @atomicStore(u32, &shm.oplog_write_pos, write_pos, .release);
-            @atomicStore(u64, &shm.oplog_seqno, seqno, .release);
+            @atomicStore(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_seqno)), @truncate(seqno), .release);
         }
 
         /// Read a single oplog entry starting at `ring_pos`.
@@ -576,8 +588,9 @@ pub const WAL = struct {
             total: u32,
         ) void {
             _ = self;
-            const oldest = @atomicLoad(u64, &shm.oplog_oldest_seqno, .monotonic);
-            const current = @atomicLoad(u64, &shm.oplog_seqno, .monotonic);
+            // Write lock is held — plain reads give full u64 values.
+            const oldest: u64 = shm.oplog_oldest_seqno;
+            const current: u64 = shm.oplog_seqno;
             if (oldest == 0 and current == 0) {
                 // Ring is empty, nothing to evict.
                 return;
@@ -609,7 +622,8 @@ pub const WAL = struct {
                 remaining -= entry_total;
             }
             if (evicted > 0) {
-                @atomicStore(u64, &shm.oplog_oldest_seqno, oldest + evicted, .release);
+                // Atomic release store — same truncation caveat as oplog_seqno.
+                @atomicStore(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_oldest_seqno)), @truncate(oldest + evicted), .release);
             }
         }
 

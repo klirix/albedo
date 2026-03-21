@@ -2943,6 +2943,7 @@ pub const Bucket = struct {
             return try BSONDocument.fromPairs(a, pairs_buf[0..n]);
         }
     };
+    const seqno_type = usize;
 
     /// Reader-side subscription handle.  Created via `Bucket.subscribe()`,
     /// the caller polls `poll()` from their event loop to drain matching
@@ -2964,7 +2965,7 @@ pub const Bucket = struct {
         /// Return the latest committed oplog seqno visible to readers.
         pub fn currentSeqno(self: *Subscription) u64 {
             const w = &(self.bucket.wal orelse return 0);
-            return @atomicLoad(u64, &w.index.shmHeader().oplog_seqno, .acquire);
+            return @atomicLoad(seqno_type, @as(*seqno_type, @ptrCast(&w.index.shmHeader().oplog_seqno)), .acquire);
         }
 
         /// Poll for the next batch of change events that match the stored
@@ -2988,13 +2989,19 @@ pub const Bucket = struct {
             const w = &(self.bucket.wal orelse return error.WalNotActive);
             const shm = w.index.shmHeader();
 
-            const head_seqno = @atomicLoad(u64, &shm.oplog_seqno, .acquire);
-            if (head_seqno <= self.last_seqno) {
+            const head_seqno: u64 = @atomicLoad(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_seqno)), .acquire);
+            if (head_seqno < self.last_seqno) {
+                // On 32-bit builds, seqno_type is usize (u32) so the published
+                // SHM watermark can wrap. Treat regression as a gap so callers
+                // re-subscribe instead of stalling forever.
+                return error.OplogGap;
+            }
+            if (head_seqno == self.last_seqno) {
                 return null;
             }
 
             // Check for gap.
-            const oldest = @atomicLoad(u64, &shm.oplog_oldest_seqno, .acquire);
+            const oldest: u64 = @atomicLoad(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_oldest_seqno)), .acquire);
             if (oldest > 0 and self.last_seqno > 0 and oldest > self.last_seqno + 1) {
                 return error.OplogGap;
             }
@@ -3085,7 +3092,7 @@ pub const Bucket = struct {
         const w = &(self.wal.?);
 
         // Snapshot current seqno so the reader doesn't receive historical events.
-        const initial_seqno = @atomicLoad(u64, &w.index.shmHeader().oplog_seqno, .acquire);
+        const initial_seqno: u64 = @atomicLoad(seqno_type, @as(*seqno_type, @ptrCast(&w.index.shmHeader().oplog_seqno)), .acquire);
         const initial_pos = @atomicLoad(u32, &w.index.shmHeader().oplog_write_pos, .acquire);
 
         const sub = self.allocator.create(Subscription) catch return error.OutOfMemory;
