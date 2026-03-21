@@ -3000,8 +3000,13 @@ pub const Bucket = struct {
                 return null;
             }
 
-            // Check for gap.
+            // Check for gap: has the ring evicted entries we haven't read yet?
             const oldest: u64 = @atomicLoad(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_oldest_seqno)), .acquire);
+            // Guard: if the writer stored oldest before seqno (transient
+            // race), oldest > head — just wait for the next poll.
+            if (oldest > head_seqno) {
+                return null;
+            }
             if (oldest > 0 and self.last_seqno > 0 and oldest > self.last_seqno + 1) {
                 return error.OplogGap;
             }

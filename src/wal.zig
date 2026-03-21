@@ -493,8 +493,8 @@ pub const WAL = struct {
 
             var write_pos = @atomicLoad(u32, &shm.oplog_write_pos, .monotonic);
 
-            // Advance oldest_seqno for entries we are about to overwrite.
-            self.evictOverwritten(shm, ring, write_pos, total);
+            // Compute the new oldest_seqno (deferred publish — see below).
+            const new_oldest = self.evictOverwritten(shm, ring, write_pos, total);
 
             // Write header.
             const hdr = OplogEntryHeader{
@@ -515,13 +515,15 @@ pub const WAL = struct {
                 write_pos = (write_pos + @as(u32, plen)) % @as(u32, @intCast(OPLOG_REGION_SIZE));
             }
 
-            // Publish: update write_pos then seqno with release ordering so
-            // readers' @atomicLoad(seqno, .acquire) establishes happens-before
-            // with all ring writes above.
-            // On 32-bit seqno is truncated to usize (u32); precision is lost
-            // after ~4 billion operations but the ring itself recycles far sooner.
+            // Publish: write_pos → seqno → oldest_seqno, all with release
+            // ordering so readers' acquire-loads see a consistent state.
+            // Crucially, seqno is stored BEFORE oldest_seqno so that a
+            // reader never observes oldest > head.
             @atomicStore(u32, &shm.oplog_write_pos, write_pos, .release);
             @atomicStore(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_seqno)), @truncate(seqno), .release);
+            if (new_oldest != shm.oplog_oldest_seqno) {
+                @atomicStore(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_oldest_seqno)), @truncate(new_oldest), .release);
+            }
         }
 
         /// Read a single oplog entry starting at `ring_pos`.
@@ -578,22 +580,25 @@ pub const WAL = struct {
             }
         }
 
-        /// Advance `oplog_oldest_seqno` to skip entries that would be
-        /// overwritten by a new entry of `total` bytes at `write_pos`.
+        /// Count entries that would be overwritten by a new entry of
+        /// `total` bytes at `write_pos` and return the new oldest seqno.
+        /// Does NOT publish the value — the caller must store it after
+        /// publishing the new `oplog_seqno` so readers never observe
+        /// `oldest > head`.
         fn evictOverwritten(
             self: *WalIndex,
             shm: *ShmHeader,
             ring: [*]u8,
             write_pos: u32,
             total: u32,
-        ) void {
+        ) u64 {
             _ = self;
             // Write lock is held — plain reads give full u64 values.
             const oldest: u64 = shm.oplog_oldest_seqno;
             const current: u64 = shm.oplog_seqno;
             if (oldest == 0 and current == 0) {
                 // Ring is empty, nothing to evict.
-                return;
+                return 0;
             }
             // Walk from the logical oldest entry forward, evicting any that
             // overlap with the region [write_pos .. write_pos + total).
@@ -621,10 +626,7 @@ pub const WAL = struct {
                 if (remaining <= entry_total) break;
                 remaining -= entry_total;
             }
-            if (evicted > 0) {
-                // Atomic release store — same truncation caveat as oplog_seqno.
-                @atomicStore(seqno_type, @as(*seqno_type, @ptrCast(&shm.oplog_oldest_seqno)), @truncate(oldest + evicted), .release);
-            }
+            return oldest + evicted;
         }
 
         // ── Locking ──
