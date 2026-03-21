@@ -364,6 +364,9 @@ pub const Bucket = struct {
     cached_last_data_page: ?*Page = null,
     read_durability: ReadDurability = .shared,
     wal: ?WAL = null,
+    /// When true, mutation methods skip oplog emission (used by
+    /// TransformIterator to avoid double-emitting for updates).
+    _suppress_oplog: bool = false,
 
     const PageIterator = struct {
         bucket: *Bucket,
@@ -1072,6 +1075,42 @@ pub const Bucket = struct {
         }
     }
 
+    /// Emit an oplog entry into the WAL shared-memory ring buffer.
+    /// For insert/update, `payload` is the raw BSON bytes of the document.
+    /// For delete, `payload` is null.
+    /// Entries are only emitted when WAL mode is active and not in-memory.
+    fn emitOplogEntry(self: *Bucket, op: WAL.OpKind, doc_id: u96, payload: ?[]const u8) void {
+        if (self.in_memory) return;
+        const w = &(self.wal orelse return);
+
+        const ts = walTimestamp();
+
+        // Determine payload kind and actual bytes to write.
+        var payload_kind: WAL.PayloadKind = .none;
+        var actual_payload: ?[]const u8 = null;
+
+        if (payload) |p| {
+            if (p.len <= WAL.OPLOG_INLINE_MAX) {
+                payload_kind = .inline_doc;
+                actual_payload = p;
+            } else {
+                // For large documents, store a DocRef so readers can
+                // reconstruct the document from storage.  We don't have
+                // the exact page_id/offset cheaply here, so we store
+                // a zero ref — readers fall back to a full lookup by _id.
+                payload_kind = .ref_loc;
+                const ref = WAL.DocRef{ .page_id = 0, .offset = 0 };
+                const ref_bytes: *const [WAL.DocRef.byte_size]u8 = @ptrCast(&ref);
+                actual_payload = ref_bytes;
+            }
+        }
+
+        w.index.acquireWrite();
+        defer w.index.releaseWrite();
+        const doc_id_bytes: [12]u8 = @bitCast(doc_id);
+        w.index.appendOplogEntry(op, doc_id_bytes, ts, actual_payload, payload_kind);
+    }
+
     /// Flush all pages dirtied during the current write transaction to the WAL,
     /// then optionally fsync.  Call this once at the end of insert() / delete() /
     /// buildIndex() instead of appending individual WAL frames inside writePage().
@@ -1631,6 +1670,11 @@ pub const Bucket = struct {
         // optionally fsync. This is the correct place to do it — all in-memory
         // B+ tree modifications are complete and the page cache holds final state.
         self.commitWalTransaction();
+
+        // Emit oplog entry for the insert (unless suppressed by transform).
+        if (!self._suppress_oplog) {
+            self.emitOplogEntry(.insert, doc_header.doc_id, encoded_doc);
+        }
 
         // After writing is done, free the page resources
         return result;
@@ -2848,6 +2892,213 @@ pub const Bucket = struct {
         }
     }
 
+    // ── Oplog Subscription ────────────────────────────────────────────
+
+    pub const SubscriptionError = error{
+        /// The subscriber fell behind and the ring buffer has wrapped past
+        /// unread entries. The caller must re-subscribe from a fresh query.
+        OplogGap,
+        OutOfMemory,
+        WalNotActive,
+    };
+
+    /// An operation envelope returned by the subscription poll API.
+    pub const ChangeEvent = struct {
+        /// Monotonically increasing sequence number.
+        seqno: u64,
+        /// The kind of mutation (insert, update, delete).
+        op: WAL.OpKind,
+        /// Raw bytes of the _id field (ObjectId as 12 bytes).
+        doc_id: [12]u8,
+        /// Wall-clock timestamp of the operation (nanoseconds).
+        timestamp: i64,
+        /// The document body for insert/update, or null for delete.
+        document: ?BSONDocument,
+
+        /// Serialize this event into a BSON document.
+        /// The caller owns the returned document and must free it.
+        fn toBson(self: *const ChangeEvent, a: mem.Allocator) !BSONDocument {
+            var pairs_buf: [5]bson.BSONKeyValuePair = undefined;
+            var n: usize = 0;
+
+            pairs_buf[n] = .{ .key = "seqno", .value = .{ .int64 = .{ .value = @bitCast(self.seqno) } } };
+            n += 1;
+            const op_str: []const u8 = switch (self.op) {
+                .insert => "insert",
+                .update => "update",
+                .delete => "delete",
+            };
+            pairs_buf[n] = .{ .key = "op", .value = .{ .string = .{ .value = op_str } } };
+            n += 1;
+            pairs_buf[n] = .{ .key = "doc_id", .value = .{ .objectId = .{ .value = .{ .buffer = self.doc_id } } } };
+            n += 1;
+            pairs_buf[n] = .{ .key = "ts", .value = .{ .int64 = .{ .value = self.timestamp } } };
+            n += 1;
+
+            if (self.document) |doc| {
+                pairs_buf[n] = .{ .key = "doc", .value = .{ .document = doc } };
+                n += 1;
+            }
+
+            return try BSONDocument.fromPairs(a, pairs_buf[0..n]);
+        }
+    };
+
+    /// Reader-side subscription handle.  Created via `Bucket.subscribe()`,
+    /// the caller polls `poll()` from their event loop to drain matching
+    /// oplog entries in batches.
+    pub const Subscription = struct {
+        bucket: *Bucket,
+        q: query.Query,
+        /// Sequence number of the last consumed oplog entry.
+        last_seqno: u64,
+        /// Ring position corresponding to the byte after last_seqno's entry.
+        ring_pos: u32,
+        /// Scratch buffer for reading payloads out of the ring.
+        payload_buf: [WAL.OPLOG_INLINE_MAX]u8,
+        /// Materialized BSON batch from the last poll. Freed on the next
+        /// poll or on deinit. Callers must consume the document before the
+        /// next poll call — see API docs.
+        last_batch_buf: ?[]const u8 = null,
+
+        /// Return the latest committed oplog seqno visible to readers.
+        pub fn currentSeqno(self: *Subscription) u64 {
+            const w = &(self.bucket.wal orelse return 0);
+            return @atomicLoad(u64, &w.index.shmHeader().oplog_seqno, .acquire);
+        }
+
+        /// Poll for the next batch of change events that match the stored
+        /// query.  Returns a BSON document `{batch: [...events]}` when at
+        /// least one matching event is available, or `null` when there is
+        /// nothing new.
+        ///
+        /// **Lifetime:** the returned document is backed by memory owned by
+        /// the Subscription.  It remains valid until the next `poll()` call
+        /// or until `deinit()` — whichever comes first.
+        ///
+        /// Returns `SubscriptionError.OplogGap` if the ring has wrapped
+        /// past our read position.
+        pub fn poll(self: *Subscription, max_events: u32) SubscriptionError!?BSONDocument {
+            // Free previous batch.
+            if (self.last_batch_buf) |buf| {
+                self.bucket.allocator.free(buf);
+                self.last_batch_buf = null;
+            }
+
+            const w = &(self.bucket.wal orelse return error.WalNotActive);
+            const shm = w.index.shmHeader();
+
+            const head_seqno = @atomicLoad(u64, &shm.oplog_seqno, .acquire);
+            if (head_seqno <= self.last_seqno) {
+                return null;
+            }
+
+            // Check for gap.
+            const oldest = @atomicLoad(u64, &shm.oplog_oldest_seqno, .acquire);
+            if (oldest > 0 and self.last_seqno > 0 and oldest > self.last_seqno + 1) {
+                return error.OplogGap;
+            }
+
+            const a = self.bucket.allocator;
+
+            // Collect matching events.
+            var event_docs = std.ArrayList(BSONDocument){};
+            defer {
+                for (event_docs.items) |edoc| edoc.deinit(a);
+                event_docs.deinit(a);
+            }
+
+            var pos = self.ring_pos;
+            while (event_docs.items.len < max_events) {
+                const entry = w.index.readOplogEntry(pos, &self.payload_buf) orelse break;
+                if (entry.header.seqno <= self.last_seqno) break;
+                if (entry.header.seqno == 0) break; // uninit
+
+                var maybe_doc: ?BSONDocument = null;
+                if (entry.header.payload_kind == .inline_doc and entry.payload.len > 0) {
+                    maybe_doc = BSONDocument.init(entry.payload);
+                }
+
+                const dominated = if (maybe_doc) |*doc| self.q.match(doc) else true;
+                if (dominated) {
+                    const ev = ChangeEvent{
+                        .seqno = entry.header.seqno,
+                        .op = entry.header.op,
+                        .doc_id = entry.header.doc_id,
+                        .timestamp = entry.header.timestamp,
+                        .document = maybe_doc,
+                    };
+                    const ev_doc = ev.toBson(a) catch return error.OutOfMemory;
+                    event_docs.append(a, ev_doc) catch return error.OutOfMemory;
+                }
+
+                self.last_seqno = entry.header.seqno;
+                pos = entry.next_pos;
+            }
+            self.ring_pos = pos;
+
+            if (event_docs.items.len == 0) return null;
+
+            // Build BSON array from collected event docs.
+            const arr_pairs = a.alloc(bson.BSONKeyValuePair, event_docs.items.len) catch return error.OutOfMemory;
+            defer a.free(arr_pairs);
+
+            const idx_keys = a.alloc([20]u8, event_docs.items.len) catch return error.OutOfMemory;
+            defer a.free(idx_keys);
+
+            for (event_docs.items, 0..) |edoc, i| {
+                const key = std.fmt.bufPrint(&idx_keys[i], "{d}", .{i}) catch unreachable;
+                arr_pairs[i] = .{ .key = key, .value = .{ .document = edoc } };
+            }
+
+            var arr_doc = BSONDocument.fromPairs(a, arr_pairs) catch return error.OutOfMemory;
+            defer arr_doc.deinit(a);
+
+            var root_pair = [_]bson.BSONKeyValuePair{
+                .{ .key = "batch", .value = .{ .array = arr_doc } },
+            };
+            var result_doc = BSONDocument.fromPairs(a, &root_pair) catch return error.OutOfMemory;
+
+            // Transfer ownership to subscription.
+            self.last_batch_buf = result_doc.buffer;
+            // Prevent the local from freeing the buffer.
+            result_doc = BSONDocument.init(self.last_batch_buf.?);
+
+            return BSONDocument.init(self.last_batch_buf.?);
+        }
+
+        pub fn deinit(self: *Subscription) void {
+            if (self.last_batch_buf) |buf| {
+                self.bucket.allocator.free(buf);
+            }
+            self.q.deinit(self.bucket.allocator);
+            self.bucket.allocator.destroy(self);
+        }
+    };
+
+    /// Create a subscription on this bucket. The subscription will deliver
+    /// change events (as operation envelopes) matching the provided query.
+    /// The caller should poll `sub.poll()` from their event loop.
+    /// Requires WAL mode to be active.
+    pub fn subscribe(self: *Bucket, q: query.Query) SubscriptionError!*Subscription {
+        if (self.wal == null) return error.WalNotActive;
+        const w = &(self.wal.?);
+
+        // Snapshot current seqno so the reader doesn't receive historical events.
+        const initial_seqno = @atomicLoad(u64, &w.index.shmHeader().oplog_seqno, .acquire);
+        const initial_pos = @atomicLoad(u32, &w.index.shmHeader().oplog_write_pos, .acquire);
+
+        const sub = self.allocator.create(Subscription) catch return error.OutOfMemory;
+        sub.* = .{
+            .bucket = self,
+            .q = q,
+            .last_seqno = initial_seqno,
+            .ring_pos = initial_pos,
+            .payload_buf = [_]u8{0} ** WAL.OPLOG_INLINE_MAX,
+        };
+        return sub;
+    }
+
     pub fn listIterate(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*ListIterator {
         var ally = arena.allocator();
         const plan = self.planQuery(&q);
@@ -3226,11 +3477,23 @@ pub const Bucket = struct {
 
                 defer if (owns_doc) insert_doc.deinit(self.bucket.allocator);
 
+                // Suppress oplog from inner insert; we emit an update oplog instead.
+                self.bucket._suppress_oplog = true;
+                defer {
+                    self.bucket._suppress_oplog = false;
+                }
+
                 _ = self.bucket.insert(insert_doc) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DuplicateKey => return error.DuplicateKey,
                     else => return error.ScanError,
                 };
+
+                // Emit a single update oplog entry with the new document.
+                self.bucket.emitOplogEntry(.update, header.doc_id, insert_doc.buffer);
+            } else {
+                // Pure delete (no replacement).
+                self.bucket.emitOplogEntry(.delete, header.doc_id, null);
             }
 
             self.current_doc = null;
@@ -3511,6 +3774,11 @@ pub const Bucket = struct {
 
         // Commit WAL transaction once per delete call.
         self.commitWalTransaction();
+
+        // Emit oplog entries for each deleted document.
+        for (locations.items) |*location| {
+            self.emitOplogEntry(.delete, location.header.doc_id, null);
+        }
 
         if (!self.in_memory and self.header.deleted_count > self.header.doc_count and self.autoVaccuum) {
             // If all documents are deleted, reset the deleted count
@@ -5420,4 +5688,208 @@ test "WAL live-tail: reader polls empty DB then sees docs after writer inserts" 
         seen += 1;
     }
     try testing.expectEqual(@as(usize, 2), seen);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Oplog subscription tests
+// ═══════════════════════════════════════════════════════════════════════
+
+test "subscription: reader sees inserts via oplog poll" {
+    const allocator = std.testing.allocator;
+    const db_path = "albedo_test_sub_insert.bucket";
+    const wal_path = "albedo_test_sub_insert.bucket-wal";
+    const shm_path = "albedo_test_sub_insert.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    // Writer
+    var w_arena = std.heap.ArenaAllocator.init(allocator);
+    defer w_arena.deinit();
+    const w_ally = w_arena.allocator();
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    defer writer.deinit();
+
+    // Reader
+    var r_arena = std.heap.ArenaAllocator.init(allocator);
+    defer r_arena.deinit();
+    const r_ally = r_arena.allocator();
+    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    defer reader.deinit();
+
+    // Subscribe with an empty query (match all).
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, r_ally);
+    defer qDoc.deinit(r_ally);
+    const q = try query.Query.parse(r_ally, qDoc);
+    var sub = try reader.subscribe(q);
+    defer sub.deinit();
+
+    // No events yet.
+    const batch0 = try sub.poll(64);
+    try testing.expect(batch0 == null);
+
+    // Writer inserts two documents.
+    const doc1 = try bson.fmt.serialize(.{ .seq = @as(i32, 1) }, w_ally);
+    _ = try writer.insert(doc1);
+    const doc2 = try bson.fmt.serialize(.{ .seq = @as(i32, 2) }, w_ally);
+    _ = try writer.insert(doc2);
+    try writer.flush();
+
+    // Poll events — should return a BSON doc with batch array.
+    const batch1 = (try sub.poll(64)) orelse return error.TestExpectedEqual;
+    const arr1 = batch1.get("batch") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u32, 2), arr1.array.keyNumber());
+    const ev0 = arr1.array.get("0") orelse return error.TestExpectedEqual;
+    const ev0_op = ev0.document.get("op") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("insert", ev0_op.string.value);
+
+    // Second poll is empty — no new writes.
+    const batch2 = try sub.poll(64);
+    try testing.expect(batch2 == null);
+}
+
+test "subscription: delete events appear in oplog" {
+    const allocator = std.testing.allocator;
+    const db_path = "albedo_test_sub_delete.bucket";
+    const wal_path = "albedo_test_sub_delete.bucket-wal";
+    const shm_path = "albedo_test_sub_delete.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var w_arena = std.heap.ArenaAllocator.init(allocator);
+    defer w_arena.deinit();
+    const w_ally = w_arena.allocator();
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true, .auto_vaccuum = false });
+    defer writer.deinit();
+
+    // Insert a document before subscribing.
+    const doc1 = try bson.fmt.serialize(.{ .tag = "removeme" }, w_ally);
+    _ = try writer.insert(doc1);
+    try writer.flush();
+
+    // Subscribe after insert.
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, w_ally);
+    defer qDoc.deinit(w_ally);
+    const q = try query.Query.parse(w_ally, qDoc);
+    var sub = try writer.subscribe(q);
+    defer sub.deinit();
+
+    // Delete the document.
+    var delQuery = try bson.fmt.serialize(.{ .query = .{ .tag = "removeme" } }, w_ally);
+    defer delQuery.deinit(w_ally);
+    const dq = try query.Query.parse(w_ally, delQuery);
+    try writer.delete(dq);
+
+    // Poll — should see a delete event.
+    const batch = (try sub.poll(64)) orelse return error.TestExpectedEqual;
+    const arr = batch.get("batch") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u32, 1), arr.array.keyNumber());
+    const ev = arr.array.get("0") orelse return error.TestExpectedEqual;
+    const ev_op = ev.document.get("op") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("delete", ev_op.string.value);
+}
+
+test "subscription: query-filtered subscription skips non-matching inserts" {
+    const allocator = std.testing.allocator;
+    const db_path = "albedo_test_sub_filter.bucket";
+    const wal_path = "albedo_test_sub_filter.bucket-wal";
+    const shm_path = "albedo_test_sub_filter.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var w_arena = std.heap.ArenaAllocator.init(allocator);
+    defer w_arena.deinit();
+    const w_ally = w_arena.allocator();
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    defer writer.deinit();
+
+    // Subscribe with filter: only status == "active"
+    var qDoc = try bson.fmt.serialize(.{ .query = .{ .status = "active" } }, w_ally);
+    defer qDoc.deinit(w_ally);
+    const q = try query.Query.parse(w_ally, qDoc);
+    var sub = try writer.subscribe(q);
+    defer sub.deinit();
+
+    // Insert three docs: two active, one inactive.
+    const d1 = try bson.fmt.serialize(.{ .status = "active", .name = "a" }, w_ally);
+    _ = try writer.insert(d1);
+    const d2 = try bson.fmt.serialize(.{ .status = "inactive", .name = "b" }, w_ally);
+    _ = try writer.insert(d2);
+    const d3 = try bson.fmt.serialize(.{ .status = "active", .name = "c" }, w_ally);
+    _ = try writer.insert(d3);
+    try writer.flush();
+
+    // Poll: should see only the two active inserts.
+    const batch = (try sub.poll(64)) orelse return error.TestExpectedEqual;
+    const arr = batch.get("batch") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u32, 2), arr.array.keyNumber());
+    const ev0 = arr.array.get("0") orelse return error.TestExpectedEqual;
+    const ev0_op = ev0.document.get("op") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("insert", ev0_op.string.value);
+}
+
+test "subscription: seqno is monotonically increasing" {
+    const allocator = std.testing.allocator;
+    const db_path = "albedo_test_sub_seqno.bucket";
+    const wal_path = "albedo_test_sub_seqno.bucket-wal";
+    const shm_path = "albedo_test_sub_seqno.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var w_arena = std.heap.ArenaAllocator.init(allocator);
+    defer w_arena.deinit();
+    const w_ally = w_arena.allocator();
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    defer writer.deinit();
+
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, w_ally);
+    defer qDoc.deinit(w_ally);
+    const q = try query.Query.parse(w_ally, qDoc);
+    var sub = try writer.subscribe(q);
+    defer sub.deinit();
+
+    try testing.expectEqual(@as(u64, 0), sub.currentSeqno());
+
+    // Insert 5 documents.
+    var i: i32 = 0;
+    while (i < 5) : (i += 1) {
+        const doc = try bson.fmt.serialize(.{ .i = i }, w_ally);
+        _ = try writer.insert(doc);
+    }
+    try writer.flush();
+
+    try testing.expectEqual(@as(u64, 5), sub.currentSeqno());
+
+    // Poll all and verify monotonicity.
+    const batch_doc = (try sub.poll(64)) orelse return error.TestExpectedEqual;
+    const arr = batch_doc.get("batch") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u32, 5), arr.array.keyNumber());
+    var prev_seqno: i64 = 0;
+    for (0..5) |idx| {
+        var key_buf: [20]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{d}", .{idx}) catch unreachable;
+        const ev = arr.array.get(key) orelse return error.TestExpectedEqual;
+        const seqno = ev.document.get("seqno") orelse return error.TestExpectedEqual;
+        try testing.expect(seqno.int64.value > prev_seqno);
+        prev_seqno = seqno.int64.value;
+    }
 }

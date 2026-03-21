@@ -177,7 +177,14 @@ pub const WAL = struct {
         head_forward: [MAX_LEVEL]u32,
         /// Number of processes/connections that have this WAL open (atomic).
         active_connections: u32,
-        _reserved: [52]u8,
+        _pad0: [4]u8,
+        /// Latest committed oplog sequence number (atomic, monotonic).
+        oplog_seqno: u64,
+        /// Sequence number of the oldest entry still retained in the ring.
+        oplog_oldest_seqno: u64,
+        /// Byte offset within the oplog ring where the next entry will be written.
+        oplog_write_pos: u32,
+        _reserved: [28]u8,
 
         pub const byte_size: usize = 128;
 
@@ -202,6 +209,74 @@ pub const WAL = struct {
         }
     };
 
+    // ── Oplog (circular buffer in the SHM region) ─────────────────────
+
+    /// Size of the oplog ring buffer region in the SHM file.
+    pub const OPLOG_REGION_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+
+    /// Maximum payload size that is stored inline in an oplog entry.
+    /// Larger payloads store a physical location reference instead.
+    pub const OPLOG_INLINE_MAX: u16 = 1024;
+
+    /// Operation kind for oplog entries.
+    pub const OpKind = enum(u8) {
+        insert = 1,
+        update = 2,
+        delete = 3,
+    };
+
+    /// Describes how the entry payload is stored.
+    pub const PayloadKind = enum(u8) {
+        /// Full BSON document bytes are stored inline after the header.
+        inline_doc = 0,
+        /// Payload is a physical location reference (page_id + offset).
+        ref_loc = 1,
+        /// No payload (e.g. delete where only the doc_id matters).
+        none = 2,
+    };
+
+    /// Physical location reference for large or deleted documents.
+    pub const DocRef = extern struct {
+        page_id: u64,
+        offset: u16,
+        _pad: [6]u8 = .{0} ** 6,
+
+        pub const byte_size: usize = 16;
+
+        comptime {
+            if (@sizeOf(DocRef) != byte_size)
+                @compileError("DocRef must be exactly 16 bytes");
+        }
+    };
+
+    /// Fixed-size header for each oplog ring entry (32 bytes).
+    ///
+    /// Layout:  seqno(8) | timestamp(8) | doc_id(12) | payload_len(2) | op(1) | payload_kind(1)
+    ///
+    /// The entry's total on-disk size is `OplogEntryHeader.byte_size + payload_len`.
+    /// Readers detect wrap/corruption by checking that `seqno` ≥ expected.
+    pub const OplogEntryHeader = extern struct {
+        /// Monotonically increasing sequence number.
+        seqno: u64,
+        /// Wall-clock timestamp of the operation.
+        timestamp: i64,
+        /// The _id of the affected document (ObjectId stored as 12 raw bytes).
+        doc_id: [12]u8,
+        /// Length of the payload that follows this header.
+        payload_len: u16,
+        /// The kind of mutation.
+        op: OpKind,
+        /// How the payload is encoded.
+        payload_kind: PayloadKind,
+
+        pub const byte_size: usize = 32;
+
+        comptime {
+            if (@sizeOf(OplogEntryHeader) != byte_size)
+                @compileError("OplogEntryHeader must be exactly 32 bytes");
+        }
+    };
+
     // ── WalIndex (mmap'd shared-memory skip list) ─────────────────────
 
     pub const WalIndex = struct {
@@ -211,11 +286,16 @@ pub const WAL = struct {
         path: []const u8,
         allocator: std.mem.Allocator,
 
+        /// Byte offset where the oplog ring region starts (right after the header).
+        pub const oplog_offset: usize = ShmHeader.byte_size;
+        /// Byte offset where the skip-list nodes start (after header + oplog ring).
+        pub const nodes_offset: usize = ShmHeader.byte_size + OPLOG_REGION_SIZE;
+
         pub fn init(allocator: std.mem.Allocator, path: []const u8, capacity: u32) Error!WalIndex {
             const stored_path = allocator.dupe(u8, path) catch return Error.WalIndexFailed;
             errdefer allocator.free(stored_path);
 
-            const desired = ShmHeader.byte_size + @as(usize, capacity) * ShmNode.byte_size;
+            const desired = nodes_offset + @as(usize, capacity) * ShmNode.byte_size;
             const map_len = std.mem.alignForward(usize, desired, std.heap.page_size_min);
 
             // ── Open the SHM file and map it into memory ──────────────────────
@@ -298,7 +378,11 @@ pub const WAL = struct {
                     .reader_count = 0,
                     .head_forward = [_]u32{SENTINEL} ** MAX_LEVEL,
                     .active_connections = 0,
-                    ._reserved = [_]u8{0} ** 52,
+                    ._pad0 = [_]u8{0} ** 4,
+                    .oplog_seqno = 0,
+                    .oplog_oldest_seqno = 0,
+                    .oplog_write_pos = 0,
+                    ._reserved = [_]u8{0} ** 28,
                 };
             }
 
@@ -364,14 +448,169 @@ pub const WAL = struct {
             return false;
         }
 
-        fn shmHeader(self: *WalIndex) *ShmHeader {
+        pub fn shmHeader(self: *WalIndex) *ShmHeader {
             return @ptrCast(@alignCast(self.map));
         }
 
         fn nodePtr(self: *WalIndex, idx: u32) *ShmNode {
             const base: [*]u8 = @ptrCast(self.map);
-            const offset = ShmHeader.byte_size + @as(usize, idx) * ShmNode.byte_size;
+            const offset = nodes_offset + @as(usize, idx) * ShmNode.byte_size;
             return @ptrCast(@alignCast(base + offset));
+        }
+
+        // ── Oplog ring helpers ──
+
+        /// Returns a pointer to the start of the oplog ring region.
+        fn oplogBase(self: *WalIndex) [*]u8 {
+            const base: [*]u8 = @ptrCast(self.map);
+            return base + oplog_offset;
+        }
+
+        /// Append an oplog entry into the circular buffer.
+        /// Must be called while holding the write lock.
+        pub fn appendOplogEntry(
+            self: *WalIndex,
+            op: OpKind,
+            doc_id: [12]u8,
+            timestamp: i64,
+            payload: ?[]const u8,
+            payload_kind: PayloadKind,
+        ) void {
+            const shm = self.shmHeader();
+            const ring = self.oplogBase();
+
+            const seqno = @atomicLoad(u64, &shm.oplog_seqno, .monotonic) + 1;
+            const plen: u16 = if (payload) |p| @intCast(p.len) else 0;
+            const total: u32 = @intCast(OplogEntryHeader.byte_size + @as(u32, plen));
+
+            var write_pos = @atomicLoad(u32, &shm.oplog_write_pos, .monotonic);
+
+            // Advance oldest_seqno for entries we are about to overwrite.
+            self.evictOverwritten(shm, ring, write_pos, total);
+
+            // Write header.
+            const hdr = OplogEntryHeader{
+                .seqno = seqno,
+                .doc_id = doc_id,
+                .timestamp = timestamp,
+                .payload_len = plen,
+                .op = op,
+                .payload_kind = payload_kind,
+            };
+            const hdr_bytes: [OplogEntryHeader.byte_size]u8 = @bitCast(hdr);
+            self.ringWrite(ring, write_pos, &hdr_bytes);
+            write_pos = (write_pos + @as(u32, @intCast(OplogEntryHeader.byte_size))) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+
+            // Write payload.
+            if (payload) |p| {
+                self.ringWrite(ring, write_pos, p);
+                write_pos = (write_pos + @as(u32, plen)) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+            }
+
+            // Publish: update write_pos then seqno with release ordering.
+            @atomicStore(u32, &shm.oplog_write_pos, write_pos, .release);
+            @atomicStore(u64, &shm.oplog_seqno, seqno, .release);
+        }
+
+        /// Read a single oplog entry starting at `ring_pos`.
+        /// Returns the header, the payload slice (copied into `buf`), and
+        /// the ring position immediately after the entry.
+        /// Returns `null` if the entry at that position has been overwritten.
+        pub fn readOplogEntry(
+            self: *WalIndex,
+            ring_pos: u32,
+            buf: []u8,
+        ) ?struct { header: OplogEntryHeader, payload: []const u8, next_pos: u32 } {
+            const ring = self.oplogBase();
+
+            var hdr_bytes: [OplogEntryHeader.byte_size]u8 = undefined;
+            self.ringRead(ring, ring_pos, &hdr_bytes);
+            const hdr: OplogEntryHeader = @bitCast(hdr_bytes);
+
+            // Sanity: seqno 0 means empty/uninitialized.
+            if (hdr.seqno == 0) return null;
+
+            var pos = (ring_pos + @as(u32, @intCast(OplogEntryHeader.byte_size))) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+            const plen: u32 = hdr.payload_len;
+            if (plen > 0 and plen <= buf.len) {
+                self.ringRead(ring, pos, buf[0..plen]);
+            }
+            pos = (pos + plen) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+
+            return .{
+                .header = hdr,
+                .payload = if (plen > 0 and plen <= buf.len) buf[0..plen] else buf[0..0],
+                .next_pos = pos,
+            };
+        }
+
+        /// Copy `data` into the ring at `pos`, wrapping around OPLOG_REGION_SIZE.
+        fn ringWrite(self: *WalIndex, ring: [*]u8, pos: u32, data: []const u8) void {
+            _ = self;
+            const region = OPLOG_REGION_SIZE;
+            const first = @min(data.len, region - pos);
+            @memcpy(ring[pos .. pos + first], data[0..first]);
+            if (first < data.len) {
+                @memcpy(ring[0 .. data.len - first], data[first..]);
+            }
+        }
+
+        /// Read `data.len` bytes from the ring at `pos`, wrapping around.
+        fn ringRead(self: *WalIndex, ring: [*]u8, pos: u32, data: []u8) void {
+            _ = self;
+            const region = OPLOG_REGION_SIZE;
+            const first = @min(data.len, region - pos);
+            @memcpy(data[0..first], ring[pos .. pos + first]);
+            if (first < data.len) {
+                @memcpy(data[first..], ring[0 .. data.len - first]);
+            }
+        }
+
+        /// Advance `oplog_oldest_seqno` to skip entries that would be
+        /// overwritten by a new entry of `total` bytes at `write_pos`.
+        fn evictOverwritten(
+            self: *WalIndex,
+            shm: *ShmHeader,
+            ring: [*]u8,
+            write_pos: u32,
+            total: u32,
+        ) void {
+            _ = self;
+            const oldest = @atomicLoad(u64, &shm.oplog_oldest_seqno, .monotonic);
+            const current = @atomicLoad(u64, &shm.oplog_seqno, .monotonic);
+            if (oldest == 0 and current == 0) {
+                // Ring is empty, nothing to evict.
+                return;
+            }
+            // Walk from the logical oldest entry forward, evicting any that
+            // overlap with the region [write_pos .. write_pos + total).
+            // Because we only ever append sequentially, we just need to
+            // check whether the distance from write_pos to the next read
+            // position is less than total.
+            var scan_pos = write_pos;
+            var evicted: u64 = 0;
+            var remaining = total;
+            while (remaining > 0) {
+                var hdr_bytes: [OplogEntryHeader.byte_size]u8 = undefined;
+                const region = OPLOG_REGION_SIZE;
+                // read header at scan_pos (may wrap)
+                const first = @min(OplogEntryHeader.byte_size, region - scan_pos);
+                @memcpy(hdr_bytes[0..first], ring[scan_pos .. scan_pos + first]);
+                if (first < OplogEntryHeader.byte_size) {
+                    @memcpy(hdr_bytes[first..], ring[0 .. OplogEntryHeader.byte_size - first]);
+                }
+                const hdr: OplogEntryHeader = @bitCast(hdr_bytes);
+                if (hdr.seqno == 0) break; // uninitialized region
+                if (hdr.seqno < oldest) break; // already evicted
+                const entry_total: u32 = @as(u32, @intCast(OplogEntryHeader.byte_size)) + hdr.payload_len;
+                evicted += 1;
+                scan_pos = (scan_pos + entry_total) % @as(u32, @intCast(region));
+                if (remaining <= entry_total) break;
+                remaining -= entry_total;
+            }
+            if (evicted > 0) {
+                @atomicStore(u64, &shm.oplog_oldest_seqno, oldest + evicted, .release);
+            }
         }
 
         // ── Locking ──

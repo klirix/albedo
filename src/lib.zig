@@ -31,6 +31,8 @@ const Result = enum(u8) {
     DuplicateKey,
     InvalidCursor,
     UnsupportedCursorQuery,
+    /// The subscriber fell behind the oplog ring; must re-subscribe.
+    OplogGap,
 };
 
 fn mapQueryParseError(err: anyerror) Result {
@@ -444,6 +446,76 @@ pub export fn albedo_apply_batch(
         return Result.Error;
     };
 
+    return Result.OK;
+}
+
+const SubscriptionHandle = struct {
+    sub: *Bucket.Subscription,
+};
+
+pub export fn albedo_subscribe(
+    bucket: *Bucket,
+    queryBuffer: [*]u8,
+    outHandle: **SubscriptionHandle,
+) Result {
+    const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
+    const queryBufProper = queryBuffer[0..queryLen];
+
+    var q = Query.parseRaw(ally, queryBufProper) catch |err| return mapQueryParseError(err);
+
+    const sub = bucket.subscribe(q) catch |err| switch (err) {
+        error.WalNotActive => return Result.Error,
+        error.OutOfMemory => {
+            q.deinit(ally);
+            return Result.OutOfMemory;
+        },
+        error.OplogGap => {
+            q.deinit(ally);
+            return Result.Error;
+        },
+    };
+
+    const handle = ally.create(SubscriptionHandle) catch {
+        sub.deinit();
+        return Result.OutOfMemory;
+    };
+    handle.* = .{ .sub = sub };
+    outHandle.* = handle;
+    return Result.OK;
+}
+
+/// Poll the subscription for new change events.
+/// Returns ALBEDO_HAS_DATA with `*out_doc` pointing to a BSON document
+/// `{batch: [...event]}` whose memory is owned by the subscription and
+/// valid until the next poll or close call.
+/// Returns ALBEDO_EOS when there are no new events, or ALBEDO_OPLOG_GAP
+/// when the subscriber has fallen behind the ring buffer.
+pub export fn albedo_subscribe_poll(
+    handle: *SubscriptionHandle,
+    out_doc: *[*]u8,
+    max_events: u32,
+) Result {
+    const maybe_doc = handle.sub.poll(max_events) catch |err| switch (err) {
+        error.OplogGap => return Result.OplogGap,
+        error.WalNotActive => return Result.Error,
+        error.OutOfMemory => return Result.OutOfMemory,
+    };
+    if (maybe_doc) |doc| {
+        out_doc.* = @constCast(doc.buffer.ptr);
+        return Result.HasData;
+    }
+    return Result.EOS;
+}
+
+/// Return the latest committed oplog sequence number.
+pub export fn albedo_subscribe_seqno(handle: *SubscriptionHandle) u64 {
+    return handle.sub.currentSeqno();
+}
+
+/// Close and free a subscription handle.
+pub export fn albedo_subscribe_close(handle: *SubscriptionHandle) Result {
+    handle.sub.deinit();
+    ally.destroy(handle);
     return Result.OK;
 }
 
@@ -1042,4 +1114,172 @@ test "bson fmt tagged union roundtrip" {
         defer parsed.deinit();
         try testing.expectEqual(Mode{ .periodic = 50 }, parsed.value.mode);
     }
+}
+
+// ── Memory-leak tests ────────────────────────────────────────────────────────
+//
+// std.testing.allocator is a GeneralPurposeAllocator that fails the test if
+// any allocation that was created through `ally` is still live when the test
+// exits.  Each test below exercises a distinct cleanup path so that a missing
+// deinit/destroy/free anywhere in the call chain is caught automatically.
+
+test "lib API subscription lifecycle does not leak" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-sub-lifecycle");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
+    defer allocator.free(wal_path);
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+
+    const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
+    defer allocator.free(shm_path);
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    // Subscribe before inserting so only future events are visible.
+    var sub_query = try bson.BSONDocument.fromJSON(allocator, "{}");
+    defer sub_query.deinit(allocator);
+
+    var sub_handle: *SubscriptionHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_subscribe(bucket, @constCast(sub_query.buffer.ptr), &sub_handle));
+
+    // Insert a document AFTER subscribing so the subscription sees it.
+    var doc = try bson.BSONDocument.fromJSON(allocator, "{\"name\":\"Eve\"}");
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+    // Poll — must see a BSON batch with at least one event.
+    var batch_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.HasData, albedo_subscribe_poll(sub_handle, &batch_ptr, 64));
+    const batch_len = std.mem.readInt(u32, batch_ptr[0..4], .little);
+    const batch_doc = bson.BSONDocument.init(batch_ptr[0..batch_len]);
+    const batch_arr = batch_doc.get("batch") orelse return error.TestExpectedEqual;
+    try testing.expect(batch_arr.array.keyNumber() >= 1);
+
+    // A second poll with no new writes must return EOS.
+    try testing.expectEqual(Result.EOS, albedo_subscribe_poll(sub_handle, &batch_ptr, 64));
+
+    // Close frees SubscriptionHandle + internal Subscription + stored Query.
+    try testing.expectEqual(Result.OK, albedo_subscribe_close(sub_handle));
+}
+
+test "lib API subscription idle seqno does not leak" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-sub-seqno");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
+    defer allocator.free(wal_path);
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+
+    const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
+    defer allocator.free(shm_path);
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var sub_query = try bson.BSONDocument.fromJSON(allocator, "{}");
+    defer sub_query.deinit(allocator);
+
+    var sub_handle: *SubscriptionHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_subscribe(bucket, @constCast(sub_query.buffer.ptr), &sub_handle));
+
+    // On a fresh bucket with no inserts, seqno should be 0.
+    try testing.expectEqual(@as(u64, 0), albedo_subscribe_seqno(sub_handle));
+
+    // Poll on an idle bucket must return EOS without any allocation.
+    var batch_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.EOS, albedo_subscribe_poll(sub_handle, &batch_ptr, 64));
+
+    try testing.expectEqual(Result.OK, albedo_subscribe_close(sub_handle));
+}
+
+test "lib API close list handle without exhausting does not leak" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-list-early-close");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    for ([_][]const u8{ "X", "Y", "Z" }) |name| {
+        const json = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\"}}", .{name});
+        defer allocator.free(json);
+        var doc = try bson.BSONDocument.fromJSON(allocator, json);
+        defer doc.deinit(allocator);
+        try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+    }
+
+    var list_query = try bson.BSONDocument.fromJSON(allocator, "{}");
+    defer list_query.deinit(allocator);
+
+    var handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(list_query.buffer.ptr), &handle));
+
+    // Read only the first document, then close early — the arena must still
+    // be fully freed by albedo_close_iterator.
+    var raw_doc_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_data(handle, &raw_doc_ptr));
+
+    try testing.expectEqual(Result.OK, albedo_close_iterator(handle));
+}
+
+test "lib API transform close without apply does not leak" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-transform-early-close");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var doc = try bson.BSONDocument.fromJSON(allocator, "{\"name\":\"Frank\"}");
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+    var transform_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{"query":{"name":"Frank"}}
+    );
+    defer transform_query.deinit(allocator);
+
+    var iterator: *Bucket.TransformIterator = undefined;
+    try testing.expectEqual(Result.OK, albedo_transform(bucket, @constCast(transform_query.buffer.ptr), &iterator));
+
+    // Fetch the current document pointer but skip calling albedo_transform_apply.
+    // albedo_transform_close must release the iterator arena regardless.
+    var current_ptr: [*c]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_transform_data(iterator, &current_ptr));
+
+    try testing.expectEqual(Result.OK, albedo_transform_close(iterator));
 }

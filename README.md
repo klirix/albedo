@@ -91,6 +91,7 @@ albedo_close(db);
 | Indexes | `albedo_ensure_index`, `albedo_drop_index`, `albedo_list_indexes` | B⁺-tree indexes on arbitrary field paths |
 | Maintenance | `albedo_vacuum`, `albedo_flush` | Compact the file or force-sync to disk (`flush` fsyncs the WAL in WAL mode) |
 | Replication | `albedo_set_replication_callback`, `albedo_apply_batch` | Page-level batched sync — see [REPLICATION.md](REPLICATION.md) |
+| Subscriptions | `albedo_subscribe`, `albedo_subscribe_poll`, `albedo_subscribe_close` | Real-time oplog change stream (insert / update / delete events) — requires WAL mode |
 
 See [include/albedo.h](include/albedo.h) for the full C API surface.
 
@@ -150,6 +151,11 @@ alive so other readers can continue using it.
 list iterator, call `albedo_data` / `next()`, and keep polling after `EOS` if
 you want live-tail behavior. In WAL mode the iterator can pick up documents
 written later by another connection.
+
+> **Real-time use case?** If you need low-latency notification of individual
+> inserts, updates, and deletes — rather than a full re-scan — use the
+> [Subscriptions](#subscriptions) API instead. Subscriptions read from the
+> oplog ring and return change events immediately, with no page scanning.
 
 Basic C flow:
 
@@ -237,6 +243,90 @@ Invalidation and resume errors:
 - After `vacuum()`, previously exported cursors are not accepted
 - If the anchor can no longer be found when reopening, resume fails with
   `InvalidCursor` in Zig and `ALBEDO_INVALID_CURSOR` in the C API
+
+---
+
+## Subscriptions
+
+Subscriptions give you a real-time change stream over a WAL-mode bucket.
+Rather than re-scanning pages, a subscription reads from a circular oplog
+ring buffer kept in the WAL shared-memory file. Each entry is a compact
+operation envelope — insert, update, or delete — with the document embedded
+inline when it fits within 1 KB.
+
+**When to prefer subscriptions over streaming queries:**
+
+- You need individual change notifications (insert / update / delete) rather than a document stream.
+- You want to observe changes made by *any* writer, not just the local connection.
+- Polling latency matters more than throughput; the oplog ring is read without any page I/O.
+
+### C API
+
+```c
+// 1. Open a bucket in WAL mode (default on Linux/macOS).
+albedo_bucket *db;
+albedo_open("my.bucket", &db);
+
+// 2. Subscribe. Pass an optional BSON query to receive only matching events.
+//    An empty document {} matches everything.
+albedo_subscription_handle *sub;
+albedo_subscribe(db, query_buf, &sub);
+
+// 3. Poll in a loop. Each successful poll returns a BSON document
+//    {batch: [{seqno, op, doc_id, ts, doc?}, ...]}.
+//    The document is owned by the subscription and valid only until the
+//    next poll or close call.
+uint8_t *batch_doc;
+albedo_result r = albedo_subscribe_poll(sub, &batch_doc, 64);
+if (r == ALBEDO_HAS_DATA) {
+    // batch_doc is a BSON document: {batch: [...events]}.
+    // Parse it with your BSON library of choice.
+    // Lifetime: valid until the next albedo_subscribe_poll() or
+    //           albedo_subscribe_close() call.
+} else if (r == ALBEDO_EOS) {
+    // No new events; sleep briefly and poll again.
+} else if (r == ALBEDO_OPLOG_GAP) {
+    // The subscriber fell too far behind and the ring wrapped.
+    // Close the subscription and re-subscribe to resume.
+    albedo_subscribe_close(sub);
+    albedo_subscribe(db, query_buf, &sub);
+}
+
+// 4. Check the latest committed seqno without polling.
+uint64_t seqno = albedo_subscribe_seqno(sub);
+
+// 5. Clean up.
+albedo_subscribe_close(sub);
+albedo_close(db);
+```
+
+### Change event fields
+
+Each element of the `batch` array is a BSON document with these fields:
+
+| Field | BSON type | Description |
+|-------|-----------|-------------|
+| `seqno` | int64 | Monotonically increasing oplog sequence number |
+| `op` | string | `"insert"`, `"update"`, or `"delete"` |
+| `doc_id` | objectId | Document identifier (same as the BSON `_id` bytes) |
+| `ts` | int64 | Unix nanoseconds when the operation was written |
+| `doc` | document | *(present on insert/update with inline payload ≤ 1 KB)* Full BSON document body |
+
+### Overflow and gap handling
+
+The oplog ring is fixed at 4 MB. If a subscriber polls infrequently and the
+writer is active, the ring may wrap before the subscriber reads all entries.
+When this happens `albedo_subscribe_poll` returns `ALBEDO_OPLOG_GAP`. The
+correct recovery is to close the subscription, optionally perform a one-time
+full scan of the collection to rebuild local state, and then re-subscribe to
+resume from the current tail.
+
+### Filtering
+
+Pass a BSON query document (the same format as `albedo_list`) to
+`albedo_subscribe`. Only insert and update events whose inline document
+matches the query are delivered; delete events without an inline document
+always pass through.
 
 ---
 
