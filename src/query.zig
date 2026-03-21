@@ -1,6 +1,6 @@
 /// queries will be simple
 /// There are filters, sorts, sectoring and projections
-/// filters: $eq, $ne, $lt, $lte, $gt, $gte, $in, $between, $startsWith, $endsWith, $exists, $notExists
+/// filters: $eq, $ne, $lt, $lte, $gt, $gte, $in, $between, $startsWith, $endsWith, $exists, $notExists, $vectorSearch
 /// sorts: $asc, $desc
 /// sectoring: $offset, $limit
 ///
@@ -16,10 +16,11 @@ const std = @import("std");
 const bson = @import("bson.zig");
 const BSONDoc = bson.BSONDocument;
 const Allocator = std.mem.Allocator;
+const algos = @import("./vector_search.zig");
 
 const Path = [][]const u8; // "field.subfield".split('.')
 
-pub const FilterType = enum { eq, ne, lt, lte, gt, gte, in, between, startsWith, endsWith, exists, notExists };
+pub const FilterType = enum { eq, ne, lt, lte, gt, gte, in, between, startsWith, endsWith, exists, notExists, vectorSearch };
 
 pub const PathValuePair = struct {
     path: []const u8,
@@ -45,6 +46,52 @@ test "test parse path" {
     try std.testing.expectEqualSlices(u8, "subfield", path[1]);
 }
 
+const VectorSearchType = enum {
+    cosine,
+    dot,
+    euclidean,
+};
+
+const vectorSearchTypeMap = std.StaticStringMap(VectorSearchType).initComptime(.{
+    .{ "cosine", .cosine },
+    .{ "dot", .dot },
+    .{ "euclidean", .euclidean },
+});
+
+const filterNameMap = std.StaticStringMap(FilterType).initComptime(.{
+    .{ "$eq", .eq },
+    .{ "$ne", .ne },
+    .{ "$lt", .lt },
+    .{ "$lte", .lte },
+    .{ "$gt", .gt },
+    .{ "$gte", .gte },
+    .{ "$in", .in },
+    .{ "$between", .between },
+    .{ "$startsWith", .startsWith },
+    .{ "$endsWith", .endsWith },
+    .{ "$exists", .exists },
+    .{ "$notExists", .notExists },
+    .{ "$vectorSearch", .vectorSearch },
+});
+
+const VectorSearchOperand = union(enum) {
+    gte: f32,
+    lte: f32,
+    gt: f32,
+    lt: f32,
+};
+
+const vectorSearchOperandMap = std.StaticStringMap(std.meta.Tag(VectorSearchOperand)).initComptime(.{
+    .{ "gte", .gte },
+    .{ "lte", .lte },
+    .{ "gt", .gt },
+    .{ "lt", .lt },
+    .{ "$gte", .gte },
+    .{ "$lte", .lte },
+    .{ "$gt", .gt },
+    .{ "$lt", .lt },
+});
+
 pub const Filter = union(FilterType) {
     eq: PathValuePair,
     ne: PathValuePair,
@@ -58,6 +105,12 @@ pub const Filter = union(FilterType) {
     endsWith: PathValuePair,
     exists: PathValuePair,
     notExists: PathValuePair,
+    vectorSearch: struct {
+        path: []const u8,
+        array: []const f32,
+        operand: VectorSearchOperand,
+        type: VectorSearchType,
+    }, // value is expected to be an array of floats representing the vector
 
     pub fn deinit(self: *Filter, ally: Allocator) void {
         switch (self.*) {
@@ -69,6 +122,10 @@ pub const Filter = union(FilterType) {
             },
             .eq, .ne, .lt, .gt, .lte, .gte, .startsWith, .endsWith, .exists, .notExists => |*filter| {
                 ally.free(filter.path);
+            },
+            .vectorSearch => |*filter| {
+                ally.free(filter.path);
+                ally.free(filter.array);
             },
         }
     }
@@ -85,21 +142,15 @@ pub const Filter = union(FilterType) {
         OutOfMemory,
     };
 
+    pub const FilterMatchErrors = error{
+        InvalidVectorType,
+        InvalidVectorByteLength,
+        InvalidVectorDimension,
+        InvalidVectorAlignment,
+        InvalidVectorComputation,
+    };
+
     fn parseDoc(ally: Allocator, doc: bson.BSONDocument) FilterParsingErrors![]Filter {
-        const filterNameMap = comptime std.StaticStringMap(FilterType).initComptime(.{
-            .{ "$eq", .eq },
-            .{ "$ne", .ne },
-            .{ "$lt", .lt },
-            .{ "$lte", .lte },
-            .{ "$gt", .gt },
-            .{ "$gte", .gte },
-            .{ "$in", .in },
-            .{ "$between", .between },
-            .{ "$startsWith", .startsWith },
-            .{ "$endsWith", .endsWith },
-            .{ "$exists", .exists },
-            .{ "$notExists", .notExists },
-        });
         var filters = std.ArrayListUnmanaged(Filter){};
         defer filters.deinit(ally);
 
@@ -122,6 +173,64 @@ pub const Filter = union(FilterType) {
                                 const filter = @unionInit(Filter, @tagName(op), PathValuePair{ .path = path_copy, .value = operand });
 
                                 try filters.append(ally, filter);
+                            },
+                            .vectorSearch => {
+                                if (operand != .document) return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                const path_copy = try ally.dupe(u8, path);
+                                errdefer ally.free(path_copy);
+                                const algo_value = operand.document.get("algo") orelse return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                const algo_str = switch (algo_value) {
+                                    .string => |s| s.value,
+                                    else => return FilterParsingErrors.InvalidQueryOperatorParameter,
+                                };
+                                const search_algo = vectorSearchTypeMap.get(algo_str) orelse return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                const operand_value = operand.document.get("operand") orelse return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                const operand_f32 = switch (operand_value) {
+                                    .document => |operand_doc| blk: {
+                                        var operand_iter = operand_doc.iter();
+                                        const operand_pair = operand_iter.next() orelse return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                        if (operand_iter.next()) |_| return FilterParsingErrors.InvalidQueryOperatorParameter;
+
+                                        const operand_tag = vectorSearchOperandMap.get(operand_pair.key) orelse return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                        const operand_threshold: f32 = switch (operand_pair.value) {
+                                            .double => |d| @floatCast(d.value),
+                                            .int32 => |v| @floatFromInt(v.value),
+                                            .int64 => |v| @floatFromInt(v.value),
+                                            else => return FilterParsingErrors.InvalidQueryOperatorParameter,
+                                        };
+
+                                        break :blk switch (operand_tag) {
+                                            .gte => VectorSearchOperand{ .gte = operand_threshold },
+                                            .lte => VectorSearchOperand{ .lte = operand_threshold },
+                                            .gt => VectorSearchOperand{ .gt = operand_threshold },
+                                            .lt => VectorSearchOperand{ .lt = operand_threshold },
+                                        };
+                                    },
+                                    else => return FilterParsingErrors.InvalidQueryOperatorParameter,
+                                };
+
+                                const vector_value = operand.document.get("vector") orelse return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                const vector_bin: []const f32 = switch (vector_value) {
+                                    .binary => |b| blk: {
+                                        if (b.value.len % @sizeOf(f32) != 0) return FilterParsingErrors.InvalidQueryOperatorParameter;
+                                        const vector_len = b.value.len / @sizeOf(f32);
+                                        const vector_copy = try ally.alloc(f32, vector_len);
+                                        for (0..vector_len) |idx| {
+                                            const start = idx * @sizeOf(f32);
+                                            vector_copy[idx] = std.mem.bytesToValue(f32, b.value[start .. start + @sizeOf(f32)]);
+                                        }
+                                        break :blk vector_copy;
+                                    },
+                                    else => return FilterParsingErrors.InvalidQueryOperatorParameter,
+                                };
+                                errdefer ally.free(vector_bin);
+
+                                try filters.append(ally, .{ .vectorSearch = .{
+                                    .path = path_copy,
+                                    .array = vector_bin,
+                                    .type = search_algo,
+                                    .operand = operand_f32,
+                                } });
                             },
                             .between => {
                                 if (operand != .array) return FilterParsingErrors.InvalidQueryOperatorParameter;
@@ -154,7 +263,7 @@ pub const Filter = union(FilterType) {
         return try parseDoc(ally, doc.document);
     }
 
-    pub fn matchValue(self: *const Filter, valueToMatch: bson.BSONValue) bool {
+    pub fn matchValue(self: *const Filter, valueToMatch: bson.BSONValue) FilterMatchErrors!bool {
         switch (self.*) {
             .eq => |eqFilter| {
                 return valueToMatch.eql(&eqFilter.value);
@@ -201,6 +310,33 @@ pub const Filter = union(FilterType) {
                 if (strValue.len < suffix.len) return false;
                 return std.mem.eql(u8, strValue[strValue.len - suffix.len ..], suffix);
             },
+            .vectorSearch => |vectorFilter| {
+                const vecValueBytes: []const u8 = switch (valueToMatch) {
+                    .binary => |b| b.value,
+                    else => return error.InvalidVectorType,
+                };
+                if (vecValueBytes.len % @sizeOf(f32) != 0) return error.InvalidVectorByteLength;
+                const vec_len = vecValueBytes.len / @sizeOf(f32);
+                if (vec_len != vectorFilter.array.len) return error.InvalidVectorDimension;
+
+                if (@intFromPtr(vecValueBytes.ptr) % @alignOf(f32) != 0) {
+                    return error.InvalidVectorAlignment;
+                }
+                const aligned_bytes: []align(@alignOf(f32)) const u8 = @alignCast(vecValueBytes);
+                const vecValue = std.mem.bytesAsSlice(f32, aligned_bytes);
+                const res = (switch (vectorFilter.type) {
+                    .dot => algos.dot_product(vecValue, vectorFilter.array),
+                    .cosine => algos.cosine_similarity(vecValue, vectorFilter.array),
+                    .euclidean => algos.euclidean_distance(vecValue, vectorFilter.array),
+                }) catch return error.InvalidVectorComputation;
+
+                return switch (vectorFilter.operand) {
+                    .gte => |threshold| res >= threshold,
+                    .lte => |threshold| res <= threshold,
+                    .gt => |threshold| res > threshold,
+                    .lt => |threshold| res < threshold,
+                };
+            },
             .exists => |_| {
                 return true;
             },
@@ -210,17 +346,17 @@ pub const Filter = union(FilterType) {
         }
     }
 
-    pub fn match(self: *const Filter, doc: *const bson.BSONDocument) bool {
+    pub fn match(self: *const Filter, doc: *const bson.BSONDocument) FilterMatchErrors!bool {
         const valueToMatch = switch (self.*) {
             .notExists => |e| blk: {
                 // For notExists, return true if field doesn't exist, false if it exists
                 break :blk doc.getPath(e.path) orelse return true;
             },
-            inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between, .startsWith, .endsWith, .exists => |e| blk: {
+            inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between, .startsWith, .endsWith, .exists, .vectorSearch => |e| blk: {
                 break :blk doc.getPath(e.path) orelse return false;
             },
         };
-        return matchValue(self, valueToMatch);
+        return try matchValue(self, valueToMatch);
     }
 };
 
@@ -314,24 +450,24 @@ test "Filter.matchValue startsWith matches correctly" {
 
     // Test positive cases
     const matchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "hello world" } };
-    try std.testing.expect(filter.matchValue(matchingValue1));
+    try std.testing.expect(try filter.matchValue(matchingValue1));
 
     const matchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "hello" } };
-    try std.testing.expect(filter.matchValue(matchingValue2));
+    try std.testing.expect(try filter.matchValue(matchingValue2));
 
     // Test negative cases
     const nonMatchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "world hello" } };
-    try std.testing.expect(!filter.matchValue(nonMatchingValue1));
+    try std.testing.expect(!(try filter.matchValue(nonMatchingValue1)));
 
     const nonMatchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "hel" } };
-    try std.testing.expect(!filter.matchValue(nonMatchingValue2));
+    try std.testing.expect(!(try filter.matchValue(nonMatchingValue2)));
 
     const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
-    try std.testing.expect(!filter.matchValue(emptyString));
+    try std.testing.expect(!(try filter.matchValue(emptyString)));
 
     // Test non-string value
     const nonStringValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
-    try std.testing.expect(!filter.matchValue(nonStringValue));
+    try std.testing.expect(!(try filter.matchValue(nonStringValue)));
 }
 
 test "Filter.matchValue startsWith with empty prefix" {
@@ -347,10 +483,10 @@ test "Filter.matchValue startsWith with empty prefix" {
 
     // Empty prefix should match any string
     const anyString = bson.BSONValue{ .string = bson.BSONString{ .value = "anything" } };
-    try std.testing.expect(filter.matchValue(anyString));
+    try std.testing.expect(try filter.matchValue(anyString));
 
     const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
-    try std.testing.expect(filter.matchValue(emptyString));
+    try std.testing.expect(try filter.matchValue(emptyString));
 }
 
 test "Filter.parse handles endsWith" {
@@ -385,24 +521,24 @@ test "Filter.matchValue endsWith matches correctly" {
 
     // Test positive cases
     const matchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "document.txt" } };
-    try std.testing.expect(filter.matchValue(matchingValue1));
+    try std.testing.expect(try filter.matchValue(matchingValue1));
 
     const matchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = ".txt" } };
-    try std.testing.expect(filter.matchValue(matchingValue2));
+    try std.testing.expect(try filter.matchValue(matchingValue2));
 
     // Test negative cases
     const nonMatchingValue1 = bson.BSONValue{ .string = bson.BSONString{ .value = "document.pdf" } };
-    try std.testing.expect(!filter.matchValue(nonMatchingValue1));
+    try std.testing.expect(!(try filter.matchValue(nonMatchingValue1)));
 
     const nonMatchingValue2 = bson.BSONValue{ .string = bson.BSONString{ .value = "txt" } };
-    try std.testing.expect(!filter.matchValue(nonMatchingValue2));
+    try std.testing.expect(!(try filter.matchValue(nonMatchingValue2)));
 
     const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
-    try std.testing.expect(!filter.matchValue(emptyString));
+    try std.testing.expect(!(try filter.matchValue(emptyString)));
 
     // Test non-string value
     const nonStringValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
-    try std.testing.expect(!filter.matchValue(nonStringValue));
+    try std.testing.expect(!(try filter.matchValue(nonStringValue)));
 }
 
 test "Filter.matchValue endsWith with empty suffix" {
@@ -418,10 +554,10 @@ test "Filter.matchValue endsWith with empty suffix" {
 
     // Empty suffix should match any string
     const anyString = bson.BSONValue{ .string = bson.BSONString{ .value = "anything" } };
-    try std.testing.expect(filter.matchValue(anyString));
+    try std.testing.expect(try filter.matchValue(anyString));
 
     const emptyString = bson.BSONValue{ .string = bson.BSONString{ .value = "" } };
-    try std.testing.expect(filter.matchValue(emptyString));
+    try std.testing.expect(try filter.matchValue(emptyString));
 }
 
 test "Filter.parse handles exists" {
@@ -455,13 +591,13 @@ test "Filter.matchValue exists always returns true" {
 
     // Exists filter should always return true for any value when field exists
     const stringValue = bson.BSONValue{ .string = bson.BSONString{ .value = "test" } };
-    try std.testing.expect(filter.matchValue(stringValue));
+    try std.testing.expect(try filter.matchValue(stringValue));
 
     const intValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
-    try std.testing.expect(filter.matchValue(intValue));
+    try std.testing.expect(try filter.matchValue(intValue));
 
     const boolValue = bson.BSONValue{ .boolean = .{ .value = false } };
-    try std.testing.expect(filter.matchValue(boolValue));
+    try std.testing.expect(try filter.matchValue(boolValue));
 }
 
 test "Filter.match exists checks field presence in document" {
@@ -479,13 +615,13 @@ test "Filter.match exists checks field presence in document" {
     var docWithField = bson.BSONDocument.initEmpty();
     docWithField = try docWithField.set(ally, "email", bson.BSONValue{ .string = bson.BSONString{ .value = "test@example.com" } });
     defer docWithField.deinit(ally);
-    try std.testing.expect(filter.match(&docWithField));
+    try std.testing.expect(try filter.match(&docWithField));
 
     // Document without the field should not match
     var docWithoutField = bson.BSONDocument.initEmpty();
     docWithoutField = try docWithoutField.set(ally, "name", bson.BSONValue{ .string = bson.BSONString{ .value = "John" } });
     defer docWithoutField.deinit(ally);
-    try std.testing.expect(!filter.match(&docWithoutField));
+    try std.testing.expect(!(try filter.match(&docWithoutField)));
 }
 
 test "Filter.parse handles notExists" {
@@ -519,13 +655,13 @@ test "Filter.matchValue notExists always returns false" {
 
     // notExists filter should always return false when a value exists
     const stringValue = bson.BSONValue{ .string = bson.BSONString{ .value = "test" } };
-    try std.testing.expect(!filter.matchValue(stringValue));
+    try std.testing.expect(!(try filter.matchValue(stringValue)));
 
     const intValue = bson.BSONValue{ .int32 = .{ .value = 42 } };
-    try std.testing.expect(!filter.matchValue(intValue));
+    try std.testing.expect(!(try filter.matchValue(intValue)));
 
     const boolValue = bson.BSONValue{ .boolean = .{ .value = false } };
-    try std.testing.expect(!filter.matchValue(boolValue));
+    try std.testing.expect(!(try filter.matchValue(boolValue)));
 }
 
 test "Filter.match notExists checks field absence in document" {
@@ -543,13 +679,205 @@ test "Filter.match notExists checks field absence in document" {
     var docWithField = bson.BSONDocument.initEmpty();
     docWithField = try docWithField.set(ally, "deletedAt", bson.BSONValue{ .string = bson.BSONString{ .value = "2024-01-01" } });
     defer docWithField.deinit(ally);
-    try std.testing.expect(!filter.match(&docWithField));
+    try std.testing.expect(!(try filter.match(&docWithField)));
 
     // Document without the field should match (returns true when field doesn't exist)
     var docWithoutField = bson.BSONDocument.initEmpty();
     docWithoutField = try docWithoutField.set(ally, "createdAt", bson.BSONValue{ .string = bson.BSONString{ .value = "2024-01-01" } });
     defer docWithoutField.deinit(ally);
-    try std.testing.expect(filter.match(&docWithoutField));
+    try std.testing.expect(try filter.match(&docWithoutField));
+}
+
+fn buildVectorSearchFilterDoc(
+    ally: Allocator,
+    path: []const u8,
+    algo: []const u8,
+    vector_value: bson.BSONValue,
+    operand_pairs: []bson.BSONKeyValuePair,
+) !bson.BSONDocument {
+    const operand_doc = try bson.BSONDocument.fromPairs(ally, operand_pairs);
+    defer operand_doc.deinit(ally);
+
+    var vector_search_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "algo", .value = .{ .string = .{ .value = algo } } },
+        .{ .key = "vector", .value = vector_value },
+        .{ .key = "operand", .value = .{ .document = operand_doc } },
+    };
+    const vector_search_doc = try bson.BSONDocument.fromPairs(ally, vector_search_pairs[0..]);
+    defer vector_search_doc.deinit(ally);
+
+    var operator_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$vectorSearch", .value = .{ .document = vector_search_doc } },
+    };
+    const operator_doc = try bson.BSONDocument.fromPairs(ally, operator_pairs[0..]);
+    defer operator_doc.deinit(ally);
+
+    var filter_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = path, .value = .{ .document = operator_doc } },
+    };
+    return bson.BSONDocument.fromPairs(ally, filter_pairs[0..]);
+}
+
+test "Filter.parse handles vectorSearch" {
+    const ally = std.testing.allocator;
+    const query_vector = [_]f32{ 1.0, 2.0, 3.0 };
+    var operand_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$gte", .value = .{ .double = .{ .value = 0.99 } } },
+    };
+    const filterDoc = try buildVectorSearchFilterDoc(ally, "embedding", "cosine", .{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(query_vector[0..]),
+            .subtype = 0x00,
+        },
+    }, operand_pairs[0..]);
+    defer filterDoc.deinit(ally);
+
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    switch (filters[0]) {
+        .vectorSearch => |vector_filter| {
+            try std.testing.expectEqualStrings("embedding", vector_filter.path);
+            try std.testing.expectEqual(VectorSearchType.cosine, vector_filter.type);
+            try std.testing.expectEqualSlices(f32, query_vector[0..], vector_filter.array);
+            switch (vector_filter.operand) {
+                .gte => |threshold| try std.testing.expectApproxEqAbs(@as(f32, 0.99), threshold, 0.0001),
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test "Filter.matchValue vectorSearch matches with cosine threshold" {
+    const ally = std.testing.allocator;
+    const query_vector = [_]f32{ 1.0, 2.0, 3.0 };
+    var operand_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "$gte", .value = .{ .double = .{ .value = 0.99 } } },
+    };
+    const filterDoc = try buildVectorSearchFilterDoc(ally, "embedding", "cosine", .{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(query_vector[0..]),
+            .subtype = 0x00,
+        },
+    }, operand_pairs[0..]);
+    defer filterDoc.deinit(ally);
+
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+
+    const filter = &filters[0];
+    const same_vector = [_]f32{ 1.0, 2.0, 3.0 };
+    const same_value = bson.BSONValue{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(same_vector[0..]),
+            .subtype = 0x00,
+        },
+    };
+    try std.testing.expect(try filter.matchValue(same_value));
+
+    const short_vector = [_]f32{ 1.0, 2.0 };
+    const short_value = bson.BSONValue{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(short_vector[0..]),
+            .subtype = 0x00,
+        },
+    };
+    try std.testing.expectError(error.InvalidVectorDimension, filter.matchValue(short_value));
+}
+
+test "Filter.matchValue vectorSearch matches with euclidean lt threshold" {
+    const ally = std.testing.allocator;
+    const query_vector = [_]f32{ 0.5, 0.25, 0.125 };
+    var operand_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "lt", .value = .{ .double = .{ .value = 0.00001 } } },
+    };
+    const filterDoc = try buildVectorSearchFilterDoc(ally, "embedding", "euclidean", .{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(query_vector[0..]),
+            .subtype = 0x00,
+        },
+    }, operand_pairs[0..]);
+    defer filterDoc.deinit(ally);
+
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+
+    const filter = &filters[0];
+    const same_value = bson.BSONValue{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(query_vector[0..]),
+            .subtype = 0x00,
+        },
+    };
+    try std.testing.expect(try filter.matchValue(same_value));
+}
+
+test "Filter.parse vectorSearch rejects invalid operand operator" {
+    const ally = std.testing.allocator;
+    const query_vector = [_]f32{ 1.0, 2.0, 3.0 };
+    var operand_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "invalid", .value = .{ .double = .{ .value = 0.5 } } },
+    };
+    const filterDoc = try buildVectorSearchFilterDoc(ally, "embedding", "dot", .{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(query_vector[0..]),
+            .subtype = 0x00,
+        },
+    }, operand_pairs[0..]);
+    defer filterDoc.deinit(ally);
+
+    try std.testing.expectError(
+        error.InvalidQueryOperatorParameter,
+        Filter.parse(ally, bson.BSONValue{ .document = filterDoc }),
+    );
+}
+
+test "Filter.parse vectorSearch rejects multiple operand operators" {
+    const ally = std.testing.allocator;
+    const query_vector = [_]f32{ 1.0, 2.0, 3.0 };
+    var operand_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "gt", .value = .{ .double = .{ .value = 0.3 } } },
+        .{ .key = "lt", .value = .{ .double = .{ .value = 0.9 } } },
+    };
+    const filterDoc = try buildVectorSearchFilterDoc(ally, "embedding", "dot", .{
+        .binary = .{
+            .value = std.mem.sliceAsBytes(query_vector[0..]),
+            .subtype = 0x00,
+        },
+    }, operand_pairs[0..]);
+    defer filterDoc.deinit(ally);
+
+    try std.testing.expectError(
+        error.InvalidQueryOperatorParameter,
+        Filter.parse(ally, bson.BSONValue{ .document = filterDoc }),
+    );
+}
+
+test "Filter.parse vectorSearch rejects non-binary vector" {
+    const ally = std.testing.allocator;
+    var operand_pairs = [_]bson.BSONKeyValuePair{
+        .{ .key = "gte", .value = .{ .double = .{ .value = 0.1 } } },
+    };
+    const filterDoc = try buildVectorSearchFilterDoc(ally, "embedding", "cosine", .{
+        .string = .{ .value = "not-binary" },
+    }, operand_pairs[0..]);
+    defer filterDoc.deinit(ally);
+
+    try std.testing.expectError(
+        error.InvalidQueryOperatorParameter,
+        Filter.parse(ally, bson.BSONValue{ .document = filterDoc }),
+    );
 }
 
 const SortType = enum {
@@ -833,9 +1161,9 @@ pub const Query = struct {
         }
     }
 
-    pub fn match(self: Query, doc: *const bson.BSONDocument) bool {
+    pub fn match(self: Query, doc: *const bson.BSONDocument) Filter.FilterMatchErrors!bool {
         for (self.filters) |filter| {
-            if (!filter.match(doc)) return false;
+            if (!try filter.match(doc)) return false;
         }
         return true;
     }
@@ -1035,7 +1363,7 @@ test "Query.match matches objectId correctly" {
     // queryDoc.serializeToMemory(buffer);
     var query = try Query.parse(ally, queryDoc);
 
-    try std.testing.expect(query.match(&doc));
-    try std.testing.expect(!query.match(&doc2));
+    try std.testing.expect(try query.match(&doc));
+    try std.testing.expect(!(try query.match(&doc2)));
     defer query.deinit(ally);
 }

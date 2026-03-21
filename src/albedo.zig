@@ -2149,7 +2149,8 @@ pub const Bucket = struct {
                 } orelse return null;
 
                 const bsonDoc: BSONDocument = .{ .buffer = doc.data };
-                if (self.query.match(&bsonDoc) and self.offsetLeft == 0) {
+                const matched = self.query.match(&bsonDoc) catch return error.ScanError;
+                if (matched and self.offsetLeft == 0) {
                     if (self.limitLeft != null) self.limitLeft = self.limitLeft.? - 1;
                     return .{
                         .doc = bsonDoc,
@@ -2201,7 +2202,8 @@ pub const Bucket = struct {
                     else => return error.ScanError,
                 };
 
-                if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
+                const matched = if (self.query.filters.len == 0) true else self.query.match(&doc) catch return error.ScanError;
+                if (!matched) {
                     continue;
                 }
 
@@ -2291,7 +2293,8 @@ pub const Bucket = struct {
                     else => return error.ScanError,
                 };
 
-                if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
+                const matched = if (self.query.filters.len == 0) true else self.query.match(&doc) catch return error.ScanError;
+                if (!matched) {
                     // ally.free(doc.buffer);
                     continue;
                 }
@@ -2788,7 +2791,8 @@ pub const Bucket = struct {
                     } orelse break;
                     const docRaw = next_doc;
                     const doc = BSONDocument{ .buffer = docRaw.data };
-                    if (q.filters.len == 0 or q.match(&doc)) {
+                    const matched = if (q.filters.len == 0) true else q.match(&doc) catch return error.ScanError;
+                    if (matched) {
                         try docList.append(ally, doc);
                     } else {
                         ally.free(docRaw.data);
@@ -2843,7 +2847,8 @@ pub const Bucket = struct {
                                 else => return error.ScanError,
                             };
 
-                            if (q.filters.len == 0 or q.match(&doc)) {
+                            const matched = if (q.filters.len == 0) true else q.match(&doc) catch return error.ScanError;
+                            if (matched) {
                                 try docList.append(ally, doc);
                             } else {
                                 ally.free(doc.buffer);
@@ -2866,7 +2871,8 @@ pub const Bucket = struct {
                             error.DocumentDeleted => continue,
                             else => return error.ScanError,
                         };
-                        if (q.filters.len == 0 or q.match(&doc)) {
+                        const matched = if (q.filters.len == 0) true else q.match(&doc) catch return error.ScanError;
+                        if (matched) {
                             try docList.append(ally, doc);
                         } else {
                             ally.free(doc.buffer);
@@ -2992,7 +2998,8 @@ pub const Bucket = struct {
                     } orelse break;
 
                     const doc = BSONDocument{ .buffer = maybe_doc.data };
-                    if (q.filters.len == 0 or q.match(&doc)) {
+                    const matched = if (q.filters.len == 0) true else q.match(&doc) catch return error.ScanError;
+                    if (matched) {
                         try targets.append(ally, .{
                             .page_id = maybe_doc.page_id,
                             .offset = maybe_doc.offset,
@@ -3039,7 +3046,8 @@ pub const Bucket = struct {
                                 else => return error.ScanError,
                             };
 
-                            if (q.filters.len == 0 or q.match(&doc)) {
+                            const matched = if (q.filters.len == 0) true else q.match(&doc) catch return error.ScanError;
+                            if (matched) {
                                 try targets.append(ally, .{
                                     .page_id = loc.pageId,
                                     .offset = loc.offset,
@@ -3065,7 +3073,8 @@ pub const Bucket = struct {
                             else => return error.ScanError,
                         };
 
-                        if (q.filters.len == 0 or q.match(&doc)) {
+                        const matched = if (q.filters.len == 0) true else q.match(&doc) catch return error.ScanError;
+                        if (matched) {
                             try targets.append(ally, .{
                                 .page_id = loc.pageId,
                                 .offset = loc.offset,
@@ -3464,7 +3473,7 @@ pub const Bucket = struct {
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
         while (try iterator.next()) |doc| {
             const deletable: BSONDocument = .{ .buffer = doc.data };
-            const matched = q.match(&deletable);
+            const matched = try q.match(&deletable);
             if (!matched) continue;
             try locations.append(allocator, .{
                 .header = doc.header,

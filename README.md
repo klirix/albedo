@@ -17,11 +17,12 @@ page-based file format, indexes them with B⁺-trees, and exposes a portable
 C ABI so virtually any language can use it as a library — no server process, no
 network round-trips.
 
-**Key properties:**
+**Key features:**
 
 - **Single-file storage** — one `.bucket` file holds documents, indexes, and metadata.
 - **BSON native** — documents are stored and queried in BSON; no intermediate format.
 - **B⁺-tree indexing** — create indexes on any field path, including nested and array fields.
+- **Vector search filters** — query `f32` embedding payloads with cosine, dot-product, or euclidean thresholds.
 - **Write-Ahead Log (WAL)** — enabled by default on Linux/macOS; provides crash recovery, MVCC reads, and cross-process live-tail without blocking writers.
 - **Built-in replication** — page-level dirty tracking with batched sync and automatic retry.
 - **Tunable write durability** — choose between per-write fsync (`.all`), periodic fsync (`.periodic(N)`), or fully manual (`.manual`) to trade safety for throughput.
@@ -93,6 +94,48 @@ albedo_close(db);
 | Replication | `albedo_set_replication_callback`, `albedo_apply_batch` | Page-level batched sync — see [REPLICATION.md](REPLICATION.md) |
 
 See [include/albedo.h](include/albedo.h) for the full C API surface.
+
+---
+
+## Vector Search
+
+Albedo supports `$vectorSearch` as a query filter operator. It compares a
+stored vector field against a query vector and applies a threshold condition.
+
+Supported algorithms:
+
+- `cosine`
+- `dot`
+- `euclidean`
+
+Supported threshold operators inside `operand`:
+
+- `$gte` / `gte`
+- `$lte` / `lte`
+- `$gt` / `gt`
+- `$lt` / `lt`
+
+Query shape:
+
+```bson
+{
+  "query": {
+    "embedding": {
+      "$vectorSearch": {
+        "algo": "cosine",
+        "vector": <BSON binary of f32[]>,
+        "operand": { "$gte": 0.85 }
+      }
+    }
+  }
+}
+```
+
+Important validation rules:
+
+- Payload alignment must be valid for `f32`.
+- Any non-`f32` vector format is rejected.
+- Invalid vector payloads are treated as query errors and are not computed as best-effort fallbacks.
 
 ---
 
