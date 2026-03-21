@@ -364,6 +364,7 @@ pub const Bucket = struct {
     cached_last_data_page: ?*Page = null,
     read_durability: ReadDurability = .shared,
     wal: ?WAL = null,
+    active_tx: ?*Transaction = null,
     /// When true, mutation methods skip oplog emission (used by
     /// TransformIterator to avoid double-emitting for updates).
     _suppress_oplog: bool = false,
@@ -434,6 +435,183 @@ pub const Bucket = struct {
         read_durability: ReadDurability = .shared,
     };
 
+    const IndexRootSnapshot = struct {
+        index: *Index,
+        root_page_id: u64,
+    };
+
+    const DeferredOplogEntry = struct {
+        op: WAL.OpKind,
+        doc_id: u96,
+        payload: ?[]u8 = null,
+
+        fn deinit(self: *DeferredOplogEntry, allocator: std.mem.Allocator) void {
+            if (self.payload) |payload| {
+                allocator.free(payload);
+            }
+            self.payload = null;
+        }
+    };
+
+    pub const Transaction = struct {
+        bucket: *Bucket,
+        pending_pages: std.AutoHashMap(u64, *Page),
+        header_snapshot: BucketHeader,
+        header_dirty: bool = false,
+        cached_last_data_page_snapshot: ?*Page,
+        index_root_snapshots: []IndexRootSnapshot,
+        deferred_oplog: std.ArrayList(DeferredOplogEntry) = .{},
+        open_transforms: usize = 0,
+        active: bool = true,
+
+        pub fn insert(self: *Transaction, insertable: bson.BSONDocument) !DocInsertResult {
+            try self.ensureActive();
+            return self.bucket.insertLocked(insertable, false);
+        }
+
+        pub fn delete(self: *Transaction, q: query.Query) !void {
+            try self.ensureActive();
+            try self.bucket.deleteLocked(q, false);
+        }
+
+        pub fn transformIterate(self: *Transaction, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
+            try self.ensureActive();
+            return self.bucket.transformIterateInternal(arena, q, self);
+        }
+
+        pub fn commit(self: *Transaction) !void {
+            try self.ensureActive();
+            if (self.open_transforms != 0) return error.TransactionBusy;
+
+            var it = self.pending_pages.iterator();
+            while (it.next()) |entry| {
+                const page_id = entry.key_ptr.*;
+                const page = entry.value_ptr.*;
+                if (try self.bucket.pageCache.put(page_id, page)) |evicted| {
+                    if (evicted.header.page_id == page_id) {
+                        evicted.deinit(self.bucket.allocator);
+                        self.bucket.allocator.destroy(evicted);
+                    }
+                }
+                try self.bucket.wal_pending_pages.put(page_id, {});
+                if (self.bucket.replication_callback != null) {
+                    try self.bucket.dirty_pages.put(page_id, {});
+                }
+            }
+
+            if (self.header_dirty) {
+                self.bucket.wal_header_pending = true;
+            }
+
+            self.bucket.commitWalTransaction();
+
+            for (self.deferred_oplog.items) |entry| {
+                self.bucket.emitOplogEntry(entry.op, entry.doc_id, entry.payload);
+            }
+
+            self.finishActiveState();
+        }
+
+        pub fn rollback(self: *Transaction) !void {
+            try self.ensureActive();
+            if (self.open_transforms != 0) return error.TransactionBusy;
+            self.abort(false);
+        }
+
+        pub fn close(self: *Transaction) !void {
+            if (self.active) {
+                try self.rollback();
+            }
+            self.deinit();
+        }
+
+        pub fn deinit(self: *Transaction) void {
+            if (self.active) {
+                self.abort(true);
+            }
+            self.pending_pages.deinit();
+            self.clearDeferredOplog();
+            self.bucket.allocator.free(self.index_root_snapshots);
+            self.bucket.allocator.destroy(self);
+        }
+
+        fn stageOplog(self: *Transaction, op: WAL.OpKind, doc_id: u96, payload: ?[]const u8) !void {
+            const owned_payload = if (payload) |bytes|
+                try self.bucket.allocator.dupe(u8, bytes)
+            else
+                null;
+
+            try self.deferred_oplog.append(self.bucket.allocator, .{
+                .op = op,
+                .doc_id = doc_id,
+                .payload = owned_payload,
+            });
+        }
+
+        fn loadPageForWrite(self: *Transaction, page_id: u64) !*Page {
+            if (self.pending_pages.get(page_id)) |page| {
+                return page;
+            }
+
+            const source_page = try self.bucket.loadPage(page_id);
+            const page = try self.bucket.allocator.create(Page);
+            errdefer self.bucket.allocator.destroy(page);
+            page.* = try Page.init(self.bucket.allocator, self.bucket, source_page.header);
+            @memcpy(page.data, source_page.data);
+            try self.pending_pages.put(page_id, page);
+
+            if (self.bucket.cached_last_data_page) |cached| {
+                if (cached.header.page_id == page_id) {
+                    self.bucket.cached_last_data_page = page;
+                }
+            }
+
+            return page;
+        }
+
+        fn ensureActive(self: *Transaction) !void {
+            if (!self.active or self.bucket.active_tx != self) {
+                return error.InvalidTransaction;
+            }
+        }
+
+        fn finishActiveState(self: *Transaction) void {
+            if (!self.active) return;
+            self.active = false;
+            self.bucket.active_tx = null;
+            self.bucket.rwlock.unlock();
+        }
+
+        fn abort(self: *Transaction, force: bool) void {
+            if (!self.active) return;
+            if (!force and self.open_transforms != 0) return;
+
+            self.bucket.header = self.header_snapshot;
+            self.bucket.cached_last_data_page = self.cached_last_data_page_snapshot;
+            for (self.index_root_snapshots) |snapshot| {
+                snapshot.index.root_page_id = snapshot.root_page_id;
+            }
+
+            var it = self.pending_pages.iterator();
+            while (it.next()) |entry| {
+                const page = entry.value_ptr.*;
+                page.deinit(self.bucket.allocator);
+                self.bucket.allocator.destroy(page);
+            }
+            self.pending_pages.clearRetainingCapacity();
+            self.clearDeferredOplog();
+            self.finishActiveState();
+        }
+
+        fn clearDeferredOplog(self: *Transaction) void {
+            for (self.deferred_oplog.items) |*entry| {
+                entry.deinit(self.bucket.allocator);
+            }
+            self.deferred_oplog.deinit(self.bucket.allocator);
+            self.deferred_oplog = .{};
+        }
+    };
+
     fn loadIndices(self: *Bucket, page: *const Page) !void {
         var reader = std.io.Reader.fixed(page.data);
         while (true) {
@@ -494,7 +672,65 @@ pub const Bucket = struct {
         try self.writePage(meta_page);
     }
 
+    pub fn beginTransaction(self: *Bucket) !*Transaction {
+        if (self.active_tx != null) return error.TransactionActive;
+        self.rwlock.lock();
+        errdefer self.rwlock.unlock();
+        if (self.active_tx != null) return error.TransactionActive;
+
+        var root_snapshots = std.ArrayList(IndexRootSnapshot){};
+        defer root_snapshots.deinit(self.allocator);
+
+        var idx_iter = self.indexes.iterator();
+        while (idx_iter.next()) |entry| {
+            try root_snapshots.append(self.allocator, .{
+                .index = entry.value_ptr.*,
+                .root_page_id = entry.value_ptr.*.root_page_id,
+            });
+        }
+
+        const tx = try self.allocator.create(Transaction);
+        errdefer self.allocator.destroy(tx);
+
+        tx.* = .{
+            .bucket = self,
+            .pending_pages = std.AutoHashMap(u64, *Page).init(self.allocator),
+            .header_snapshot = self.header,
+            .cached_last_data_page_snapshot = self.cached_last_data_page,
+            .index_root_snapshots = try self.allocator.dupe(IndexRootSnapshot, root_snapshots.items),
+        };
+
+        self.active_tx = tx;
+        return tx;
+    }
+
+    inline fn ensureNoActiveTransaction(self: *Bucket) !void {
+        if (self.active_tx != null) {
+            return error.TransactionActive;
+        }
+    }
+
+    inline fn currentTransaction(self: *Bucket) ?*Transaction {
+        return self.active_tx;
+    }
+
+    pub fn loadPageForWrite(self: *Bucket, page_id: u64) !*Page {
+        if (self.active_tx) |tx| {
+            return tx.loadPageForWrite(page_id);
+        }
+        return self.loadPage(page_id);
+    }
+
+    fn stageOplogEntry(self: *Bucket, op: WAL.OpKind, doc_id: u96, payload: ?[]const u8) !void {
+        if (self.active_tx) |tx| {
+            try tx.stageOplog(op, doc_id, payload);
+            return;
+        }
+        self.emitOplogEntry(op, doc_id, payload);
+    }
+
     pub fn ensureIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
+        try self.ensureNoActiveTransaction();
         if (self.indexes.contains(path)) {
             // Index already exists
             return;
@@ -539,6 +775,7 @@ pub const Bucket = struct {
     }
 
     pub fn dropIndex(self: *Bucket, path: []const u8) !void {
+        try self.ensureNoActiveTransaction();
         self.rwlock.lock();
         defer self.rwlock.unlock();
 
@@ -791,6 +1028,11 @@ pub const Bucket = struct {
             return;
         }
 
+        if (self.active_tx) |tx| {
+            tx.header_dirty = true;
+            return;
+        }
+
         // Always defer: commitWalTransaction() will write the final header
         // to either the WAL or the main DB file once per logical transaction.
         // This prevents multiple costly small writes to file offset 0 during
@@ -799,6 +1041,7 @@ pub const Bucket = struct {
     }
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
+        try self.ensureNoActiveTransaction();
         self.rwlock.lock();
         defer {
             self.rwlock.unlock();
@@ -880,6 +1123,12 @@ pub const Bucket = struct {
     // Previous openFile implementation remains the same...
 
     pub fn loadPage(self: *Bucket, page_id: u64) !*Page {
+        if (self.active_tx) |tx| {
+            if (tx.pending_pages.get(page_id)) |page| {
+                return page;
+            }
+        }
+
         if (self.in_memory) {
             if (self.pageCache.get(page_id)) |page| {
                 return page;
@@ -1010,6 +1259,10 @@ pub const Bucket = struct {
 
     pub fn writePage(self: *Bucket, page: *const Page) !void {
         if (self.in_memory) {
+            return;
+        }
+
+        if (self.active_tx != null) {
             return;
         }
 
@@ -1276,6 +1529,7 @@ pub const Bucket = struct {
     /// Force a sync of all pending writes to disk.
     /// Call this when you need guaranteed durability (e.g., after critical operations).
     pub fn flush(self: *Bucket) !void {
+        try self.ensureNoActiveTransaction();
         if (self.in_memory) {
             return;
         }
@@ -1412,6 +1666,10 @@ pub const Bucket = struct {
         try self.flushHeader(); // Ensure the header is flushed to disk
         const page = try self.allocator.create(Page);
         page.* = try Page.init(self.allocator, self, PageHeader.init(page_type, new_page_id));
+        if (self.active_tx) |tx| {
+            try tx.pending_pages.put(new_page_id, page);
+            return page;
+        }
         if (try self.pageCache.put(new_page_id, page)) |evicted| {
             // Don't destroy evicted pages immediately - they may still be referenced
             // by B+ tree Node structures. They will be freed during pageCache.clear()
@@ -1473,6 +1731,14 @@ pub const Bucket = struct {
     fn findLastDataPage(self: *Bucket) !?*Page {
         // Return cached page if still valid (not freed, correct type)
         if (self.cached_last_data_page) |cached| {
+            if (self.active_tx) |tx| {
+                if (tx.pending_pages.get(cached.header.page_id)) |pending| {
+                    if (pending.header.page_type == PageType.Data) {
+                        self.cached_last_data_page = pending;
+                        return pending;
+                    }
+                }
+            }
             if (cached.header.page_type == PageType.Data) {
                 return cached;
             }
@@ -1499,6 +1765,13 @@ pub const Bucket = struct {
     };
 
     pub fn insert(self: *Bucket, insertable: bson.BSONDocument) !DocInsertResult {
+        try self.ensureNoActiveTransaction();
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+        return self.insertLocked(insertable, true);
+    }
+
+    fn insertLocked(self: *Bucket, insertable: bson.BSONDocument, autocommit: bool) !DocInsertResult {
         var doc = insertable;
         const docId = self.objectIdGenerator.next();
         const needCleanup = doc.get("_id") == null;
@@ -1516,11 +1789,6 @@ pub const Bucket = struct {
         const doc_size = doc.buffer.len;
         const encoded_doc = doc.buffer;
         var page: *Page = undefined;
-
-        self.rwlock.lock();
-        defer {
-            self.rwlock.unlock();
-        }
 
         var planned_index_inserts = std.ArrayList(PlannedIndexInsert){};
         defer {
@@ -1578,7 +1846,7 @@ pub const Bucket = struct {
 
         // If no pages exist yet, create one
         if (try findLastDataPage(self)) |p| {
-            page = p;
+            page = try self.loadPageForWrite(p.header.page_id);
         } else {
             page = try self.createNewPage(.Data);
             self.cached_last_data_page = page;
@@ -1666,14 +1934,16 @@ pub const Bucket = struct {
         self.header.doc_count += 1;
         try self.flushHeader();
 
-        // Commit WAL transaction: flush each unique dirty page to WAL once and
-        // optionally fsync. This is the correct place to do it — all in-memory
-        // B+ tree modifications are complete and the page cache holds final state.
-        self.commitWalTransaction();
+        if (autocommit) {
+            // Commit WAL transaction: flush each unique dirty page to WAL once and
+            // optionally fsync. This is the correct place to do it — all in-memory
+            // B+ tree modifications are complete and the page cache holds final state.
+            self.commitWalTransaction();
+        }
 
         // Emit oplog entry for the insert (unless suppressed by transform).
         if (!self._suppress_oplog) {
-            self.emitOplogEntry(.insert, doc_header.doc_id, encoded_doc);
+            try self.stageOplogEntry(.insert, doc_header.doc_id, encoded_doc);
         }
 
         // After writing is done, free the page resources
@@ -3313,6 +3583,7 @@ pub const Bucket = struct {
 
     pub const TransformIterator = struct {
         bucket: *Bucket,
+        tx: ?*Transaction = null,
         arena: *std.heap.ArenaAllocator,
         ally: std.mem.Allocator,
         query: query.Query,
@@ -3427,14 +3698,9 @@ pub const Bucket = struct {
             }
 
             const target = self.targets[self.index];
+            const autocommit = self.tx == null;
 
-            self.bucket.rwlock.lock();
-            var lock_released = false;
-            defer {
-                if (!lock_released) self.bucket.rwlock.unlock();
-            }
-
-            var page = self.bucket.loadPage(target.page_id) catch |err| switch (err) {
+            var page = self.bucket.loadPageForWrite(target.page_id) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.ScanError,
             };
@@ -3473,9 +3739,6 @@ pub const Bucket = struct {
             self.bucket.header.deleted_count += 1;
             self.bucket.flushHeader() catch return error.ScanError;
 
-            self.bucket.rwlock.unlock();
-            lock_released = true;
-
             if (updated) |new_doc_ptr| {
                 var insert_doc = new_doc_ptr.*;
                 var owns_doc = false;
@@ -3495,17 +3758,20 @@ pub const Bucket = struct {
                     self.bucket._suppress_oplog = false;
                 }
 
-                _ = self.bucket.insert(insert_doc) catch |err| switch (err) {
+                _ = self.bucket.insertLocked(insert_doc, autocommit) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DuplicateKey => return error.DuplicateKey,
                     else => return error.ScanError,
                 };
 
                 // Emit a single update oplog entry with the new document.
-                self.bucket.emitOplogEntry(.update, header.doc_id, insert_doc.buffer);
+                self.bucket.stageOplogEntry(.update, header.doc_id, insert_doc.buffer) catch return error.OutOfMemory;
             } else {
                 // Pure delete (no replacement).
-                self.bucket.emitOplogEntry(.delete, header.doc_id, null);
+                if (autocommit) {
+                    self.bucket.commitWalTransaction();
+                }
+                self.bucket.stageOplogEntry(.delete, header.doc_id, null) catch return error.OutOfMemory;
             }
 
             self.current_doc = null;
@@ -3516,7 +3782,11 @@ pub const Bucket = struct {
         pub fn close(self: *TransformIterator) !void {
             const allocator = self.bucket.allocator;
 
-            if (!self.bucket.in_memory and self.bucket.autoVaccuum and self.bucket.header.deleted_count > self.bucket.header.doc_count) {
+            if (self.tx) |tx| {
+                if (tx.open_transforms > 0) {
+                    tx.open_transforms -= 1;
+                }
+            } else if (!self.bucket.in_memory and self.bucket.autoVaccuum and self.bucket.header.deleted_count > self.bucket.header.doc_count) {
                 self.bucket.vacuum() catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.ScanError,
@@ -3533,13 +3803,20 @@ pub const Bucket = struct {
     };
 
     pub fn transformIterate(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
+        try self.ensureNoActiveTransaction();
+        return self.transformIterateInternal(arena, q, null);
+    }
+
+    fn transformIterateInternal(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query, tx: ?*Transaction) !*TransformIterator {
         var plan = self.planQuery(&q);
 
         var target_list = std.ArrayList(DocumentLocation){};
         defer target_list.deinit(arena.allocator());
 
-        self.rwlock.lockShared();
-        defer self.rwlock.unlockShared();
+        if (tx == null) {
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
+        }
         try self.collectTargets(&plan, &q, &target_list, arena);
 
         const raw_len = target_list.items.len;
@@ -3574,6 +3851,7 @@ pub const Bucket = struct {
         errdefer self.allocator.destroy(iter);
         iter.* = .{
             .bucket = self,
+            .tx = tx,
             .arena = arena,
             .ally = arena.allocator(),
             .query = q,
@@ -3583,6 +3861,10 @@ pub const Bucket = struct {
             .current_doc = null,
             .owns_arena = false,
         };
+
+        if (tx) |active_tx| {
+            active_tx.open_transforms += 1;
+        }
 
         return iter;
     }
@@ -3699,13 +3981,18 @@ pub const Bucket = struct {
     }
 
     pub fn delete(self: *Bucket, q: query.Query) !void {
-        // For now, we'll just print the document
+        try self.ensureNoActiveTransaction();
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+        try self.deleteLocked(q, true);
+    }
+
+    fn deleteLocked(self: *Bucket, q: query.Query, autocommit: bool) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         var locations = std.ArrayList(DocumentMeta){};
         var iterator = try ScanIterator.init(self, allocator);
-        self.rwlock.lockShared();
 
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
         while (try iterator.next()) |doc| {
@@ -3718,10 +4005,7 @@ pub const Bucket = struct {
                 .offset = doc.offset,
             });
         }
-        self.rwlock.unlockShared();
-        // std.debug.print("iterator state: {any}\n", .{iterator.offset});
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+
         for (locations.items) |*location| {
             // Read the full document first so we can compute indexed values
             // before tombstoning it.
@@ -3759,7 +4043,7 @@ pub const Bucket = struct {
             }
 
             // Mark the document as deleted on its page (once per doc)
-            var page = try self.loadPage(location.page_id);
+            var page = try self.loadPageForWrite(location.page_id);
             const header_offset = location.offset;
             if (header_offset + DocHeader.byteSize > page.data.len) {
                 return error.PageNotFound;
@@ -3784,21 +4068,24 @@ pub const Bucket = struct {
         self.header.deleted_count += locations.items.len;
         try self.flushHeader();
 
-        // Commit WAL transaction once per delete call.
-        self.commitWalTransaction();
+        if (autocommit) {
+            // Commit WAL transaction once per delete call.
+            self.commitWalTransaction();
+        }
 
         // Emit oplog entries for each deleted document.
         for (locations.items) |*location| {
-            self.emitOplogEntry(.delete, location.header.doc_id, null);
+            try self.stageOplogEntry(.delete, location.header.doc_id, null);
         }
 
-        if (!self.in_memory and self.header.deleted_count > self.header.doc_count and self.autoVaccuum) {
+        if (autocommit and !self.in_memory and self.header.deleted_count > self.header.doc_count and self.autoVaccuum) {
             // If all documents are deleted, reset the deleted count
             try self.vacuum();
         }
     }
 
     pub fn vacuum(self: *Bucket) !void {
+        try self.ensureNoActiveTransaction();
         if (self.in_memory) {
             return;
         }
@@ -3892,6 +4179,10 @@ pub const Bucket = struct {
     }
 
     pub fn deinit(self: *Bucket) void {
+        if (self.active_tx) |tx| {
+            tx.deinit();
+        }
+
         // Flush any pending writes before cleanup
         self.flush() catch {
             // Ignore flush errors during cleanup
@@ -3938,6 +4229,26 @@ pub const Bucket = struct {
 };
 
 const testing = std.testing;
+
+fn testListCount(bucket: *Bucket, allocator: std.mem.Allocator, json: []const u8) !usize {
+    var query_doc = try bson.BSONDocument.fromJSON(allocator, json);
+    defer query_doc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, query_doc);
+    defer q.deinit(allocator);
+
+    var iter_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iter_arena.deinit();
+
+    var iter = try bucket.listIterate(&iter_arena, q);
+    defer iter.deinit() catch {};
+
+    var count: usize = 0;
+    while (try iter.next(iter)) |_| {
+        count += 1;
+    }
+    return count;
+}
 
 test "Bucket.TransformIterator updates document" {
     var bucket_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4072,6 +4383,250 @@ test "Bucket.TransformIterator deletes document when null transform" {
 
     const remaining = try list_iter.next(list_iter);
     try testing.expect(remaining == null);
+}
+
+test "Bucket.Transaction commit keeps writes hidden until commit" {
+    const allocator = std.testing.allocator;
+    const db_path = "transaction_commit_visibility.bucket";
+    const wal_path = "transaction_commit_visibility.bucket-wal";
+    const shm_path = "transaction_commit_visibility.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var writer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer writer_arena.deinit();
+    const w_ally = writer_arena.allocator();
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    defer writer.deinit();
+
+    var reader_arena = std.heap.ArenaAllocator.init(allocator);
+    defer reader_arena.deinit();
+    const r_ally = reader_arena.allocator();
+    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    defer reader.deinit();
+
+    const seed_doc = try bson.fmt.serialize(.{ .name = "seed" }, w_ally);
+    _ = try writer.insert(seed_doc);
+
+    var tx = try writer.beginTransaction();
+    defer tx.close() catch unreachable;
+
+    const staged_doc = try bson.fmt.serialize(.{ .name = "staged" }, w_ally);
+    _ = try tx.insert(staged_doc);
+
+    var delete_query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "seed" } }, w_ally);
+    defer delete_query_doc.deinit(w_ally);
+    var delete_query = try query.Query.parse(w_ally, delete_query_doc);
+    defer delete_query.deinit(w_ally);
+    try tx.delete(delete_query);
+
+    try testing.expectEqual(@as(usize, 1), try testListCount(&reader, r_ally, "{\"query\":{\"name\":\"seed\"}}"));
+    try testing.expectEqual(@as(usize, 0), try testListCount(&reader, r_ally, "{\"query\":{\"name\":\"staged\"}}"));
+
+    try tx.commit();
+
+    try testing.expectEqual(@as(usize, 0), try testListCount(&reader, r_ally, "{\"query\":{\"name\":\"seed\"}}"));
+    try testing.expectEqual(@as(usize, 1), try testListCount(&reader, r_ally, "{\"query\":{\"name\":\"staged\"}}"));
+}
+
+test "Bucket.Transaction rollback restores state" {
+    const allocator = std.testing.allocator;
+    const db_path = "transaction_rollback_restore.bucket";
+    const wal_path = "transaction_rollback_restore.bucket-wal";
+    const shm_path = "transaction_rollback_restore.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ally = arena.allocator();
+
+    var bucket = try Bucket.openFileWithOptions(ally, db_path, .{ .wal = true });
+    defer bucket.deinit();
+
+    const original = try bson.fmt.serialize(.{ .name = "Alice" }, ally);
+    _ = try bucket.insert(original);
+    const snapshot_doc_count = bucket.header.doc_count;
+
+    var tx = try bucket.beginTransaction();
+    defer tx.close() catch unreachable;
+
+    const staged = try bson.fmt.serialize(.{ .name = "Bob" }, ally);
+    _ = try tx.insert(staged);
+
+    var query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "Alice" } }, ally);
+    defer query_doc.deinit(ally);
+    var q = try query.Query.parse(ally, query_doc);
+    defer q.deinit(ally);
+
+    var iter_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iter_arena.deinit();
+    var iter = try tx.transformIterate(&iter_arena, q);
+    try testing.expect((try iter.data()) != null);
+
+    const updated = try bson.fmt.serialize(.{ .name = "Alicia" }, ally);
+    try iter.transform(&updated);
+    try iter.close();
+
+    try tx.rollback();
+
+    try testing.expectEqual(snapshot_doc_count, bucket.header.doc_count);
+    try testing.expectEqual(@as(usize, 1), try testListCount(&bucket, ally, "{\"query\":{\"name\":\"Alice\"}}"));
+    try testing.expectEqual(@as(usize, 0), try testListCount(&bucket, ally, "{\"query\":{\"name\":\"Alicia\"}}"));
+    try testing.expectEqual(@as(usize, 0), try testListCount(&bucket, ally, "{\"query\":{\"name\":\"Bob\"}}"));
+}
+
+test "Bucket.Transaction delays oplog until commit" {
+    const allocator = std.testing.allocator;
+    const db_path = "transaction_oplog_delay.bucket";
+    const wal_path = "transaction_oplog_delay.bucket-wal";
+    const shm_path = "transaction_oplog_delay.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var writer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer writer_arena.deinit();
+    const w_ally = writer_arena.allocator();
+    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    defer writer.deinit();
+
+    var reader_arena = std.heap.ArenaAllocator.init(allocator);
+    defer reader_arena.deinit();
+    const r_ally = reader_arena.allocator();
+    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    defer reader.deinit();
+
+    var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, r_ally);
+    defer qDoc.deinit(r_ally);
+    const q = try query.Query.parse(r_ally, qDoc);
+    var sub = try reader.subscribe(q);
+    defer sub.deinit();
+
+    var tx = try writer.beginTransaction();
+    defer tx.close() catch unreachable;
+
+    const staged = try bson.fmt.serialize(.{ .name = "delayed" }, w_ally);
+    _ = try tx.insert(staged);
+
+    try testing.expect((try sub.poll(64)) == null);
+
+    try tx.commit();
+
+    const batch = (try sub.poll(64)) orelse return error.TestExpectedEqual;
+    const arr = batch.get("batch") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u32, 1), arr.array.keyNumber());
+    const ev0 = arr.array.get("0") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("insert", ev0.document.get("op").?.string.value);
+}
+
+test "Bucket.Transaction reduces WAL frame count" {
+    const allocator = std.testing.allocator;
+    const db_path_a = "transaction_wal_compare_a.bucket";
+    const wal_path_a = "transaction_wal_compare_a.bucket-wal";
+    const shm_path_a = "transaction_wal_compare_a.bucket-wal-shm";
+    const db_path_b = "transaction_wal_compare_b.bucket";
+    const wal_path_b = "transaction_wal_compare_b.bucket-wal";
+    const shm_path_b = "transaction_wal_compare_b.bucket-wal-shm";
+
+    platform.deleteFile(db_path_a) catch {};
+    std.fs.cwd().deleteFile(wal_path_a) catch {};
+    std.fs.cwd().deleteFile(shm_path_a) catch {};
+    platform.deleteFile(db_path_b) catch {};
+    std.fs.cwd().deleteFile(wal_path_b) catch {};
+    std.fs.cwd().deleteFile(shm_path_b) catch {};
+    defer platform.deleteFile(db_path_a) catch {};
+    defer std.fs.cwd().deleteFile(wal_path_a) catch {};
+    defer std.fs.cwd().deleteFile(shm_path_a) catch {};
+    defer platform.deleteFile(db_path_b) catch {};
+    defer std.fs.cwd().deleteFile(wal_path_b) catch {};
+    defer std.fs.cwd().deleteFile(shm_path_b) catch {};
+
+    var arena_a = std.heap.ArenaAllocator.init(allocator);
+    defer arena_a.deinit();
+    const a_ally = arena_a.allocator();
+    var bucket_a = try Bucket.openFileWithOptions(a_ally, db_path_a, .{ .wal = true });
+    defer bucket_a.deinit();
+
+    const doc_a1 = try bson.fmt.serialize(.{ .seq = @as(i32, 1) }, a_ally);
+    const doc_a2 = try bson.fmt.serialize(.{ .seq = @as(i32, 2) }, a_ally);
+    _ = try bucket_a.insert(doc_a1);
+    _ = try bucket_a.insert(doc_a2);
+    const standalone_frames = bucket_a.wal.?.header.frame_count;
+
+    var arena_b = std.heap.ArenaAllocator.init(allocator);
+    defer arena_b.deinit();
+    const b_ally = arena_b.allocator();
+    var bucket_b = try Bucket.openFileWithOptions(b_ally, db_path_b, .{ .wal = true });
+    defer bucket_b.deinit();
+
+    var tx = try bucket_b.beginTransaction();
+    defer tx.close() catch unreachable;
+    const doc_b1 = try bson.fmt.serialize(.{ .seq = @as(i32, 1) }, b_ally);
+    const doc_b2 = try bson.fmt.serialize(.{ .seq = @as(i32, 2) }, b_ally);
+    _ = try tx.insert(doc_b1);
+    _ = try tx.insert(doc_b2);
+    try tx.commit();
+    const transaction_frames = bucket_b.wal.?.header.frame_count;
+
+    try testing.expect(transaction_frames < standalone_frames);
+}
+
+test "Bucket.Transaction guardrails" {
+    const allocator = std.testing.allocator;
+    const db_path = "transaction_guardrails.bucket";
+    const wal_path = "transaction_guardrails.bucket-wal";
+    const shm_path = "transaction_guardrails.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ally = arena.allocator();
+    var bucket = try Bucket.openFileWithOptions(ally, db_path, .{ .wal = true });
+    defer bucket.deinit();
+
+    const base = try bson.fmt.serialize(.{ .name = "guard" }, ally);
+    _ = try bucket.insert(base);
+
+    var tx = try bucket.beginTransaction();
+    defer tx.close() catch unreachable;
+
+    try testing.expectError(error.TransactionActive, bucket.beginTransaction());
+    const blocked = try bson.fmt.serialize(.{ .name = "blocked" }, ally);
+    try testing.expectError(error.TransactionActive, bucket.insert(blocked));
+
+    var query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "guard" } }, ally);
+    defer query_doc.deinit(ally);
+    var q = try query.Query.parse(ally, query_doc);
+    defer q.deinit(ally);
+
+    var iter_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iter_arena.deinit();
+    var iter = try tx.transformIterate(&iter_arena, q);
+    defer iter.close() catch unreachable;
+
+    try testing.expectError(error.TransactionBusy, tx.commit());
+    try testing.expectError(error.TransactionBusy, tx.rollback());
 }
 
 test "Bucket.insert" {

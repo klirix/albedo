@@ -540,7 +540,7 @@ pub const Index = struct {
             self.setLeafNextId(new_page.header.page_id);
 
             if (next_id != 0) {
-                const next_page = try self.index.bucket.loadPage(next_id);
+                const next_page = try self.index.bucket.loadPageForWrite(next_id);
                 var next_node = Node.init(self.index, next_page);
                 next_node.setLeafPrevId(new_page.header.page_id);
                 try self.index.bucket.writePage(next_page);
@@ -622,11 +622,25 @@ pub const Index = struct {
         return Node.init(self, page);
     }
 
+    fn loadWritableNode(self: *Index, page_id: u64) !Node {
+        const page = try self.bucket.loadPageForWrite(page_id);
+        return Node.init(self, page);
+    }
+
     fn descendToLeaf(self: *Index, value: BSONValue) !Node {
         var node = try self.loadNode(self.root_page_id);
         while (!node.isLeaf()) {
             const child_id = try node.internalFindChild(value);
             node = try self.loadNode(child_id);
+        }
+        return node;
+    }
+
+    fn descendToLeafForWrite(self: *Index, value: BSONValue) !Node {
+        var node = try self.loadWritableNode(self.root_page_id);
+        while (!node.isLeaf()) {
+            const child_id = try node.internalFindChild(value);
+            node = try self.loadWritableNode(child_id);
         }
         return node;
     }
@@ -668,7 +682,7 @@ pub const Index = struct {
         }
 
         const child_id = try node.internalFindChild(value);
-        var child_node = try self.loadNode(child_id);
+        var child_node = try self.loadWritableNode(child_id);
         if (try self.insertRecursive(&child_node, value, loc)) |payload| {
             defer payload.deinit(self.allocator);
 
@@ -871,7 +885,7 @@ pub const Index = struct {
                 return error.DuplicateKey;
             }
         }
-        var root_node = try self.loadNode(self.root_page_id);
+        var root_node = try self.loadWritableNode(self.root_page_id);
         if (try self.insertRecursive(&root_node, value, loc)) |payload| {
             defer payload.deinit(self.allocator);
             const new_root_page = try self.bucket.createNewPage(.Index);
@@ -887,7 +901,7 @@ pub const Index = struct {
     }
 
     pub fn delete(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
-        var node = try self.descendToLeaf(value);
+        var node = try self.descendToLeafForWrite(value);
         const start_offset_opt = node.leafFindFirstEqualOffset(value) orelse return;
         var offset = start_offset_opt;
         while (true) {

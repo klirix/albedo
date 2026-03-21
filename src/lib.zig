@@ -33,6 +33,9 @@ const Result = enum(u8) {
     UnsupportedCursorQuery,
     /// The subscriber fell behind the oplog ring; must re-subscribe.
     OplogGap,
+    TransactionActive,
+    InvalidTransaction,
+    TransactionBusy,
 };
 
 fn mapQueryParseError(err: anyerror) Result {
@@ -56,6 +59,28 @@ fn mapListError(err: anyerror) Result {
         error.InvalidCursor => Result.InvalidCursor,
         error.UnsupportedCursorQuery => Result.UnsupportedCursorQuery,
         error.OutOfMemory => Result.OutOfMemory,
+        error.TransactionActive => Result.TransactionActive,
+        else => Result.Error,
+    };
+}
+
+fn mapTransactionError(err: anyerror) Result {
+    return switch (err) {
+        error.OutOfMemory => Result.OutOfMemory,
+        error.TransactionActive => Result.TransactionActive,
+        error.InvalidTransaction => Result.InvalidTransaction,
+        error.TransactionBusy => Result.TransactionBusy,
+        else => Result.Error,
+    };
+}
+
+fn mapWriteError(err: anyerror) Result {
+    return switch (err) {
+        error.OutOfMemory => Result.OutOfMemory,
+        error.DuplicateKey => Result.DuplicateKey,
+        error.TransactionActive => Result.TransactionActive,
+        error.InvalidTransaction => Result.InvalidTransaction,
+        error.TransactionBusy => Result.TransactionBusy,
         else => Result.Error,
     };
 }
@@ -102,18 +127,91 @@ pub export fn albedo_insert(bucket: *albedo.Bucket, docBuffer: [*]u8) Result {
 
     const doc = bson.BSONDocument.init(docBufferProper);
 
-    _ = bucket.insert(doc) catch |err| switch (err) {
-        error.DuplicateKey => {
-            return Result.DuplicateKey;
-        },
-        else => {
-            return Result.Error;
-        },
-    };
+    _ = bucket.insert(doc) catch |err| return mapWriteError(err);
 
     return Result.OK;
-    // Insert the document into the bucket
-    // This is a placeholder for actual insertion logic
+}
+
+pub export fn albedo_transaction_begin(bucket: *Bucket, out: **Bucket.Transaction) Result {
+    const tx = bucket.beginTransaction() catch |err| return mapTransactionError(err);
+    out.* = tx;
+    return Result.OK;
+}
+
+pub export fn albedo_transaction_insert(tx: *Bucket.Transaction, docBuffer: [*]u8) Result {
+    const docSize = std.mem.readInt(u32, docBuffer[0..4], .little);
+    const docBufferProper = docBuffer[0..docSize];
+    const doc = bson.BSONDocument.init(docBufferProper);
+
+    _ = tx.insert(doc) catch |err| return mapWriteError(err);
+    return Result.OK;
+}
+
+pub export fn albedo_transaction_delete(tx: *Bucket.Transaction, queryBuffer: [*]u8, queryLen: u16) Result {
+    var arena = std.heap.ArenaAllocator.init(ally);
+    defer arena.deinit();
+    const local_ally = arena.allocator();
+
+    const docBufferProper = local_ally.dupe(u8, queryBuffer[0..queryLen]) catch {
+        return Result.OutOfMemory;
+    };
+
+    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| switch (err) {
+        Query.QueryParsingErrors.OutOfMemory => return Result.OutOfMemory,
+        else => return Result.Error,
+    };
+    defer query.deinit(local_ally);
+
+    tx.delete(query) catch |err| return mapWriteError(err);
+    return Result.OK;
+}
+
+pub export fn albedo_transaction_transform(
+    tx: *Bucket.Transaction,
+    queryBuffer: [*c]u8,
+    iteratorOut: **Bucket.TransformIterator,
+) Result {
+    const queryLen = std.mem.readInt(u32, queryBuffer[0..4], .little);
+    const queryBufProper = queryBuffer[0..queryLen];
+
+    const arena_ptr = ally.create(std.heap.ArenaAllocator) catch return Result.OutOfMemory;
+    arena_ptr.* = std.heap.ArenaAllocator.init(ally);
+    var arena_owned_by_iterator = false;
+    defer {
+        if (!arena_owned_by_iterator) {
+            arena_ptr.deinit();
+            ally.destroy(arena_ptr);
+        }
+    }
+
+    const query = Query.parseRaw(
+        arena_ptr.allocator(),
+        arena_ptr.allocator().dupe(u8, queryBufProper) catch return Result.OutOfMemory,
+    ) catch |err| switch (err) {
+        Query.QueryParsingErrors.OutOfMemory => return Result.OutOfMemory,
+        else => return Result.Error,
+    };
+
+    const iter = tx.transformIterate(arena_ptr, query) catch |err| return mapWriteError(err);
+    iter.owns_arena = true;
+    arena_owned_by_iterator = true;
+    iteratorOut.* = iter;
+    return Result.OK;
+}
+
+pub export fn albedo_transaction_commit(tx: *Bucket.Transaction) Result {
+    tx.commit() catch |err| return mapTransactionError(err);
+    return Result.OK;
+}
+
+pub export fn albedo_transaction_rollback(tx: *Bucket.Transaction) Result {
+    tx.rollback() catch |err| return mapTransactionError(err);
+    return Result.OK;
+}
+
+pub export fn albedo_transaction_close(tx: *Bucket.Transaction) Result {
+    tx.close() catch |err| return mapTransactionError(err);
+    return Result.OK;
 }
 
 pub export fn albedo_ensure_index(bucket: *albedo.Bucket, path: [*:0]const u8, options_byte: u8) Result {
@@ -128,6 +226,9 @@ pub export fn albedo_ensure_index(bucket: *albedo.Bucket, path: [*:0]const u8, o
     bucket.ensureIndex(path_proper, index_options) catch |err| switch (err) {
         error.OutOfMemory => {
             return Result.OutOfMemory;
+        },
+        error.TransactionActive => {
+            return Result.TransactionActive;
         },
         else => {
             // std.debug.print("Failed to ensure index for path {s}, {any}\n", .{ path_proper, err });
@@ -147,6 +248,9 @@ pub export fn albedo_drop_index(bucket: *albedo.Bucket, path: [*:0]const u8) Res
         },
         error.OutOfMemory => {
             return Result.OutOfMemory;
+        },
+        error.TransactionActive => {
+            return Result.TransactionActive;
         },
         else => {
             // std.debug.print("Failed to drop index for path {s}, {any}\n", .{ path_proper, err });
@@ -235,15 +339,9 @@ pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen
     };
     defer query.deinit(local_ally);
 
-    bucket.delete(query) catch |err| switch (err) {
-        else => {
-            return Result.Error;
-        },
-    };
+    bucket.delete(query) catch |err| return mapWriteError(err);
 
     return Result.OK;
-    // Insert the document into the bucket
-    // This is a placeholder for actual insertion logic
 }
 
 const ListIterator = albedo.Bucket.ListIterator;
@@ -317,17 +415,12 @@ pub export fn albedo_close_iterator(iterator: *ListHandle) Result {
 }
 
 pub export fn albedo_vacuum(bucket: *Bucket) Result {
-    bucket.vacuum() catch {
-        // std.debug.print("Failed to vacuum bucket, {any}", .{err});
-        return Result.Error;
-    };
+    bucket.vacuum() catch |err| return mapTransactionError(err);
     return Result.OK;
 }
 
 pub export fn albedo_flush(bucket: *Bucket) Result {
-    bucket.flush() catch {
-        return Result.Error;
-    };
+    bucket.flush() catch |err| return mapTransactionError(err);
     return Result.OK;
 }
 
@@ -367,11 +460,7 @@ pub export fn albedo_transform(
 
     // Create an arena for the iterator and mark it as owned
 
-    const iter = bucket.transformIterate(arena_ptr, query) catch |err| switch (err) {
-        else => {
-            return Result.Error;
-        },
-    };
+    const iter = bucket.transformIterate(arena_ptr, query) catch |err| return mapWriteError(err);
 
     // Mark the arena as owned by the iterator so it will be cleaned up in close()
     iter.owns_arena = true;
@@ -407,12 +496,7 @@ pub export fn albedo_transform_apply(
         break :blk &bson.BSONDocument.init(transformBufProper);
     } else null;
 
-    iterator.transform(doc) catch |err| switch (err) {
-        else => {
-            // std.debug.print("Failed to transform document, {any}", .{err});
-            return Result.Error;
-        },
-    };
+    iterator.transform(doc) catch |err| return mapWriteError(err);
 
     return Result.OK;
 }
@@ -745,6 +829,195 @@ test "lib API transform updates matching doc" {
         else => return error.TestExpectedEqual,
     };
     try testing.expectEqual(@as(i64, 21), age_num);
+}
+
+test "lib API transaction commit lifecycle" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-transaction-commit");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
+    defer allocator.free(wal_path);
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+
+    const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
+    defer allocator.free(shm_path);
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var writer: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &writer));
+    defer _ = albedo_close(writer);
+
+    var reader: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &reader));
+    defer _ = albedo_close(reader);
+
+    var tx: *Bucket.Transaction = undefined;
+    try testing.expectEqual(Result.OK, albedo_transaction_begin(writer, &tx));
+    var tx_closed = false;
+    defer {
+        if (!tx_closed) _ = albedo_transaction_close(tx);
+    }
+
+    var staged = try bson.BSONDocument.fromJSON(allocator, "{\"name\":\"committed\"}");
+    defer staged.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_transaction_insert(tx, @constCast(staged.buffer.ptr)));
+
+    var list_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": "committed"
+        \\  }
+        \\}
+    );
+    defer list_query.deinit(allocator);
+
+    var before_handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(reader, @constCast(list_query.buffer.ptr), &before_handle));
+    defer _ = albedo_close_iterator(before_handle);
+    var raw_doc_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.EOS, albedo_data(before_handle, &raw_doc_ptr));
+
+    try testing.expectEqual(Result.OK, albedo_transaction_commit(tx));
+    try testing.expectEqual(Result.OK, albedo_transaction_close(tx));
+    tx_closed = true;
+
+    var after_handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(reader, @constCast(list_query.buffer.ptr), &after_handle));
+    defer _ = albedo_close_iterator(after_handle);
+    try testing.expectEqual(Result.OK, albedo_data(after_handle, &raw_doc_ptr));
+}
+
+test "lib API transaction rollback transform" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-transaction-rollback-transform");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
+    defer allocator.free(wal_path);
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+
+    const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
+    defer allocator.free(shm_path);
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var doc = try bson.BSONDocument.fromJSON(allocator, "{\"name\":\"Alice\"}");
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+    var tx: *Bucket.Transaction = undefined;
+    try testing.expectEqual(Result.OK, albedo_transaction_begin(bucket, &tx));
+    var tx_closed = false;
+    defer {
+        if (!tx_closed) _ = albedo_transaction_close(tx);
+    }
+
+    var transform_query = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "query": {
+        \\    "name": "Alice"
+        \\  }
+        \\}
+    );
+    defer transform_query.deinit(allocator);
+
+    var iterator: *Bucket.TransformIterator = undefined;
+    try testing.expectEqual(Result.OK, albedo_transaction_transform(tx, @constCast(transform_query.buffer.ptr), &iterator));
+
+    var current_ptr: [*c]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_transform_data(iterator, &current_ptr));
+
+    var updated = try bson.BSONDocument.fromJSON(allocator, "{\"name\":\"Alicia\"}");
+    defer updated.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_transform_apply(iterator, @constCast(updated.buffer.ptr)));
+    try testing.expectEqual(Result.OK, albedo_transform_close(iterator));
+
+    try testing.expectEqual(Result.OK, albedo_transaction_rollback(tx));
+    try testing.expectEqual(Result.OK, albedo_transaction_close(tx));
+    tx_closed = true;
+
+    var alice_query = try bson.BSONDocument.fromJSON(allocator, "{\"query\":{\"name\":\"Alice\"}}");
+    defer alice_query.deinit(allocator);
+    var alice_handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(alice_query.buffer.ptr), &alice_handle));
+    defer _ = albedo_close_iterator(alice_handle);
+    var listed_ptr: [*]u8 = undefined;
+    try testing.expectEqual(Result.OK, albedo_data(alice_handle, &listed_ptr));
+
+    var alicia_query = try bson.BSONDocument.fromJSON(allocator, "{\"query\":{\"name\":\"Alicia\"}}");
+    defer alicia_query.deinit(allocator);
+    var alicia_handle: *ListHandle = undefined;
+    try testing.expectEqual(Result.OK, albedo_list(bucket, @constCast(alicia_query.buffer.ptr), &alicia_handle));
+    defer _ = albedo_close_iterator(alicia_handle);
+    try testing.expectEqual(Result.EOS, albedo_data(alicia_handle, &listed_ptr));
+}
+
+test "lib API transaction guardrails" {
+    const allocator = testing.allocator;
+    const path = try makeTempPath(allocator, "lib-api-transaction-guardrails");
+    defer allocator.free(path);
+    platform.deleteFile(path) catch {};
+    defer platform.deleteFile(path) catch {};
+
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
+    defer allocator.free(wal_path);
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+
+    const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
+    defer allocator.free(shm_path);
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(path_z.ptr, &bucket));
+    defer _ = albedo_close(bucket);
+
+    var doc = try bson.BSONDocument.fromJSON(allocator, "{\"name\":\"guard\"}");
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(bucket, @constCast(doc.buffer.ptr)));
+
+    var tx: *Bucket.Transaction = undefined;
+    try testing.expectEqual(Result.OK, albedo_transaction_begin(bucket, &tx));
+    defer _ = albedo_transaction_close(tx);
+
+    var second_tx: *Bucket.Transaction = undefined;
+    try testing.expectEqual(Result.TransactionActive, albedo_transaction_begin(bucket, &second_tx));
+
+    var blocked = try bson.BSONDocument.fromJSON(allocator, "{\"name\":\"blocked\"}");
+    defer blocked.deinit(allocator);
+    try testing.expectEqual(Result.TransactionActive, albedo_insert(bucket, @constCast(blocked.buffer.ptr)));
+
+    var transform_query = try bson.BSONDocument.fromJSON(allocator, "{\"query\":{\"name\":\"guard\"}}");
+    defer transform_query.deinit(allocator);
+
+    var iterator: *Bucket.TransformIterator = undefined;
+    try testing.expectEqual(Result.OK, albedo_transaction_transform(tx, @constCast(transform_query.buffer.ptr), &iterator));
+    defer _ = albedo_transform_close(iterator);
+
+    try testing.expectEqual(Result.TransactionBusy, albedo_transaction_commit(tx));
+    try testing.expectEqual(Result.TransactionBusy, albedo_transaction_rollback(tx));
 }
 
 test "lib API returns errors for invalid query payloads" {

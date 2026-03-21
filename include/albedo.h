@@ -11,6 +11,7 @@ typedef struct albedo_bucket albedo_bucket;
 typedef struct albedo_list_handle albedo_list_handle;
 typedef struct albedo_transform_iterator albedo_transform_iterator;
 typedef struct albedo_subscription_handle albedo_subscription_handle;
+typedef struct albedo_transaction albedo_transaction;
 
 typedef enum albedo_result {
   ALBEDO_OK = 0,
@@ -25,6 +26,9 @@ typedef enum albedo_result {
   ALBEDO_INVALID_CURSOR = 9,
   ALBEDO_UNSUPPORTED_CURSOR_QUERY = 10,
   ALBEDO_OPLOG_GAP = 11,
+  ALBEDO_TRANSACTION_ACTIVE = 12,
+  ALBEDO_INVALID_TRANSACTION = 13,
+  ALBEDO_TRANSACTION_BUSY = 14,
 } albedo_result;
 
 typedef enum albedo_op_kind {
@@ -50,6 +54,16 @@ albedo_result albedo_open_with_options(char *path, uint8_t *options_buffer, albe
 albedo_result albedo_close(albedo_bucket *bucket);
 
 albedo_result albedo_insert(albedo_bucket *bucket, uint8_t *doc_buffer);
+albedo_result albedo_transaction_begin(albedo_bucket *bucket, albedo_transaction **out);
+albedo_result albedo_transaction_insert(albedo_transaction *tx, uint8_t *doc_buffer);
+albedo_result albedo_transaction_delete(albedo_transaction *tx, uint8_t *query_buffer, uint16_t query_len);
+albedo_result albedo_transaction_transform(
+    albedo_transaction *tx,
+    uint8_t *query_buffer,
+    albedo_transform_iterator **iterator_out);
+albedo_result albedo_transaction_commit(albedo_transaction *tx);
+albedo_result albedo_transaction_rollback(albedo_transaction *tx);
+albedo_result albedo_transaction_close(albedo_transaction *tx);
 albedo_result albedo_ensure_index(albedo_bucket *bucket, const char *path, uint8_t options_byte);
 albedo_result albedo_drop_index(albedo_bucket *bucket, const char *path);
 albedo_result albedo_list_indexes(albedo_bucket *bucket, uint8_t **out_doc);
