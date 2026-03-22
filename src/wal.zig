@@ -184,7 +184,12 @@ pub const WAL = struct {
         oplog_oldest_seqno: u64,
         /// Byte offset within the oplog ring where the next entry will be written.
         oplog_write_pos: u32,
-        _reserved: [28]u8,
+        /// Size of the oplog ring buffer region in bytes.
+        /// 0 means the oplog is disabled (also used by older SHM files that pre-date
+        /// this field — the reserved bytes were zero, so 0 acts as a "legacy/unset"
+        /// sentinel and enables seamless migration).
+        oplog_size: u32,
+        _reserved: [24]u8,
 
         pub const byte_size: usize = 128;
 
@@ -212,7 +217,7 @@ pub const WAL = struct {
     // ── Oplog (circular buffer in the SHM region) ─────────────────────
 
     /// Size of the oplog ring buffer region in the SHM file.
-    pub const OPLOG_REGION_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+    pub const DEFAULT_OPLOG_REGION_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
     /// Maximum payload size that is stored inline in an oplog entry.
     /// Larger payloads store a physical location reference instead.
@@ -292,17 +297,23 @@ pub const WAL = struct {
         map_len: usize,
         path: []const u8,
         allocator: std.mem.Allocator,
+        /// Configured oplog ring size in bytes (0 = disabled).
+        oplog_size: u32,
 
         /// Byte offset where the oplog ring region starts (right after the header).
         pub const oplog_offset: usize = ShmHeader.byte_size;
-        /// Byte offset where the skip-list nodes start (after header + oplog ring).
-        pub const nodes_offset: usize = ShmHeader.byte_size + OPLOG_REGION_SIZE;
 
-        pub fn init(allocator: std.mem.Allocator, path: []const u8, capacity: u32) Error!WalIndex {
+        /// Byte offset where the skip-list nodes start, computed from the
+        /// configured oplog size.
+        pub inline fn nodesOffset(self: *const WalIndex) usize {
+            return ShmHeader.byte_size + self.oplog_size;
+        }
+
+        pub fn init(allocator: std.mem.Allocator, path: []const u8, capacity: u32, oplog_size: u32) Error!WalIndex {
             const stored_path = allocator.dupe(u8, path) catch return Error.WalIndexFailed;
             errdefer allocator.free(stored_path);
 
-            const desired = nodes_offset + @as(usize, capacity) * ShmNode.byte_size;
+            const desired = ShmHeader.byte_size + @as(usize, oplog_size) + @as(usize, capacity) * ShmNode.byte_size;
             const map_len = std.mem.alignForward(usize, desired, std.heap.page_size_min);
 
             // ── Open the SHM file and map it into memory ──────────────────────
@@ -369,11 +380,13 @@ pub const WAL = struct {
                 .map_len = map_len,
                 .path = stored_path,
                 .allocator = allocator,
+                .oplog_size = oplog_size,
             };
 
-            // If this is a fresh or stale file, initialize the header.
+            // Validate or initialize the SHM header.
             const shm = idx.shmHeader();
             if (!std.mem.eql(u8, &shm.magic, &.{ 'W', 'A', 'L', 'I' })) {
+                // Fresh or stale (bad magic) file — initialize from scratch.
                 shm.* = .{
                     .magic = .{ 'W', 'A', 'L', 'I' },
                     .version = 1,
@@ -389,9 +402,36 @@ pub const WAL = struct {
                     .oplog_seqno = 0,
                     .oplog_oldest_seqno = 0,
                     .oplog_write_pos = 0,
-                    ._reserved = [_]u8{0} ** 28,
+                    .oplog_size = oplog_size,
+                    ._reserved = [_]u8{0} ** 24,
                 };
+            } else if (shm.oplog_size == 0) {
+                // Older SHM format (oplog_size field was in _reserved and zeroed).
+                // Treat as legacy: reinitialize so the new oplog_size takes effect.
+                // The skip-list index will be rebuilt from WAL frames by the caller.
+                shm.* = .{
+                    .magic = .{ 'W', 'A', 'L', 'I' },
+                    .version = 1,
+                    .max_level = MAX_LEVEL,
+                    .current_level = 0,
+                    .entry_count = 0,
+                    .capacity = capacity,
+                    .write_lock = 0,
+                    .reader_count = 0,
+                    .head_forward = [_]u32{SENTINEL} ** MAX_LEVEL,
+                    .active_connections = 0,
+                    ._pad0 = [_]u8{0} ** 4,
+                    .oplog_seqno = 0,
+                    .oplog_oldest_seqno = 0,
+                    .oplog_write_pos = 0,
+                    .oplog_size = oplog_size,
+                    ._reserved = [_]u8{0} ** 24,
+                };
+            } else if (shm.oplog_size != oplog_size) {
+                // Explicit mismatch: the SHM was created with a different oplog size.
+                return Error.WalOplogSizeMismatch;
             }
+            // else: shm.oplog_size == oplog_size — existing SHM is compatible.
 
             // Register this connection.
             _ = @atomicRmw(u32, &shm.active_connections, .Add, @as(u32, 1), .release);
@@ -461,7 +501,7 @@ pub const WAL = struct {
 
         fn nodePtr(self: *WalIndex, idx: u32) *ShmNode {
             const base: [*]u8 = @ptrCast(self.map);
-            const offset = nodes_offset + @as(usize, idx) * ShmNode.byte_size;
+            const offset = self.nodesOffset() + @as(usize, idx) * ShmNode.byte_size;
             return @ptrCast(@alignCast(base + offset));
         }
 
@@ -483,8 +523,12 @@ pub const WAL = struct {
             payload: ?[]const u8,
             payload_kind: PayloadKind,
         ) void {
+            // Oplog is disabled for this bucket; silently skip.
+            if (self.oplog_size == 0) return;
+
             const shm = self.shmHeader();
             const ring = self.oplogBase();
+            const region = @as(u32, self.oplog_size);
 
             // Write lock is held — plain read/write is safe and preserves full u64 precision.
             const seqno: u64 = shm.oplog_seqno + 1;
@@ -507,12 +551,12 @@ pub const WAL = struct {
             };
             const hdr_bytes: [OplogEntryHeader.byte_size]u8 = @bitCast(hdr);
             self.ringWrite(ring, write_pos, &hdr_bytes);
-            write_pos = (write_pos + @as(u32, @intCast(OplogEntryHeader.byte_size))) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+            write_pos = (write_pos + @as(u32, @intCast(OplogEntryHeader.byte_size))) % region;
 
             // Write payload.
             if (payload) |p| {
                 self.ringWrite(ring, write_pos, p);
-                write_pos = (write_pos + @as(u32, plen)) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+                write_pos = (write_pos + @as(u32, plen)) % region;
             }
 
             // Publish: write_pos → seqno → oldest_seqno, all with release
@@ -535,7 +579,9 @@ pub const WAL = struct {
             ring_pos: u32,
             buf: []u8,
         ) ?struct { header: OplogEntryHeader, payload: []const u8, next_pos: u32 } {
+            if (self.oplog_size == 0) return null;
             const ring = self.oplogBase();
+            const region = @as(u32, self.oplog_size);
 
             var hdr_bytes: [OplogEntryHeader.byte_size]u8 = undefined;
             self.ringRead(ring, ring_pos, &hdr_bytes);
@@ -544,12 +590,12 @@ pub const WAL = struct {
             // Sanity: seqno 0 means empty/uninitialized.
             if (hdr.seqno == 0) return null;
 
-            var pos = (ring_pos + @as(u32, @intCast(OplogEntryHeader.byte_size))) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+            var pos = (ring_pos + @as(u32, @intCast(OplogEntryHeader.byte_size))) % region;
             const plen: u32 = hdr.payload_len;
             if (plen > 0 and plen <= buf.len) {
                 self.ringRead(ring, pos, buf[0..plen]);
             }
-            pos = (pos + plen) % @as(u32, @intCast(OPLOG_REGION_SIZE));
+            pos = (pos + plen) % region;
 
             return .{
                 .header = hdr,
@@ -558,10 +604,9 @@ pub const WAL = struct {
             };
         }
 
-        /// Copy `data` into the ring at `pos`, wrapping around OPLOG_REGION_SIZE.
+        /// Copy `data` into the ring at `pos`, wrapping around oplog_size.
         fn ringWrite(self: *WalIndex, ring: [*]u8, pos: u32, data: []const u8) void {
-            _ = self;
-            const region = OPLOG_REGION_SIZE;
+            const region = self.oplog_size;
             const first = @min(data.len, region - pos);
             @memcpy(ring[pos .. pos + first], data[0..first]);
             if (first < data.len) {
@@ -571,8 +616,7 @@ pub const WAL = struct {
 
         /// Read `data.len` bytes from the ring at `pos`, wrapping around.
         fn ringRead(self: *WalIndex, ring: [*]u8, pos: u32, data: []u8) void {
-            _ = self;
-            const region = OPLOG_REGION_SIZE;
+            const region = self.oplog_size;
             const first = @min(data.len, region - pos);
             @memcpy(data[0..first], ring[pos .. pos + first]);
             if (first < data.len) {
@@ -592,7 +636,6 @@ pub const WAL = struct {
             write_pos: u32,
             total: u32,
         ) u64 {
-            _ = self;
             // Write lock is held — plain reads give full u64 values.
             const oldest: u64 = shm.oplog_oldest_seqno;
             const current: u64 = shm.oplog_seqno;
@@ -608,9 +651,9 @@ pub const WAL = struct {
             var scan_pos = write_pos;
             var evicted: u64 = 0;
             var remaining = total;
+            const region = @as(u32, self.oplog_size);
             while (remaining > 0) {
                 var hdr_bytes: [OplogEntryHeader.byte_size]u8 = undefined;
-                const region = OPLOG_REGION_SIZE;
                 // read header at scan_pos (may wrap)
                 const first = @min(OplogEntryHeader.byte_size, region - scan_pos);
                 @memcpy(hdr_bytes[0..first], ring[scan_pos .. scan_pos + first]);
@@ -622,7 +665,7 @@ pub const WAL = struct {
                 if (hdr.seqno < oldest) break; // already evicted
                 const entry_total: u32 = @as(u32, @intCast(OplogEntryHeader.byte_size)) + hdr.payload_len;
                 evicted += 1;
-                scan_pos = (scan_pos + entry_total) % @as(u32, @intCast(region));
+                scan_pos = (scan_pos + entry_total) % region;
                 if (remaining <= entry_total) break;
                 remaining -= entry_total;
             }
@@ -784,6 +827,10 @@ pub const WAL = struct {
         WalRecoveryFailed,
         WalIndexFailed,
         WalPageNotFound,
+        /// The oplog_size stored in the SHM file does not match the value
+        /// requested when opening this WAL.  Either re-open with the
+        /// matching size or delete the stale SHM file and retry.
+        WalOplogSizeMismatch,
     };
 
     // ── WAL state ─────────────────────────────────────────────────────
@@ -806,8 +853,13 @@ pub const WAL = struct {
 
     /// Open (or create) a WAL file at `path`.
     /// An accompanying `<path>-shm` file is created for the mmap'd page index.
+    /// `oplog_size` controls the circular oplog ring buffer: pass 0 to disable
+    /// the oplog, or any non-zero value for a custom ring size (use
+    /// WAL.DEFAULT_OPLOG_REGION_SIZE` for the default 4 MiB).  If an existing SHM file
+    /// was created with a different non-zero size the call returns
+    /// `Error.WalOplogSizeMismatch`.
     /// Supported on POSIX (Linux / macOS) and Windows.
-    pub fn init(allocator: std.mem.Allocator, path: []const u8) Error!WAL {
+    pub fn init(allocator: std.mem.Allocator, path: []const u8, oplog_size: u32) Error!WAL {
         const stored_path = allocator.dupe(u8, path) catch return Error.WalOpenFailed;
         errdefer allocator.free(stored_path);
 
@@ -853,7 +905,7 @@ pub const WAL = struct {
         @memcpy(shm_path[0..path.len], path);
         @memcpy(shm_path[path.len..], "-shm");
 
-        var wal_index = try WalIndex.init(allocator, shm_path, DEFAULT_INDEX_CAPACITY);
+        var wal_index = try WalIndex.init(allocator, shm_path, DEFAULT_INDEX_CAPACITY, oplog_size);
         errdefer wal_index.deinit();
 
         var wal = WAL{
@@ -1314,7 +1366,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- create & write two frames --
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1331,7 +1383,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- reopen and verify frames survive --
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         try std.testing.expectEqual(wal.header.frame_count, 2);
@@ -1356,7 +1408,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- after checkpoint the WAL is empty --
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
         try std.testing.expectEqual(wal.header.frame_count, 0);
     }
@@ -1378,7 +1430,7 @@ test "WAL corrupted magic is rejected on open" {
         try file.writeAll(&bytes);
     }
 
-    const result = WAL.init(allocator, path);
+    const result = WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     try std.testing.expectError(error.WalCorrupted, result);
 }
 
@@ -1389,7 +1441,7 @@ test "WAL sequence numbers increment correctly" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     try std.testing.expectEqual(wal.next_seq, 1);
@@ -1419,7 +1471,7 @@ test "WAL same page can be written multiple times" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1438,7 +1490,7 @@ test "WAL same page can be written multiple times" {
     }
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1466,7 +1518,7 @@ test "WAL checkpoint then append starts fresh sequence" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1502,7 +1554,7 @@ test "WAL checksum validates page data integrity" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1520,7 +1572,7 @@ test "WAL checksum validates page data integrity" {
     }
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1539,7 +1591,7 @@ test "WAL many frames stress test" {
     const num_frames: u64 = 64;
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1552,7 +1604,7 @@ test "WAL many frames stress test" {
     }
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         try std.testing.expectEqual(wal.header.frame_count, num_frames);
@@ -1576,7 +1628,7 @@ test "WAL empty iterator returns null immediately" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     var it = wal.frames();
@@ -1591,7 +1643,7 @@ test "WAL file size matches expected layout" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1624,14 +1676,14 @@ test "WAL page data is preserved byte-for-byte" {
     }
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
         try wal.appendPage(42, &original, 1000);
         try wal.sync();
     }
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1650,7 +1702,7 @@ test "WAL latest_committed_tx updates on sync" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     try std.testing.expectEqual(wal.latest_committed_tx, 0);
@@ -1681,7 +1733,7 @@ test "WAL latest_committed_tx persists across reopen" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1691,7 +1743,7 @@ test "WAL latest_committed_tx persists across reopen" {
     }
 
     {
-        var wal = try WAL.init(allocator, path);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         defer wal.deinit();
         try std.testing.expectEqual(wal.latest_committed_tx, 500);
     }
@@ -1706,7 +1758,7 @@ test "WAL page_data returns correct data" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1726,7 +1778,7 @@ test "WAL page_data returns WalPageNotFound for missing page" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     const result = wal.page_data(99, 1000);
@@ -1740,7 +1792,7 @@ test "WAL page_data MVCC returns latest version <= max_tx" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1787,7 +1839,7 @@ test "WAL page_data with multiple pages and MVCC" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1831,7 +1883,7 @@ test "WAL page_data after checkpoint returns not found" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1858,7 +1910,7 @@ test "WalIndex insert and lookup" {
     std.fs.cwd().deleteFile(path) catch {};
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    var idx = try WAL.WalIndex.init(allocator, path, 256);
+    var idx = try WAL.WalIndex.init(allocator, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer idx.deinit();
 
     idx.acquireWrite();
@@ -1890,7 +1942,7 @@ test "WalIndex clear resets state" {
     std.fs.cwd().deleteFile(path) catch {};
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    var idx = try WAL.WalIndex.init(allocator, path, 256);
+    var idx = try WAL.WalIndex.init(allocator, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer idx.deinit();
 
     idx.acquireWrite();
@@ -1916,7 +1968,7 @@ test "WalIndex many entries" {
     std.fs.cwd().deleteFile(path) catch {};
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    var idx = try WAL.WalIndex.init(allocator, path, 4096);
+    var idx = try WAL.WalIndex.init(allocator, path, 4096, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer idx.deinit();
 
     idx.acquireWrite();
@@ -1946,7 +1998,7 @@ test "consumeAndClose deletes WAL and SHM files" {
 
     // Create a WAL, write a frame, then consume and close.
     {
-        var w = try WAL.init(allocator, wal_path);
+        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         @memset(&page_buf, 0xAB);
         try w.appendPage(1, &page_buf, 100);
@@ -1974,7 +2026,7 @@ test "WalIndex.deleteFile removes file when no readers" {
     const path = "albedo_test_walindex_delete.shm";
     std.fs.cwd().deleteFile(path) catch {};
 
-    var idx = try WAL.WalIndex.init(allocator, path, 256);
+    var idx = try WAL.WalIndex.init(allocator, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
 
     // File must exist.
     _ = std.fs.cwd().statFile(path) catch unreachable;
@@ -1996,7 +2048,7 @@ test "deinit does not delete WAL files" {
     defer cleanupTestFiles(wal_path, shm_path);
 
     {
-        var w = try WAL.init(allocator, wal_path);
+        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         @memset(&page_buf, 0xCD);
         try w.appendPage(1, &page_buf, 200);
@@ -2017,14 +2069,14 @@ test "consumeAndClose preserves files when another connection is active" {
     defer cleanupTestFiles(wal_path, shm_path);
 
     // Open first WAL and write a frame.
-    var w1 = try WAL.init(allocator, wal_path);
+    var w1 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
     @memset(&page_buf, 0xAB);
     try w1.appendPage(1, &page_buf, 100);
     try w1.sync();
 
     // Open a second connection to the same WAL.
-    var w2 = try WAL.init(allocator, wal_path);
+    var w2 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
 
     // Two connections should be registered.
     try std.testing.expectEqual(@as(u32, 2), w1.index.activeConnections());

@@ -288,6 +288,10 @@ const BucketInitErrors = error{
     InitializationError,
     OutOfMemory,
     UnexpectedError,
+    /// The oplog_size in OpenBucketOptions does not match the size stored in
+    /// the existing SHM file.  Open the bucket with the matching oplog_size
+    /// or delete the stale `<path>-wal-shm` file and retry.
+    OplogSizeMismatch,
 };
 
 /// Callback function type for page replication
@@ -424,6 +428,13 @@ pub const Bucket = struct {
         /// When false, pages are written directly to the main DB file
         /// (simpler but no cross-process MVCC or crash safety).
         wal: bool = true,
+        /// Size of the oplog circular ring buffer in bytes.
+        /// 0 disables the oplog entirely.
+        /// Must match the value used when the SHM file was first created;
+        /// a mismatch will cause `openFileWithOptions` to return an error.
+        /// Older SHM files (where this field was in reserved storage and
+        /// therefore zero) will be seamlessly re-initialized with this value.
+        oplog_size: u32 = WAL.DEFAULT_OPLOG_REGION_SIZE,
         /// Controls when fsync is called.
         ///  - .all        — fsync every write (safest, slowest)
         ///  - .periodic(N) — fsync every N page writes
@@ -854,7 +865,7 @@ pub const Bucket = struct {
         if (bucket.file) |*f| f.sync() catch {};
 
         // Now attach the WAL for subsequent operations (if enabled).
-        bucket.wal = if (options.wal) initWal(ally, path) else null;
+        bucket.wal = if (options.wal) try initWal(ally, path, options.oplog_size) else null;
 
         bucket.rwlock = .{};
 
@@ -924,7 +935,7 @@ pub const Bucket = struct {
             return BucketInitErrors.UnexpectedError;
         };
 
-        const wal_instance: ?WAL = if (options.wal) initWal(ally, path) else null;
+        const wal_instance: ?WAL = if (options.wal) try initWal(ally, path, options.oplog_size) else null;
 
         var bucket = Bucket{
             .file = file,
@@ -1014,13 +1025,18 @@ pub const Bucket = struct {
         f.sync() catch return;
     }
 
-    /// Build the WAL path (<db_path>-wal) and try to open/create the WAL.
-    fn initWal(ally: std.mem.Allocator, db_path: []const u8) ?WAL {
+    /// Build the WAL path (<db_path>-wal) and open/create the WAL.
+    /// Returns `error.OplogSizeMismatch` when the SHM file was created with a
+    /// different non-zero oplog_size, so the caller can surface it properly.
+    fn initWal(ally: std.mem.Allocator, db_path: []const u8, oplog_size: u32) BucketInitErrors!?WAL {
         const wal_path = ally.alloc(u8, db_path.len + 4) catch return null;
         defer ally.free(wal_path);
         @memcpy(wal_path[0..db_path.len], db_path);
         @memcpy(wal_path[db_path.len..], "-wal");
-        return WAL.init(ally, wal_path) catch null;
+        return WAL.init(ally, wal_path, oplog_size) catch |err| switch (err) {
+            WAL.Error.WalOplogSizeMismatch => return BucketInitErrors.OplogSizeMismatch,
+            else => return null,
+        };
     }
 
     fn flushHeader(self: *Bucket) !void {

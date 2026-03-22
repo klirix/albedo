@@ -119,6 +119,20 @@ platform-specific notes and Android cross-compilation.
 
 ## Write-Ahead Log (WAL)
 
+Every page
+write is appended to a `<name>-wal` file instead of modifying the main DB file
+directly. A memory-mapped shared-memory index (`<name>-wal-shm`) lets multiple
+processes read the latest page versions without blocking each other. Not available on WASM due to platform limitations.
+
+**What WAL gives you:**
+
+- **Crash recovery** — uncommitted data in the WAL is replayed on the next open.
+- **MVCC reads** — readers always see a consistent snapshot; writers never block readers.
+- **Live-tail / document streaming** — a reader can keep a `listIterate` iterator open and call `next()` in a poll loop. When the iterator is exhausted it automatically refreshes from the WAL and picks up documents added by another connection.
+- **Throughput** — page writes bypass `fsync` by default (`.manual` write-durability mode), matching SQLite’s `synchronous=NORMAL` in WAL mode.
+
+## Write-Ahead Log (WAL)
+
 On Linux and macOS, Albedo opens databases in WAL mode by default. Every page
 write is appended to a `<name>-wal` file instead of modifying the main DB file
 directly. A memory-mapped shared-memory index (`<name>-wal-shm`) lets multiple
@@ -129,9 +143,30 @@ processes read the latest page versions without blocking each other.
 - **Crash recovery** — uncommitted data in the WAL is replayed on the next open.
 - **MVCC reads** — readers always see a consistent snapshot; writers never block readers.
 - **Live-tail / document streaming** — a reader can keep a `listIterate` iterator open and call `next()` in a poll loop. When the iterator is exhausted it automatically refreshes from the WAL and picks up documents added by another connection.
-- **Throughput** — page writes bypass `fsync` by default (`.manual` write-durability mode), matching SQLite’s `synchronous=NORMAL` in WAL mode.
+- **Throughput** — page writes bypass `fsync` by default (`.manual` write-durability mode), matching SQLite's `synchronous=NORMAL` in WAL mode.
 
-**Write-durability modes** (set via `OpenBucketOptions.write_durability` in Zig):
+The WAL is checkpointed (applied to the main DB file and deleted) automatically
+when the last connection closes. While any connection is open the WAL is kept
+alive so other readers can continue using it.
+
+---
+
+## Init options
+
+These options are passed via `OpenBucketOptions` in Zig (or as a BSON document
+to `albedo_open_with_options` in C).
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `wal` | `bool` | `true` | Enable the Write-Ahead Log. Disable only for read-heavy single-process workloads that do not need crash recovery or MVCC. |
+| `oplog_size` | `u32` | `4 MiB` | Size of the oplog circular ring buffer in bytes. `0` disables the oplog entirely (change-stream subscriptions will not work). Must match the value used when the SHM file was first created; a mismatch returns an error. Older SHM files (reserved bytes were zero) are seamlessly re-initialized. |
+| `write_durability` | see below | `.{ .periodic = 100 }` | Controls when `fsync` is called. |
+| `read_durability` | see below | `.shared` | Controls how page reads interact with the WAL. |
+| `auto_vaccuum` | `bool` | `true` | Automatically compact the database when deleted pages exceed live pages. |
+| `page_cache_capacity` | `usize` | `256` | Maximum number of pages held in the in-process LRU page cache. |
+| `mode` | `ReadOnly` / `ReadWrite` | `ReadWrite` | Open the file read-only or read-write. |
+
+**Write-durability modes** (`write_durability`):
 
 | Mode | Behaviour |
 |------|-----------|
@@ -139,9 +174,12 @@ processes read the latest page versions without blocking each other.
 | `.{ .periodic = N }` | `fsync` every N page writes (default: 100) |
 | `.manual` | Never auto-`fsync`; call `albedo_flush` / `flush()` when you need a durability guarantee |
 
-The WAL is checkpointed (applied to the main DB file and deleted) automatically
-when the last connection closes. While any connection is open the WAL is kept
-alive so other readers can continue using it.
+**Read-durability modes** (`read_durability`):
+
+| Mode | Behaviour |
+|------|-----------|
+| `.shared` | Always consult the WAL before returning a cached page — safe for multi-process readers |
+| `.process` | Trust the local in-process cache; fall back to the WAL only on a cache miss — best performance for single-process workloads |
 
 ---
 
@@ -314,7 +352,7 @@ Each element of the `batch` array is a BSON document with these fields:
 
 ### Overflow and gap handling
 
-The oplog ring is fixed at 4 MB. If a subscriber polls infrequently and the
+The oplog ring is by default 4 MB, configurable via `oplog_size` in init options. If a subscriber polls infrequently and the
 writer is active, the ring may wrap before the subscriber reads all entries.
 When this happens `albedo_subscribe_poll` returns `ALBEDO_OPLOG_GAP`. The
 correct recovery is to close the subscription, optionally perform a one-time
