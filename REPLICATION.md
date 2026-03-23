@@ -1,900 +1,222 @@
-# Albedo Replication System
+# WAL-Native Replication
 
-## Overview
+Albedo replication is a thin wrapper over committed WAL history.
+There is no replication callback, retry queue, or second page-batch format.
 
-Albedo includes a built-in replication system for maintaining synchronized copies of databases. The system uses batched page-level replication with acknowledgements and automatic retry on failure.
+The model is:
 
-**Status**: ✅ Production-ready for most use cases (v1.0)  
-**Last Updated**: October 30, 2025
+1. A primary exposes its committed WAL position as a `ReplicationCursor`.
+2. The caller asks for the committed delta since that cursor.
+3. The caller transports the bytes however it wants.
+4. A replica applies the batch by appending the raw WAL frames into its own WAL.
+5. If the cursor is stale after a WAL reset, Albedo returns `ReplicationGap` and the caller resnapshots.
 
-## Quick Start
+This keeps replication simple and makes the WAL the single physical source of truth.
 
-```typescript
-import { Bucket, ReplicationError } from "./albedo";
+## Design Notes
 
-// Open primary and replica
-const primary = Bucket.open("primary.bucket");
-const replica = Bucket.open("replica.bucket");
+- Replication batches contain raw WAL frames exactly as stored on disk.
+- Only committed frames are replication-visible. Unsynced WAL appends are not.
+- The engine no longer owns transport, retries, fan-out, or backoff.
+- Replicas are expected to be operationally read-only.
+- In-memory buckets do not support replication because there is no WAL file to tail.
 
-// Set up replication with acknowledgements
-primary.setReplicationCallback((data, pageCount) => {
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    return ReplicationError.OK;  // Success - dirty pages cleared
-  } catch (err) {
-    console.error("Replication failed:", err);
-    return ReplicationError.NetworkError;  // Retry on next sync
-  }
-});
+## Public API
 
-// Use normally - replication happens automatically
-primary.insert({ hello: "world" });
-primary.flush();  // Triggers replication
-```
-
-**That's it!** Replication automatically:
-- ✅ Batches dirty pages for efficiency
-- ✅ Retries on failure (up to 3 times)
-- ✅ Doesn't block writes on failure
-- ✅ Replicates indexes correctly
-
-## Architecture
-
-### Key Components
-
-1. **Dirty Page Tracking**: `std.AutoHashMap(u64, void)` tracks modified pages
-2. **Batch Replication**: All dirty pages sent together after sync
-3. **Acknowledgement Protocol**: Callback returns error codes (0 = success)
-4. **Automatic Retry**: Failed replications retry on subsequent syncs
-5. **RwLock Concurrency**: Multiple readers, single writer at a time
-
-### Data Flow
-
-```
-Write → Mark Dirty → Sync (every 100 writes) → Batch Pages → Callback → Apply to Replica
-                                                    ↓ (on failure)
-                                                  Retry on next sync
-```
-
-## API Reference
-
-### Zig (Native)
-
-#### Error Codes
+### Zig
 
 ```zig
-pub const ReplicationError = enum(u8) {
-    OK = 0,
-    NetworkError = 1,
-    DiskFull = 2,
-    InvalidFormat = 3,
-    ReplicaUnavailable = 4,
-    TimeoutError = 5,
-    UnknownError = 255,
+pub const ReplicationCursor = extern struct {
+    generation: u64,
+    next_frame_index: u64,
 };
+
+pub fn replicationCursor(self: *Bucket) !ReplicationCursor
+pub fn readReplicationBatch(
+    self: *Bucket,
+    from: ReplicationCursor,
+    max_bytes: usize,
+    allocator: std.mem.Allocator,
+) !?[]u8
+pub fn applyReplicationBatch(
+    self: *Bucket,
+    batch: []const u8,
+) !ReplicationCursor
 ```
 
-#### Callback Signature
+### C
 
-```zig
-pub const PageChangeCallback = ?*const fn (
-    context: ?*anyopaque,           // User-provided context
-    data: [*]const u8,              // Buffer: [Header(64)][Page1(8192)][Page2(8192)]...
-    data_size: u32,                 // Total buffer size
-    page_count: u32,                // Number of pages in batch
-) callconv(.c) u8;                  // Return 0 = success, >0 = error code
+```c
+typedef struct albedo_replication_cursor_handle albedo_replication_cursor_handle;
+
+albedo_result albedo_replication_cursor(
+    albedo_bucket_handle *bucket,
+    albedo_replication_cursor_handle **out_cursor);
+
+albedo_result albedo_replication_read(
+    albedo_bucket_handle *bucket,
+    albedo_replication_cursor_handle *from,
+    size_t max_bytes,
+    uint8_t **out_batch,
+    size_t *out_size);
+
+albedo_result albedo_replication_apply(
+    albedo_bucket_handle *bucket,
+    const uint8_t *data,
+    size_t data_size,
+    albedo_replication_cursor_handle **out_cursor);
+
+albedo_result albedo_replication_cursor_close(
+    albedo_replication_cursor_handle *cursor);
 ```
 
-#### Setting Up Replication
+`albedo_replication_read` returns an owned heap buffer. Release it with
+`albedo_free(batch, batch_size)`.
+Replication cursors are opaque handles on the C surface; release them with
+`albedo_replication_cursor_close(cursor)`.
 
-```zig
-bucket.replication_callback = myCallback;
-bucket.replication_context = myContext;
-```
+## Cursor Semantics
 
-#### Configuration
+`ReplicationCursor` has two fields:
 
-```zig
-bucket.sync_threshold = 100;           // Sync every N writes (default: 100)
-bucket.max_replication_retries = 3;    // Max retry attempts (default: 3)
-```
+- `generation`: WAL history generation for this bucket.
+- `next_frame_index`: the next committed WAL frame the caller expects to read.
 
-### TypeScript/JavaScript (Bun FFI)
+`next_frame_index` is always based on committed WAL state, not live append state.
+That means writes appended to the WAL but not yet synced are invisible to replication.
 
-#### Import
+Generation changes when Albedo intentionally invalidates older WAL history, for example after a clean close path that checkpoints and recreates the WAL. When that happens, older cursors are no longer satisfiable.
 
-```typescript
-import { Bucket, ReplicationError } from "./albedo";
-```
+Error behavior:
 
-#### Error Codes
+- `InvalidCursor`: the cursor points past the current committed frame count or refers to a future generation.
+- `ReplicationGap`: the cursor is from an older WAL generation and the caller must resnapshot.
+- `EOS`: there are no newer committed frames.
 
-```typescript
-const ReplicationError = {
-  OK: 0,
-  NetworkError: 1,
-  DiskFull: 2,
-  InvalidFormat: 3,
-  ReplicaUnavailable: 4,
-  TimeoutError: 5,
-  UnknownError: 255,
-} as const;
-```
+## Batch Format
 
-#### Setting Up Replication
+Each replication batch is:
 
-```typescript
-primaryBucket.setReplicationCallback((data: Uint8Array, pageCount: number) => {
-  try {
-    // Apply to replica
-    replicaBucket.applyReplicatedBatch(data, pageCount);
-    return ReplicationError.OK;
-  } catch (err) {
-    console.error("Replication failed:", err);
-    return ReplicationError.NetworkError;  // Will retry
-  }
-});
-```
-
-#### Applying Replicated Data
-
-```typescript
-replicaBucket.applyReplicatedBatch(data: Uint8Array, pageCount: number);
-```
-
-## Buffer Format
-
-### Structure
-
-```
-[Bucket Header: 64 bytes]
-[Page 1: 8192 bytes]
-  ├─ [Page Header: 32 bytes]
-  │  ├─ page_type: u8 (offset 0)
-  │  ├─ used_size: u16 (offset 1)
-  │  ├─ page_id: u64 (offset 3)      ← Extract this
-  │  ├─ first_readable_byte: u16 (offset 11)
-  │  └─ reserved: [19]u8 (offset 13)
-  └─ [Page Data: 8160 bytes]
-[Page 2: 8192 bytes]
+```text
+[ReplicationBatchHeader: 48 bytes]
+[WAL frame 0]
+[WAL frame 1]
 ...
 ```
 
-### Parsing Example (TypeScript)
+`ReplicationBatchHeader` fields:
 
-```typescript
-const headerSize = 64;
-const pageSize = 8192;
+- `magic`: `"ARPL"`
+- `version`: `1`
+- `page_size`
+- `generation`
+- `start_frame_index`
+- `frame_count`
+- `wal_salt`
+- `latest_tx_timestamp`
 
-for (let i = 0; i < pageCount; i++) {
-  const pageOffset = headerSize + (i * pageSize);
-  
-  // Read page_id from offset 3 in page header
-  const pageIdView = new DataView(
-    data.buffer,
-    data.byteOffset + pageOffset + 3,
-    8
-  );
-  const pageId = pageIdView.getBigUint64(0, true);  // little-endian
-  console.log(`Page ${i}: ID ${pageId}`);
-}
-```
+The payload is the raw WAL frame bytes exactly as stored in `<bucket>-wal`.
+There is no second replication encoding and no batch checksum; frame integrity continues to rely on the WAL frame headers and checksums.
 
-## Features
+## Typical Flow
 
-### ✅ Atomic Batch Updates
+### Primary side
 
-All pages modified in a transaction are replicated together, preventing inconsistent replica state.
-
-**Example**: If a write creates both a data page and an index page, both replicate atomically.
-
-### ✅ Automatic Deduplication
-
-Using `std.AutoHashMap` ensures each page ID appears only once per batch, even if modified multiple times.
-
-**Before**: 11 duplicate pages  
-**After**: 2 unique pages
-
-### ✅ Acknowledgement & Retry
-
-Callbacks return error codes. On failure, dirty pages are retained and retried on the next sync (up to `max_replication_retries`).
-
-**Example**: Network glitch → returns `NetworkError` → auto-retry on next sync
-
-### ✅ Non-Blocking Writes
-
-Replication errors don't prevent writes from completing. Data is safely on disk; replication catches up later.
-
-### ✅ Index Replication
-
-When page 0 (meta page) replicates, indexes are automatically reloaded on the replica.
-
-### ✅ Bucket Reopen Support
-
-Replicated buckets can be closed and reopened; indexes work correctly.
-
-## Usage Examples
-
-### Example 1: Basic Replication
-
-```typescript
-import { Bucket, ReplicationError } from "./albedo";
-
-const primary = Bucket.open("primary.bucket");
-const replica = Bucket.open("replica.bucket");
-
-primary.setReplicationCallback((data, pageCount) => {
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    return ReplicationError.OK;
-  } catch (err) {
-    return ReplicationError.UnknownError;
-  }
-});
-
-// Insert documents
-for (let i = 0; i < 100; i++) {
-  primary.insert({ _id: i, value: `doc${i}` });
+```c
+albedo_replication_cursor_handle *cursor = NULL;
+albedo_result rc = albedo_replication_cursor(primary, &cursor);
+if (rc != ALBEDO_OK) {
+    /* handle error */
 }
 
-primary.flush();  // Triggers replication
-```
+for (;;) {
+    uint8_t *batch = NULL;
+    size_t batch_size = 0;
+    albedo_replication_cursor_handle *replica_cursor = NULL;
 
-### Example 2: Network Replication
-
-```typescript
-primary.setReplicationCallback(async (data, pageCount) => {
-  try {
-    // Send over network
-    const response = await fetch("http://replica-server/apply", {
-      method: "POST",
-      body: data,
-      headers: { "X-Page-Count": pageCount.toString() },
-    });
-    
-    if (response.ok) {
-      return ReplicationError.OK;
-    } else if (response.status === 503) {
-      return ReplicationError.ReplicaUnavailable;  // Retry
-    } else {
-      return ReplicationError.NetworkError;  // Retry
+    rc = albedo_replication_read(primary, cursor, 256 * 1024, &batch, &batch_size);
+    if (rc == ALBEDO_EOS) {
+        break;
     }
-  } catch (err) {
-    return ReplicationError.NetworkError;  // Retry
-  }
-});
-```
-
-### Example 3: Multiple Replicas
-
-```typescript
-const replicas = [
-  Bucket.open("replica1.bucket"),
-  Bucket.open("replica2.bucket"),
-  Bucket.open("replica3.bucket"),
-];
-
-primary.setReplicationCallback((data, pageCount) => {
-  let allSuccess = true;
-  
-  for (const replica of replicas) {
-    try {
-      replica.applyReplicatedBatch(data, pageCount);
-    } catch (err) {
-      console.error(`Replica ${replica.path} failed:`, err);
-      allSuccess = false;
+    if (rc != ALBEDO_HAS_DATA) {
+        /* handle InvalidFormat / InvalidCursor / ReplicationGap / Error */
+        break;
     }
-  }
-  
-  return allSuccess ? ReplicationError.OK : ReplicationError.UnknownError;
-});
-```
 
-### Example 4: Monitoring Replication
-
-```typescript
-let replicationAttempts = 0;
-let replicationFailures = 0;
-
-primary.setReplicationCallback((data, pageCount) => {
-  replicationAttempts++;
-  
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    console.log(`✓ Replicated ${pageCount} pages (attempt #${replicationAttempts})`);
-    return ReplicationError.OK;
-  } catch (err) {
-    replicationFailures++;
-    console.error(`✗ Replication failed (${replicationFailures} total failures)`);
-    return ReplicationError.UnknownError;
-  }
-});
-```
-
-## Retry Behavior
-
-### Default Configuration
-
-- **Sync Threshold**: 100 writes before sync
-- **Max Retries**: 3 attempts
-- **Retry Timing**: On next sync operation
-
-### Retry Flow
-
-```
-Write #1-100 → Sync → Replication Attempt #1 → FAIL
-Write #101-200 → Sync → Replication Attempt #2 → FAIL  
-Write #201-300 → Sync → Replication Attempt #3 → FAIL
-Write #301-400 → Sync → Max retries exceeded → Pages cleared
-```
-
-After max retries, dirty pages are cleared to prevent infinite retry loops. Applications should implement monitoring to detect this.
-
-### Testing Retry Behavior
-
-See `test-retry.ts` for a complete example:
-
-```typescript
-let attemptCount = 0;
-
-primary.setReplicationCallback((data, pageCount) => {
-  attemptCount++;
-  
-  // Simulate failures for first 2 attempts
-  if (attemptCount <= 2) {
-    console.log(`Attempt ${attemptCount}: simulating failure`);
-    return ReplicationError.NetworkError;
-  }
-  
-  // Succeed on 3rd attempt
-  replica.applyReplicatedBatch(data, pageCount);
-  return ReplicationError.OK;
-});
-
-primary.insert({ test: "data" });
-primary.flush();  // Attempt 1: fails, keeps dirty pages
-primary.flush();  // Attempt 2: retries same pages, fails again  
-primary.flush();  // Attempt 3: retries same pages, succeeds!
-```
-
-## Performance Characteristics
-
-### Memory Usage
-
-- **Dirty Pages Set**: O(n) where n = unique modified pages
-- **Batch Buffer**: 64 + (page_count × 8192) bytes per sync
-- **Example**: 100 dirty pages = ~800KB temporary allocation
-
-### Network Overhead
-
-- **Per Batch**: 64-byte header + (N × 8192 bytes)
-- **Efficiency**: Batching reduces overhead vs. per-page replication
-- **Example**: 2 pages = 16,448 bytes (one call vs. two 8,256-byte calls)
-
-### Write Amplification
-
-- **None**: Only modified pages replicate (no re-writing of unchanged data)
-- **Deduplication**: Multiple writes to same page = one replication
-
-## Limitations
-
-### ❌ No Crash Recovery (No WAL)
-
-If the primary crashes before sync, dirty pages in memory are lost. Replicas will miss those updates.
-
-**Workaround**: Lower `sync_threshold` or call `flush()` more frequently.
-
-### ❌ No Multi-Master Support
-
-Assumes single writer (primary) and read-only replicas. No conflict resolution.
-
-### ❌ No Compression
-
-Full 8192-byte pages sent even if mostly empty.
-
-**Impact**: Higher network usage for sparse pages.
-
-## Best Practices
-
-### 1. Handle All Error Cases
-
-```typescript
-primaryBucket.setReplicationCallback((data, pageCount) => {
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    return ReplicationError.OK;
-  } catch (err) {
-    if (err.message.includes("disk")) {
-      return ReplicationError.DiskFull;
-    } else if (err.message.includes("network")) {
-      return ReplicationError.NetworkError;
-    } else {
-      return ReplicationError.UnknownError;
+    /* transport batch to the replica and get its returned cursor */
+    rc = albedo_replication_apply(replica, batch, batch_size, &replica_cursor);
+    if (rc != ALBEDO_OK) {
+        albedo_free(batch, batch_size);
+        break;
     }
-  }
-});
-```
 
-### 2. Monitor Replication Health
-
-```typescript
-let consecutiveFailures = 0;
-
-primary.setReplicationCallback((data, pageCount) => {
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    consecutiveFailures = 0;
-    return ReplicationError.OK;
-  } catch (err) {
-    consecutiveFailures++;
-    if (consecutiveFailures > 10) {
-      alertOps("Replication failing repeatedly!");
-    }
-    return ReplicationError.UnknownError;
-  }
-});
-```
-
-### 3. Tune Sync Threshold
-
-```typescript
-// Low-latency replication (more network calls)
-bucket.sync_threshold = 10;
-
-// Batch efficiency (less frequent, larger batches)
-bucket.sync_threshold = 1000;
-
-// Critical data (immediate replication)
-bucket.insert(criticalData);
-bucket.flush();  // Force immediate replication
-```
-
-### 4. Graceful Degradation
-
-```typescript
-let replicationEnabled = true;
-
-primary.setReplicationCallback((data, pageCount) => {
-  if (!replicationEnabled) {
-    return ReplicationError.OK;  // Skip replication
-  }
-  
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    return ReplicationError.OK;
-  } catch (err) {
-    // After too many failures, disable replication temporarily
-    if (shouldDisableReplication(err)) {
-      replicationEnabled = false;
-      scheduleReplicationReconnect();
-    }
-    return ReplicationError.ReplicaUnavailable;
-  }
-});
-```
-
-## Troubleshooting
-
-### Problem: Replication Not Happening
-
-**Symptoms**: Replica stays empty, callback never called
-
-**Causes**:
-1. No writes reaching sync threshold (default: 100)
-2. Callback not set before writes
-
-**Solutions**:
-```typescript
-// Force immediate replication
-primary.flush();
-
-// Or lower threshold
-primary.sync_threshold = 10;
-```
-
-### Problem: Replication Keeps Failing
-
-**Symptoms**: Same pages retry multiple times, then give up
-
-**Causes**:
-1. Replica disk full
-2. Replica file permissions
-3. Network issues (if remote)
-
-**Solutions**:
-```typescript
-primary.setReplicationCallback((data, pageCount) => {
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    return ReplicationError.OK;
-  } catch (err) {
-    console.error("Replication error:", err.message);
-    
-    // Return appropriate error code for retry
-    if (err.message.includes("ENOSPC")) {
-      return ReplicationError.DiskFull;
-    } else if (err.message.includes("EACCES")) {
-      return ReplicationError.InvalidFormat;
-    } else {
-      return ReplicationError.UnknownError;
-    }
-  }
-});
-```
-
-### Problem: Indexes Not Working on Replica
-
-**Symptoms**: Queries on replica don't use indexes
-
-**Cause**: Meta page (page 0) not replicated yet
-
-**Solution**:
-```typescript
-// Ensure flush after creating index
-primary.ensureIndex("fieldName");
-primary.flush();  // This replicates the meta page
-
-// Verify on replica
-const docs = replica.all({ fieldName: "value" }, {});
-```
-
-### Problem: Replica Out of Sync After Crash
-
-**Symptoms**: Primary crashed, replica missing recent data
-
-**Cause**: In-memory dirty pages lost on crash (no WAL)
-
-**Solution**:
-```typescript
-// Lower sync threshold for more frequent replication
-primary.sync_threshold = 10;  // Sync every 10 writes
-
-// Or flush after critical operations
-await saveCriticalData(primary);
-primary.flush();  // Ensure replicated before continuing
-```
-
-### Problem: High Memory Usage
-
-**Symptoms**: Memory grows during heavy writes
-
-**Cause**: Large dirty pages set before sync
-
-**Solution**:
-```typescript
-// More frequent syncs = smaller batches
-primary.sync_threshold = 50;
-
-// Or monitor and flush manually
-if (getPendingWrites() > 100) {
-  primary.flush();
+    albedo_free(batch, batch_size);
+    albedo_replication_cursor_close(cursor);
+    cursor = replica_cursor;
 }
+
+albedo_replication_cursor_close(cursor);
 ```
 
-## Testing
+### Replica side
 
-Run the test suite:
+```c
+albedo_replication_cursor_handle *cursor = NULL;
+albedo_result rc = albedo_replication_apply(replica, batch, batch_size, &cursor);
 
-```bash
-cd bun
+if (rc == ALBEDO_REPLICATION_GAP) {
+    /* local WAL history does not line up; resnapshot the replica */
+}
 
-# Basic replication test
-bun run test-simple-replication.ts
-
-# Reopen/index test  
-bun run test-reopen.ts
-
-# Retry mechanism test
-bun run test-retry.ts
-
-# Comprehensive test
-bun run index.ts
+albedo_replication_cursor_close(cursor);
 ```
 
-## Comparison with Other Systems
-
-| Feature | Albedo | PostgreSQL | MongoDB | Redis | SQLite |
-|---------|--------|------------|---------|-------|--------|
-| Replication Type | Batch Page-Level | WAL Streaming | Oplog | Async Replication | N/A (File Copy) |
-| Acknowledgements | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | N/A |
-| Automatic Retry | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | N/A |
-| Crash Recovery | ❌ No | ✅ WAL | ✅ Journal | ✅ AOF | ✅ WAL |
-| Multi-Master | ❌ No | ❌ No | ❌ No | ❌ No | N/A |
-| Compression | ❌ No | ✅ Yes | ✅ Yes | ❌ No | N/A |
-| Embedded | ✅ Yes | ❌ No | ❌ No | ❌ No | ✅ Yes |
-| Setup Complexity | ⭐ Simple | ⭐⭐⭐ Complex | ⭐⭐⭐ Complex | ⭐⭐ Medium | ⭐ Simple |
-
-**Albedo's Niche**: Embedded database with built-in replication (like SQLite + replication built-in)
-
-## FAQ
-
-### Q: Can I replicate to multiple replicas?
-
-**A:** Yes! Iterate through your replicas in the callback:
-
-```typescript
-const replicas = [replica1, replica2, replica3];
-
-primary.setReplicationCallback((data, pageCount) => {
-  for (const replica of replicas) {
-    try {
-      replica.applyReplicatedBatch(data, pageCount);
-    } catch (err) {
-      console.error(`Replica ${replica.path} failed:`, err);
-      return ReplicationError.UnknownError;
-    }
-  }
-  return ReplicationError.OK;
-});
-```
-
-### Q: Can I replicate over the network?
-
-**A:** Yes! Send the buffer via HTTP, WebSocket, or any protocol:
+Replica apply rules:
 
-```typescript
-primary.setReplicationCallback(async (data, pageCount) => {
-  try {
-    await fetch("http://replica-server/apply", {
-      method: "POST",
-      body: data,
-      headers: { "X-Page-Count": pageCount.toString() },
-    });
-    return ReplicationError.OK;
-  } catch (err) {
-    return ReplicationError.NetworkError;
-  }
-});
-```
+- Exact next range applies normally.
+- Exact duplicate replay is accepted as a no-op if the existing bytes match.
+- Any out-of-order overlap or byte mismatch returns `ReplicationGap`.
 
-### Q: What happens if the callback is slow?
+When a batch is applied, the replica:
 
-**A:** The callback runs synchronously under a write lock. Slow callbacks will block other writes. For async operations (network, etc.), consider:
+- appends the incoming raw frames to its WAL
+- updates committed frame count and latest committed timestamp
+- inserts the new frames into the shared WAL index
+- invalidates cached pages touched by the batch
+- reloads the meta page and bucket header when replicated frames include them
 
-1. **Queue batches** for background processing
-2. **Lower sync_threshold** for smaller, faster batches
-3. **Monitor callback duration** and optimize
+It does not emit oplog entries, trigger replication recursively, or rebuild a second physical format.
 
-### Q: Can I skip replication for certain writes?
+## `max_bytes` Behavior
 
-**A:** Not directly per-write, but you can disable the callback temporarily:
+- `max_bytes == 0` means "no caller-imposed size limit".
+- Otherwise, Albedo returns the largest whole-frame batch that fits.
+- If `max_bytes` cannot fit the 48-byte header plus at least one full WAL frame, the call fails with `InvalidFormat` on the C surface (`InvalidArgument` internally).
 
-```typescript
-primary.replication_callback = null;  // Disable
-primary.insert(internalData);
-primary.replication_callback = myCallback;  // Re-enable
-```
-
-### Q: How do I detect when max retries is exceeded?
-
-**A:** Currently, pages are silently dropped after max retries. Monitor this by tracking consecutive failures in your callback:
-
-```typescript
-let consecutiveFailures = 0;
-
-primary.setReplicationCallback((data, pageCount) => {
-  try {
-    replica.applyReplicatedBatch(data, pageCount);
-    consecutiveFailures = 0;
-    return ReplicationError.OK;
-  } catch (err) {
-    consecutiveFailures++;
-    if (consecutiveFailures >= 3) {
-      console.error("⚠️ Max retries likely exceeded!");
-      alertOps("Replication failing");
-    }
-    return ReplicationError.UnknownError;
-  }
-});
-```
-
-### Q: Does replication work with in-memory buckets?
-
-**A:** No. In-memory buckets (`:memory:`) don't support replication since there's no persistent storage.
-
-### Q: Can replicas also be primaries (cascade replication)?
-
-**A:** Yes! You can chain replication:
+## Resnapshot on Gap
 
-```typescript
-// Primary → Replica1 → Replica2
-primary.setReplicationCallback((data, pageCount) => {
-  replica1.applyReplicatedBatch(data, pageCount);
-  return ReplicationError.OK;
-});
-
-replica1.setReplicationCallback((data, pageCount) => {
-  replica2.applyReplicatedBatch(data, pageCount);
-  return ReplicationError.OK;
-});
-```
-
-### Q: How do I pause/resume replication?
-
-**A:** Set callback to null to pause, restore to resume:
-
-```typescript
-const savedCallback = primary.replication_callback;
-primary.replication_callback = null;  // Paused
-
-// ... do work ...
-
-primary.replication_callback = savedCallback;  // Resumed
-primary.flush();  // Catch up on missed changes
-```
-
-### Q: What's the maximum batch size?
-
-**A:** Limited by memory allocation: `64 + (page_count × 8192)` bytes. In practice:
-- 1,000 pages = ~8MB
-- 10,000 pages = ~80MB
-
-Control via `sync_threshold` to keep batches reasonable.
-
-## Security Considerations
-
-### Network Replication
-
-When replicating over the network, consider:
-
-1. **Authentication**: Verify replica identity before sending data
-2. **Encryption**: Use TLS/HTTPS for data in transit
-3. **Authorization**: Validate replica has permission to receive updates
-4. **Rate Limiting**: Prevent abuse of replication endpoint
-
-Example secure network replication:
-
-```typescript
-import crypto from "crypto";
-
-const REPLICA_SECRET = process.env.REPLICA_SECRET;
-
-primary.setReplicationCallback(async (data, pageCount) => {
-  // Sign the payload
-  const signature = crypto
-    .createHmac("sha256", REPLICA_SECRET)
-    .update(data)
-    .digest("hex");
-  
-  try {
-    const response = await fetch("https://replica-server/apply", {
-      method: "POST",
-      body: data,
-      headers: {
-        "X-Page-Count": pageCount.toString(),
-        "X-Signature": signature,
-        "Authorization": `Bearer ${REPLICA_TOKEN}`,
-      },
-    });
-    
-    if (response.ok) {
-      return ReplicationError.OK;
-    } else if (response.status === 401) {
-      return ReplicationError.ReplicaUnavailable;
-    } else {
-      return ReplicationError.NetworkError;
-    }
-  } catch (err) {
-    return ReplicationError.NetworkError;
-  }
-});
-```
-
-### Local File Permissions
-
-Ensure replica bucket files have appropriate permissions:
-
-```bash
-# Restrict access to replica
-chmod 600 replica.bucket
-
-# Or group-accessible
-chmod 640 replica.bucket
-chown app:app replica.bucket
-```
-
-### Data Validation
-
-Validate received data on replicas:
-
-```typescript
-// On replica server
-app.post("/apply", (req, res) => {
-  const signature = req.headers["x-signature"];
-  const pageCount = parseInt(req.headers["x-page-count"]);
-  
-  // Verify signature
-  const expected = crypto
-    .createHmac("sha256", REPLICA_SECRET)
-    .update(req.body)
-    .digest("hex");
-  
-  if (signature !== expected) {
-    return res.status(401).send("Invalid signature");
-  }
-  
-  // Validate size
-  const expectedSize = 64 + (pageCount * 8192);
-  if (req.body.length !== expectedSize) {
-    return res.status(400).send("Invalid batch size");
-  }
-  
-  // Apply to replica
-  try {
-    replica.applyReplicatedBatch(req.body, pageCount);
-    res.status(200).send("OK");
-  } catch (err) {
-    res.status(500).send("Replication failed");
-  }
-});
-```
-
-## Future Enhancements
-
-### Potential Improvements
-
-1. **WAL (Write-Ahead Log)** for crash recovery
-2. **Compression** for network efficiency  
-3. **Delta encoding** for sparse page updates
-4. **Async replication thread** for true non-blocking
-5. **Multi-master support** with conflict resolution
-6. **Sequence numbers** for guaranteed ordering
-7. **Incremental sync** for catching up stale replicas
-
-### Roadmap
-
-- **v1.0** (Current): Batch replication with acknowledgements ✅
-- **v1.1**: Configurable retry strategies
-- **v1.2**: Replication metrics/observability
-- **v2.0**: Optional WAL for crash recovery
-- **v3.0**: Multi-master with conflict resolution
-
-## Conclusion
-
-Albedo's replication system provides a **production-ready** solution for most use cases, offering:
-
-✅ **Simple API** - Set callback, return error code, done  
-✅ **Robust** - Automatic retry with configurable limits  
-✅ **Efficient** - Batch processing with deduplication  
-✅ **Safe** - Non-blocking, write-ahead philosophy  
-✅ **Flexible** - Works locally or over network  
-
-**Perfect for:**
-- Web applications needing read replicas
-- Distributed systems with eventual consistency  
-- High-availability deployments
-- Edge computing scenarios
-- Microservices with data replication needs
-
-**Not suitable for:**
-- Extreme crash recovery requirements (use PostgreSQL/MongoDB)
-- Multi-master writes (use CouchDB/Cassandra)
-- Real-time streaming (use Kafka/Redis Streams)
-
-For 90%+ of embedded database replication needs, Albedo provides the right balance of simplicity, reliability, and performance.
-
-## Contributing
-
-Contributions welcome! Areas of interest:
-- WAL implementation
-- Performance optimizations
-- Additional test cases
-- Documentation improvements
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## License
-
-See project [LICENSE](LICENSE) file.
-
-## Support
-
-- **Documentation**: This file + inline code comments
-- **Examples**: See `bun/test-*.ts` files
-- **Issues**: [GitHub Issues](https://github.com/klirix/albedo/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/klirix/albedo/discussions)
-
----
-
-**Last Updated**: October 30, 2025  
-**Version**: 1.0  
+`ReplicationGap` is the expected recovery path when a replica falls behind older retained WAL history.
+
+Typical recovery:
+
+1. Copy or dump a fresh snapshot from the primary.
+2. Open the replica from that snapshot.
+3. Fetch a fresh `ReplicationCursor`.
+4. Resume streaming incremental WAL batches.
+
+The engine detects the gap, but it does not perform the resnapshot for you.
+
+## Can I Tail the WAL Directly?
+
+Yes. If you want a SQLite or LiteSync-style setup, you can tail the WAL file yourself because replication batches are literally raw WAL frames.
+
+The important caveats are:
+
+- You must only replicate committed frames, not the live append tail.
+- You must track WAL generation resets so you can detect stale cursors and resnapshot instead of silently diverging.
+
+That is why the replication API still exists even though the payload is raw WAL. It packages the committed-watermark and generation rules into a small, stable contract.
+
+## Compatibility
+
+This rewrite is intentionally not backward compatible with the old page-batch replication API. The callback-based replication surface has been removed.

@@ -23,7 +23,7 @@ network round-trips.
 - **BSON native** — documents are stored and queried in BSON; no intermediate format.
 - **B⁺-tree indexing** — create indexes on any field path, including nested and array fields.
 - **Write-Ahead Log (WAL)** — enabled by default on Linux/macOS; provides crash recovery, MVCC reads, and cross-process live-tail without blocking writers.
-- **Built-in replication** — page-level dirty tracking with batched sync and automatic retry.
+- **Built-in replication** — WAL-native cursor APIs stream committed frame batches; transport and retry are owned by the caller.
 - **Tunable write durability** — choose between per-write fsync (`.all`), periodic fsync (`.periodic(N)`), or fully manual (`.manual`) to trade safety for throughput.
 - **Zero external dependencies** — the core is pure Zig; bindings are thin wrappers around the C ABI.
 - **Runs everywhere** — the storage layer only needs basic file-handle read/write operations, so it cross-compiles cleanly for Linux, macOS, Windows, iOS, Android, and WASM.
@@ -60,7 +60,7 @@ Albedo is designed to be consumed from many runtimes. Pick the one that fits:
 ```c
 #include "albedo.h"
 
-albedo_bucket *db;
+albedo_bucket_handle *db;
 albedo_open("my.bucket", &db);
 
 // Insert a BSON document (bytes built however you like)
@@ -90,7 +90,7 @@ albedo_close(db);
 | Update | `albedo_transform` → `albedo_transform_data` / `albedo_transform_apply` | Iterate matches and apply per-document transforms |
 | Indexes | `albedo_ensure_index`, `albedo_drop_index`, `albedo_list_indexes` | B⁺-tree indexes on arbitrary field paths |
 | Maintenance | `albedo_vacuum`, `albedo_flush` | Compact the file or force-sync to disk (`flush` fsyncs the WAL in WAL mode) |
-| Replication | `albedo_set_replication_callback`, `albedo_apply_batch` | Page-level batched sync — see [REPLICATION.md](REPLICATION.md) |
+| Replication | `albedo_replication_cursor`, `albedo_replication_read`, `albedo_replication_apply`, `albedo_replication_cursor_close` | Cursor-based WAL replication — see [REPLICATION.md](REPLICATION.md) |
 | Subscriptions | `albedo_subscribe`, `albedo_subscribe_poll`, `albedo_subscribe_close` | Real-time oplog change stream (insert / update / delete events) — requires WAL mode |
 
 See [include/albedo.h](include/albedo.h) for the full C API surface.
@@ -116,20 +116,6 @@ Build artifacts land in `zig-out/`. See [build.md](build.md) for
 platform-specific notes and Android cross-compilation.
 
 ---
-
-## Write-Ahead Log (WAL)
-
-Every page
-write is appended to a `<name>-wal` file instead of modifying the main DB file
-directly. A memory-mapped shared-memory index (`<name>-wal-shm`) lets multiple
-processes read the latest page versions without blocking each other. Not available on WASM due to platform limitations.
-
-**What WAL gives you:**
-
-- **Crash recovery** — uncommitted data in the WAL is replayed on the next open.
-- **MVCC reads** — readers always see a consistent snapshot; writers never block readers.
-- **Live-tail / document streaming** — a reader can keep a `listIterate` iterator open and call `next()` in a poll loop. When the iterator is exhausted it automatically refreshes from the WAL and picks up documents added by another connection.
-- **Throughput** — page writes bypass `fsync` by default (`.manual` write-durability mode), matching SQLite’s `synchronous=NORMAL` in WAL mode.
 
 ## Write-Ahead Log (WAL)
 
@@ -302,7 +288,7 @@ inline when it fits within 1 KB.
 
 ```c
 // 1. Open a bucket in WAL mode (default on Linux/macOS).
-albedo_bucket *db;
+albedo_bucket_handle *db;
 albedo_open("my.bucket", &db);
 
 // 2. Subscribe. Pass an optional BSON query to receive only matching events.
@@ -370,9 +356,24 @@ always pass through.
 
 ## Replication
 
-Albedo ships with a page-level replication system that batches dirty pages and
-pushes them to replicas via a simple callback. See
-[REPLICATION.md](REPLICATION.md) for the full protocol description.
+Albedo replication is built directly on committed WAL history. A primary
+publishes an opaque replication cursor handle, `albedo_replication_read`
+returns `ReplicationBatchHeader + raw WAL frames`, and
+`albedo_replication_apply` appends that exact range into a replica WAL.
+
+- `ALBEDO_HAS_DATA` means a batch was returned.
+- `ALBEDO_EOS` means there are no newer committed frames at the cursor.
+- `ALBEDO_REPLICATION_GAP` means the cursor is stale after a WAL generation
+  reset and the replica must resnapshot.
+- `albedo_replication_read` returns an owned buffer; release it with
+  `albedo_free`.
+- `albedo_replication_cursor` / `albedo_replication_apply` return opaque cursor
+  handles; release them with `albedo_replication_cursor_close`.
+
+If you want, you can tail the WAL directly SQLite-style because the payload is
+literally raw WAL frames, but the replication API is the safer contract because
+it only exposes committed frames and carries generation metadata for WAL reset
+detection. See [REPLICATION.md](REPLICATION.md) for the full protocol.
 
 ---
 

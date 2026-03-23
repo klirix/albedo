@@ -9,7 +9,8 @@ This document summarizes how the core database machinery works based on src/albe
   - magic ("ALBEDO"), version, flags
   - page_size (default 8192)
   - page_count, doc_count, deleted_count
-  - reserved padding
+  - replication_generation
+  - reserved padding (written as zeroes)
 - Each page is fixed-size: DEFAULT_PAGE_SIZE (8192) bytes.
   - A 32-byte PageHeader is stored at the start of the page on disk.
   - PageHeader fields: page_type, used_size, page_id, first_readable_byte, reserved.
@@ -26,7 +27,7 @@ This document summarizes how the core database machinery works based on src/albe
   - clear() frees all cached pages and entries.
 - Bucket: central handle for a database file.
   - Maintains file handle, header, page cache, index map, and an RW lock.
-  - Tracks replication state and dirty pages for replication batching.
+  - Tracks WAL state, oplog configuration, and staged page/header updates for WAL commits.
 
 ## Bucket lifecycle and initialization
 
@@ -47,8 +48,8 @@ This document summarizes how the core database machinery works based on src/albe
   - Returns cached page if present.
   - Otherwise reads PageHeader and page data from disk, then caches it.
 - writePage(page):
-  - Writes PageHeader and data to disk at calculated offset.
-  - Tracks dirty pages for replication and triggers periodic fsync.
+  - Stages PageHeader + data for WAL commit when WAL is enabled; otherwise writes directly to the main DB file.
+  - Triggers periodic sync according to write durability settings.
 - createNewPage(page_type):
   - Appends a new page at next page_id and flushes header.
   - Inserts the page into cache.
@@ -147,14 +148,13 @@ This document summarizes how the core database machinery works based on src/albe
 
 ## Replication
 
-- writePage() collects dirty page_ids when a replication callback is set.
-- notifyDirtyPages():
-  - Builds a buffer with header + all dirty pages.
-  - Calls the replication callback once with a batch.
-  - Retries up to max_replication_retries; otherwise clears dirty pages.
-- applyReplicatedBatch(data, page_count):
-  - Applies raw pages to the local file and invalidates cache entries.
-  - If page 0 is replicated, reloads all indexes.
+- Replication is WAL-native and cursor based.
+- `Bucket.replicationCursor()` returns `{ generation, next_frame_index }`, where `next_frame_index` is the committed WAL frame count.
+- `Bucket.readReplicationBatch(from, max_bytes, allocator)` returns `ReplicationBatchHeader + raw WAL frames` for the committed delta since `from`.
+- `Bucket.applyReplicationBatch(batch)` validates generation, range ordering, page size, and WAL salt before appending the raw frames into the local WAL.
+- Duplicate replay of an already-applied range is accepted only if the bytes match exactly; other overlaps return `ReplicationGap`.
+- Applying a replication batch invalidates cached pages touched by the frames, reloads page 0 index metadata when needed, and refreshes the in-memory bucket header when the replicated header page is present.
+- On clean close or other WAL-reset paths, the bucket increments its replication generation before consuming or recreating the WAL. Old cursors must resnapshot after that.
 
 ## Concurrency and memory
 

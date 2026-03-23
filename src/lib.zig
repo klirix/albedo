@@ -15,6 +15,16 @@ else
     std.heap.smp_allocator;
 
 const Bucket = albedo.Bucket;
+const ReplicationCursor = albedo.ReplicationCursor;
+const ReplicationCursorHandle = struct {
+    cursor: ReplicationCursor,
+};
+
+fn createReplicationCursorHandle(cursor: ReplicationCursor) !*ReplicationCursorHandle {
+    const handle = try ally.create(ReplicationCursorHandle);
+    handle.* = .{ .cursor = cursor };
+    return handle;
+}
 
 const Result = enum(u8) {
     // Generic result codes
@@ -33,6 +43,8 @@ const Result = enum(u8) {
     UnsupportedCursorQuery,
     /// The subscriber fell behind the oplog ring; must re-subscribe.
     OplogGap,
+    /// The replication cursor/batch is no longer valid after a WAL reset.
+    ReplicationGap,
     TransactionActive,
     InvalidTransaction,
     TransactionBusy,
@@ -81,6 +93,16 @@ fn mapWriteError(err: anyerror) Result {
         error.TransactionActive => Result.TransactionActive,
         error.InvalidTransaction => Result.InvalidTransaction,
         error.TransactionBusy => Result.TransactionBusy,
+        else => Result.Error,
+    };
+}
+
+fn mapReplicationError(err: anyerror) Result {
+    return switch (err) {
+        error.OutOfMemory => Result.OutOfMemory,
+        error.InvalidCursor => Result.InvalidCursor,
+        error.InvalidFormat, error.InvalidArgument => Result.InvalidFormat,
+        error.ReplicationGap => Result.ReplicationGap,
         else => Result.Error,
     };
 }
@@ -508,28 +530,47 @@ pub export fn albedo_transform_close(iterator: *Bucket.TransformIterator) Result
     return Result.OK;
 }
 
-/// Set a callback to be notified of page changes for replication
-pub export fn albedo_set_replication_callback(
-    bucket: *Bucket,
-    callback: albedo.PageChangeCallback,
-    context: ?*anyopaque,
-) Result {
-    bucket.replication_callback = callback;
-    bucket.replication_context = context;
+pub export fn albedo_replication_cursor(bucket: *Bucket, out_cursor: *?*ReplicationCursorHandle) Result {
+    const cursor = bucket.replicationCursor() catch |err| return mapReplicationError(err);
+    const handle = createReplicationCursorHandle(cursor) catch return Result.OutOfMemory;
+    out_cursor.* = handle;
     return Result.OK;
 }
 
-/// Apply a replicated page to this bucket (for replicas)
-pub export fn albedo_apply_batch(
+pub export fn albedo_replication_read(
+    bucket: *Bucket,
+    from: ?*ReplicationCursorHandle,
+    max_bytes: usize,
+    out_batch: *[*c]u8,
+    out_size: *usize,
+) Result {
+    const from_handle = from orelse return Result.InvalidCursor;
+    const maybe_batch = bucket.readReplicationBatch(from_handle.cursor, max_bytes, ally) catch |err| return mapReplicationError(err);
+    if (maybe_batch) |batch| {
+        out_batch.* = @ptrCast(batch.ptr);
+        out_size.* = batch.len;
+        return Result.HasData;
+    }
+    out_batch.* = null;
+    out_size.* = 0;
+    return Result.EOS;
+}
+
+pub export fn albedo_replication_apply(
     bucket: *Bucket,
     data: [*]const u8,
-    data_size: u32,
-    page_count: u32,
+    data_size: usize,
+    out_cursor: *?*ReplicationCursorHandle,
 ) Result {
-    bucket.applyReplicatedBatch(data[0..data_size], page_count) catch {
-        return Result.Error;
-    };
+    const cursor = bucket.applyReplicationBatch(data[0..data_size]) catch |err| return mapReplicationError(err);
+    const handle = createReplicationCursorHandle(cursor) catch return Result.OutOfMemory;
+    out_cursor.* = handle;
+    return Result.OK;
+}
 
+pub export fn albedo_replication_cursor_close(cursor: ?*ReplicationCursorHandle) Result {
+    const handle = cursor orelse return Result.Error;
+    ally.destroy(handle);
     return Result.OK;
 }
 
@@ -1256,9 +1297,9 @@ test "lib API drop index returns not found for missing path" {
     try testing.expectEqual(Result.NotFound, albedo_drop_index(bucket, "does.not.exist"));
 }
 
-test "lib API apply batch rejects invalid payload size" {
+test "lib API replication_apply rejects invalid payload size" {
     const allocator = testing.allocator;
-    const path = try makeTempPath(allocator, "lib-api-apply-batch-invalid-size");
+    const path = try makeTempPath(allocator, "lib-api-replication-apply-invalid-size");
     defer allocator.free(path);
     platform.deleteFile(path) catch {};
     defer platform.deleteFile(path) catch {};
@@ -1271,7 +1312,71 @@ test "lib API apply batch rejects invalid payload size" {
     defer _ = albedo_close(bucket);
 
     const bad = [_]u8{ 1, 2, 3, 4 };
-    try testing.expectEqual(Result.Error, albedo_apply_batch(bucket, bad[0..].ptr, bad.len, 1));
+    var cursor: ?*ReplicationCursorHandle = null;
+    try testing.expectEqual(Result.InvalidFormat, albedo_replication_apply(bucket, bad[0..].ptr, bad.len, &cursor));
+}
+
+test "lib API replication read/apply smoke test" {
+    const allocator = testing.allocator;
+
+    const primary_path = try makeTempPath(allocator, "lib-api-replication-primary");
+    defer allocator.free(primary_path);
+    platform.deleteFile(primary_path) catch {};
+    defer platform.deleteFile(primary_path) catch {};
+
+    const replica_path = try makeTempPath(allocator, "lib-api-replication-replica");
+    defer allocator.free(replica_path);
+    platform.deleteFile(replica_path) catch {};
+    defer platform.deleteFile(replica_path) catch {};
+
+    const primary_path_z = try allocator.dupeZ(u8, primary_path);
+    defer allocator.free(primary_path_z);
+    const replica_path_z = try allocator.dupeZ(u8, replica_path);
+    defer allocator.free(replica_path_z);
+
+    var primary: *Bucket = undefined;
+    var replica: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(primary_path_z.ptr, &primary));
+    defer _ = albedo_close(primary);
+    try testing.expectEqual(Result.OK, albedo_open(replica_path_z.ptr, &replica));
+    defer _ = albedo_close(replica);
+
+    var initial_cursor: ?*ReplicationCursorHandle = null;
+    try testing.expectEqual(Result.OK, albedo_replication_cursor(primary, &initial_cursor));
+    defer if (initial_cursor) |cursor| {
+        testing.expectEqual(Result.OK, albedo_replication_cursor_close(cursor)) catch unreachable;
+    };
+
+    var doc = try bson.BSONDocument.fromJSON(allocator,
+        \\{
+        \\  "name": "replicated"
+        \\}
+    );
+    defer doc.deinit(allocator);
+    try testing.expectEqual(Result.OK, albedo_insert(primary, @constCast(doc.buffer.ptr)));
+    try testing.expectEqual(Result.OK, albedo_flush(primary));
+
+    var batch_ptr: [*c]u8 = undefined;
+    var batch_size: usize = 0;
+    try testing.expectEqual(Result.HasData, albedo_replication_read(primary, initial_cursor, 0, &batch_ptr, &batch_size));
+    try testing.expect(batch_size > 0);
+
+    var replica_cursor: ?*ReplicationCursorHandle = null;
+    try testing.expectEqual(Result.OK, albedo_replication_apply(replica, @ptrCast(batch_ptr), batch_size, &replica_cursor));
+    defer if (replica_cursor) |cursor| {
+        testing.expectEqual(Result.OK, albedo_replication_cursor_close(cursor)) catch unreachable;
+    };
+    albedo_free(batch_ptr, batch_size);
+
+    var primary_cursor: ?*ReplicationCursorHandle = null;
+    try testing.expectEqual(Result.OK, albedo_replication_cursor(primary, &primary_cursor));
+    defer if (primary_cursor) |cursor| {
+        testing.expectEqual(Result.OK, albedo_replication_cursor_close(cursor)) catch unreachable;
+    };
+    try testing.expectEqual(primary_cursor.?.cursor.generation, replica_cursor.?.cursor.generation);
+    try testing.expectEqual(primary_cursor.?.cursor.next_frame_index, replica_cursor.?.cursor.next_frame_index);
+
+    try testing.expectEqual(Result.EOS, albedo_replication_read(primary, replica_cursor, 0, &batch_ptr, &batch_size));
 }
 
 test "lib API open_with_options" {

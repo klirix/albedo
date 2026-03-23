@@ -32,9 +32,15 @@ const BucketHeader = struct {
     page_count: u64,
     doc_count: u64,
     deleted_count: u64,
-    reserved: [28]u8, // Padding to make the struct 64 bytes
+    replication_generation: u64 = 0,
+    reserved: [20]u8,
 
     const byteSize = 64;
+
+    comptime {
+        if (@sizeOf(BucketHeader) != byteSize)
+            @compileError("BucketHeader must be exactly 64 bytes");
+    }
 
     pub fn init() BucketHeader {
         var header = BucketHeader{
@@ -45,11 +51,11 @@ const BucketHeader = struct {
             .page_count = 0,
             .doc_count = 0,
             .deleted_count = 0,
-            .reserved = [_]u8{0} ** 28,
+            .replication_generation = 0,
+            .reserved = [_]u8{0} ** 20,
         };
 
         std.mem.copyForwards(u8, &header.magic, ALBEDO_MAGIC);
-        // std.mem.copyForwards(u8, &header.reserved, [_]u8{0} ** 28);
 
         return header;
     }
@@ -63,17 +69,17 @@ const BucketHeader = struct {
             .page_count = std.mem.readInt(u64, memory[12..20], .little),
             .doc_count = std.mem.readInt(u64, memory[20..28], .little),
             .deleted_count = std.mem.readInt(u64, memory[28..36], .little),
-            .reserved = undefined,
+            .replication_generation = std.mem.readInt(u64, memory[36..44], .little),
+            .reserved = [_]u8{0} ** 20,
         };
 
         std.mem.copyForwards(u8, header.magic[0..], ALBEDO_MAGIC);
-        std.mem.copyForwards(u8, header.reserved[0..], &[_]u8{0} ** 28);
 
         return header;
     }
 
     pub fn toBytes(self: *const BucketHeader) [byteSize]u8 {
-        var buffer: [byteSize]u8 = undefined;
+        var buffer: [byteSize]u8 = [_]u8{0} ** byteSize;
         std.mem.copyForwards(u8, buffer[0..6], ALBEDO_MAGIC);
         buffer[6] = self.version;
         buffer[7] = self.flags;
@@ -81,13 +87,63 @@ const BucketHeader = struct {
         std.mem.writeInt(u64, buffer[12..20], self.page_count, .little);
         std.mem.writeInt(u64, buffer[20..28], self.doc_count, .little);
         std.mem.writeInt(u64, buffer[28..36], self.deleted_count, .little);
-        std.mem.copyForwards(u8, buffer[36..], &self.reserved);
+        std.mem.writeInt(u64, buffer[36..44], self.replication_generation, .little);
+        std.mem.copyForwards(u8, buffer[44..64], &self.reserved);
         return buffer;
     }
 
     pub fn write(self: *const BucketHeader, writer: *std.Io.Writer) !void {
         const bytes = self.toBytes();
         _ = try writer.write(&bytes);
+    }
+};
+
+pub const ReplicationCursor = extern struct {
+    generation: u64,
+    next_frame_index: u64,
+};
+
+pub const ReplicationBatchHeader = extern struct {
+    magic: [4]u8 = .{ 'A', 'R', 'P', 'L' },
+    version: u16 = 1,
+    page_size: u16 = DEFAULT_PAGE_SIZE,
+    generation: u64 = 0,
+    start_frame_index: u64 = 0,
+    frame_count: u64 = 0,
+    wal_salt: u64 = 0,
+    latest_tx_timestamp: i64 = 0,
+
+    pub const byte_size: usize = 48;
+
+    comptime {
+        if (@sizeOf(ReplicationBatchHeader) != byte_size)
+            @compileError("ReplicationBatchHeader must be exactly 48 bytes");
+    }
+
+    pub fn toBytes(self: *const ReplicationBatchHeader) [byte_size]u8 {
+        var buf: [byte_size]u8 = undefined;
+        @memcpy(buf[0..4], &self.magic);
+        std.mem.writeInt(u16, buf[4..6], self.version, .little);
+        std.mem.writeInt(u16, buf[6..8], self.page_size, .little);
+        std.mem.writeInt(u64, buf[8..16], self.generation, .little);
+        std.mem.writeInt(u64, buf[16..24], self.start_frame_index, .little);
+        std.mem.writeInt(u64, buf[24..32], self.frame_count, .little);
+        std.mem.writeInt(u64, buf[32..40], self.wal_salt, .little);
+        std.mem.writeInt(i64, buf[40..48], self.latest_tx_timestamp, .little);
+        return buf;
+    }
+
+    pub fn fromBytes(raw: []const u8) ReplicationBatchHeader {
+        return .{
+            .magic = raw[0..4].*,
+            .version = std.mem.readInt(u16, raw[4..6], .little),
+            .page_size = std.mem.readInt(u16, raw[6..8], .little),
+            .generation = std.mem.readInt(u64, raw[8..16], .little),
+            .start_frame_index = std.mem.readInt(u64, raw[16..24], .little),
+            .frame_count = std.mem.readInt(u64, raw[24..32], .little),
+            .wal_salt = std.mem.readInt(u64, raw[32..40], .little),
+            .latest_tx_timestamp = std.mem.readInt(i64, raw[40..48], .little),
+        };
     }
 };
 
@@ -294,30 +350,6 @@ const BucketInitErrors = error{
     OplogSizeMismatch,
 };
 
-/// Callback function type for page replication
-/// Called after pages are written and synced to disk
-/// The data buffer contains a batch: [BucketHeader (64 bytes)][Page1 (8192 bytes)][Page2 (8192 bytes)]...
-/// Page IDs can be extracted by reading the page headers within the buffer
-/// Each page in the buffer is at offset: 64 + (page_index * 8192)
-/// Returns 0 on success, non-zero error code on failure (will retry on next sync)
-pub const PageChangeCallback = ?*const fn (
-    context: ?*anyopaque, // User-provided context
-    data: [*]const u8, // Raw data: header (64 bytes) + N pages (8192 bytes each)
-    data_size: u32, // Total size of data (BucketHeader.byteSize + page_count * DEFAULT_PAGE_SIZE)
-    page_count: u32, // Number of pages in the batch
-) callconv(.c) u8;
-
-/// Error codes returned by replication callback
-pub const ReplicationError = enum(u8) {
-    OK = 0,
-    NetworkError = 1,
-    DiskFull = 2,
-    InvalidFormat = 3,
-    ReplicaUnavailable = 4,
-    TimeoutError = 5,
-    UnknownError = 255,
-};
-
 /// Controls when fsync is called to guarantee write durability.
 pub const WriteDurability = union(enum) {
     /// Every write is fsynced immediately (safest, slowest).
@@ -358,15 +390,11 @@ pub const Bucket = struct {
     in_memory: bool = false,
     writes_since_sync: u32 = 0,
     write_durability: WriteDurability = .{ .periodic = 100 },
-    replication_callback: PageChangeCallback = null,
-    replication_context: ?*anyopaque = null,
-    dirty_pages: std.AutoHashMap(u64, void),
     wal_pending_pages: std.AutoHashMap(u64, void),
     wal_header_pending: bool = false,
-    replication_retry_count: u32 = 0,
-    max_replication_retries: u32 = 3,
     cached_last_data_page: ?*Page = null,
     read_durability: ReadDurability = .shared,
+    oplog_size: u32 = WAL.DEFAULT_OPLOG_REGION_SIZE,
     wal: ?WAL = null,
     active_tx: ?*Transaction = null,
     /// When true, mutation methods skip oplog emission (used by
@@ -505,9 +533,6 @@ pub const Bucket = struct {
                     }
                 }
                 try self.bucket.wal_pending_pages.put(page_id, {});
-                if (self.bucket.replication_callback != null) {
-                    try self.bucket.dirty_pages.put(page_id, {});
-                }
             }
 
             if (self.header_dirty) {
@@ -846,10 +871,10 @@ pub const Bucket = struct {
             .indexes = .init(ally),
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
-            .dirty_pages = std.AutoHashMap(u64, void).init(ally),
             .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .write_durability = options.write_durability,
             .read_durability = options.read_durability,
+            .oplog_size = options.oplog_size,
             .wal = null,
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
@@ -865,7 +890,7 @@ pub const Bucket = struct {
         if (bucket.file) |*f| f.sync() catch {};
 
         // Now attach the WAL for subsequent operations (if enabled).
-        bucket.wal = if (options.wal) try initWal(ally, path, options.oplog_size) else null;
+        bucket.wal = if (options.wal) try initWal(ally, path, options.oplog_size, bucket.header.replication_generation) else null;
 
         bucket.rwlock = .{};
 
@@ -884,9 +909,9 @@ pub const Bucket = struct {
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
             .in_memory = true,
-            .dirty_pages = std.AutoHashMap(u64, void).init(ally),
             .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .read_durability = options.read_durability,
+            .oplog_size = options.oplog_size,
         };
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
@@ -935,21 +960,22 @@ pub const Bucket = struct {
             return BucketInitErrors.UnexpectedError;
         };
 
-        const wal_instance: ?WAL = if (options.wal) try initWal(ally, path, options.oplog_size) else null;
+        const existing_header = BucketHeader.read(header_bytes[0..BucketHeader.byteSize]);
+        const wal_instance: ?WAL = if (options.wal) try initWal(ally, path, options.oplog_size, existing_header.replication_generation) else null;
 
         var bucket = Bucket{
             .file = file,
             .path = stored_path,
             .allocator = ally,
-            .header = .read(header_bytes[0..BucketHeader.byteSize]),
+            .header = existing_header,
             .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
             .autoVaccuum = options.auto_vaccuum,
             .objectIdGenerator = generator,
-            .dirty_pages = std.AutoHashMap(u64, void).init(ally),
             .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .write_durability = options.write_durability,
             .read_durability = options.read_durability,
+            .oplog_size = options.oplog_size,
             .wal = wal_instance,
         };
         errdefer {
@@ -1028,15 +1054,44 @@ pub const Bucket = struct {
     /// Build the WAL path (<db_path>-wal) and open/create the WAL.
     /// Returns `error.OplogSizeMismatch` when the SHM file was created with a
     /// different non-zero oplog_size, so the caller can surface it properly.
-    fn initWal(ally: std.mem.Allocator, db_path: []const u8, oplog_size: u32) BucketInitErrors!?WAL {
-        const wal_path = ally.alloc(u8, db_path.len + 4) catch return null;
+    fn initWal(ally: std.mem.Allocator, db_path: []const u8, oplog_size: u32, generation: u64) BucketInitErrors!WAL {
+        const wal_path = ally.alloc(u8, db_path.len + 4) catch return BucketInitErrors.OutOfMemory;
         defer ally.free(wal_path);
         @memcpy(wal_path[0..db_path.len], db_path);
         @memcpy(wal_path[db_path.len..], "-wal");
-        return WAL.init(ally, wal_path, oplog_size) catch |err| switch (err) {
+        return WAL.init(ally, wal_path, oplog_size, generation) catch |err| switch (err) {
             WAL.Error.WalOplogSizeMismatch => return BucketInitErrors.OplogSizeMismatch,
-            else => return null,
+            WAL.Error.WalOpenFailed,
+            WAL.Error.WalReadFailed,
+            WAL.Error.WalCorrupted,
+            WAL.Error.WalRecoveryFailed,
+            WAL.Error.WalWriteFailed,
+            WAL.Error.WalSyncFailed,
+            WAL.Error.WalIndexFailed,
+            WAL.Error.WalPageNotFound,
+            => return BucketInitErrors.InitializationError,
         };
+    }
+
+    fn persistHeaderToMainFile(self: *Bucket) void {
+        if (self.in_memory) return;
+        const file = if (self.file) |*f| f else return;
+        const bytes = self.header.toBytes();
+        file.pwriteAll(bytes[0..], 0) catch return;
+        file.sync() catch return;
+    }
+
+    fn bumpReplicationGeneration(self: *Bucket) void {
+        const next_generation = self.nextReplicationGeneration() catch return;
+        self.header.replication_generation = next_generation;
+        self.persistHeaderToMainFile();
+        if (self.wal) |*w| {
+            w.setGeneration(next_generation) catch {};
+        }
+    }
+
+    fn nextReplicationGeneration(self: *const Bucket) error{ReplicationGenerationExhausted}!u64 {
+        return std.math.add(u64, self.header.replication_generation, 1) catch error.ReplicationGenerationExhausted;
     }
 
     fn flushHeader(self: *Bucket) !void {
@@ -1299,11 +1354,6 @@ pub const Bucket = struct {
             // This mirrors SQLite behaviour: only the final committed page
             // state reaches the WAL, not every intermediate B+ tree write.
             try self.wal_pending_pages.put(page.header.page_id, {});
-
-            // Track dirty page for replication.
-            if (self.replication_callback != null) {
-                try self.dirty_pages.put(page.header.page_id, {});
-            }
             return;
         }
 
@@ -1312,9 +1362,6 @@ pub const Bucket = struct {
         // regardless of how many intermediate B+ tree modifications touched it.
         if (!self.in_memory) {
             try self.wal_pending_pages.put(page.header.page_id, {});
-            if (self.replication_callback != null) {
-                try self.dirty_pages.put(page.header.page_id, {});
-            }
             return;
         }
     }
@@ -1331,12 +1378,10 @@ pub const Bucket = struct {
                     self.writes_since_sync = 0;
                     if (self.wal) |*w| {
                         w.sync() catch {};
-                        self.notifyDirtyPages() catch {};
                         return;
                     }
                     if (self.file) |*f| {
                         f.sync() catch {};
-                        self.notifyDirtyPages() catch {};
                     }
                 }
             },
@@ -1429,14 +1474,13 @@ pub const Bucket = struct {
 
             if (self.write_durability == .all) {
                 w.sync() catch {};
-                self.notifyDirtyPages() catch {};
                 return;
             }
             self.maybeSyncPeriodic();
             return;
         }
 
-        // No-WAL path: pwrite each unique dirty page directly to the DB file.
+        // No-WAL path: pwrite each staged page directly to the DB file.
         const file = if (self.file) |*f| f else {
             self.wal_pending_pages.clearRetainingCapacity();
             self.wal_header_pending = false;
@@ -1464,82 +1508,11 @@ pub const Bucket = struct {
             self.wal_header_pending = false;
         }
 
-        if (self.replication_callback != null) {
-            self.notifyDirtyPages() catch {};
-        }
-
         if (self.write_durability == .all) {
             file.sync() catch {};
-            self.notifyDirtyPages() catch {};
             return;
         }
         self.maybeSyncPeriodic();
-    }
-
-    /// Notify replication callback of dirty pages and clear the list
-    fn notifyDirtyPages(self: *Bucket) !void {
-        if (self.replication_callback == null or self.dirty_pages.count() == 0) {
-            return;
-        }
-
-        const callback = self.replication_callback.?;
-        const page_count = self.dirty_pages.count();
-
-        // Calculate total buffer size: header + all dirty pages
-        const total_size = BucketHeader.byteSize + (page_count * DEFAULT_PAGE_SIZE);
-
-        // Allocate buffer for batched replication
-        const buffer = try self.allocator.alloc(u8, total_size);
-        defer self.allocator.free(buffer);
-
-        // First 64 bytes: bucket header
-        const header_bytes = self.header.toBytes();
-        @memcpy(buffer[0..BucketHeader.byteSize], &header_bytes);
-
-        // Pack all dirty pages into buffer
-        var iterator = self.dirty_pages.keyIterator();
-        var i: usize = 0;
-        while (iterator.next()) |page_id_ptr| : (i += 1) {
-            const page = try self.loadPage(page_id_ptr.*);
-            const offset = BucketHeader.byteSize + (i * DEFAULT_PAGE_SIZE);
-
-            // Write page header (32 bytes)
-            const page_header_bytes = PageHeader.write(&page.header);
-            @memcpy(buffer[offset .. offset + PageHeader.byteSize], &page_header_bytes);
-
-            // Write page data
-            @memcpy(buffer[offset + PageHeader.byteSize .. offset + DEFAULT_PAGE_SIZE], page.data);
-        }
-
-        // Call the callback once with all pages and check acknowledgement
-        const result = callback(
-            self.replication_context,
-            buffer.ptr,
-            @intCast(total_size),
-            @intCast(page_count),
-        );
-
-        // Handle callback result
-        if (result == @intFromEnum(ReplicationError.OK)) {
-            // Success: clear dirty pages and reset retry counter
-            self.dirty_pages.clearRetainingCapacity();
-            self.replication_retry_count = 0;
-        } else {
-            // Failure: keep dirty pages for retry
-            self.replication_retry_count += 1;
-
-            // Check if we've exceeded max retries
-            if (self.replication_retry_count >= self.max_replication_retries) {
-                // Log or handle max retries exceeded
-                // For now, clear pages to prevent infinite retry
-                // (application can implement custom logic via error codes)
-                self.dirty_pages.clearRetainingCapacity();
-                self.replication_retry_count = 0;
-                return error.ReplicationMaxRetriesExceeded;
-            }
-
-            return error.ReplicationFailed;
-        }
     }
 
     /// Force a sync of all pending writes to disk.
@@ -1563,88 +1536,156 @@ pub const Bucket = struct {
         }
 
         self.writes_since_sync = 0;
+    }
 
-        // Trigger replication callback after flush
-        // Note: Replication errors are non-fatal - dirty pages kept for retry
-        self.notifyDirtyPages() catch {
-            // Replication failed, but data is safely on disk
-            // Dirty pages will be retried on next sync
+    fn invalidateCachedPage(self: *Bucket, page_id: u64) void {
+        if (self.pageCache.remove(page_id)) |old_page| {
+            old_page.deinit(self.allocator);
+            self.allocator.destroy(old_page);
+        }
+        if (self.cached_last_data_page) |last_page| {
+            if (last_page.header.page_id == page_id) {
+                self.cached_last_data_page = null;
+            }
+        }
+    }
+
+    fn resetLoadedIndexes(self: *Bucket) void {
+        var idx_iter = self.indexes.iterator();
+        while (idx_iter.next()) |pair| {
+            const index_ptr = pair.value_ptr.*;
+            const key = pair.key_ptr.*;
+            self.allocator.destroy(index_ptr);
+            self.allocator.free(key);
+        }
+        self.indexes.clearRetainingCapacity();
+    }
+
+    pub fn replicationCursor(self: *Bucket) !ReplicationCursor {
+        if (self.in_memory or self.wal == null) return error.WalNotActive;
+        return .{
+            .generation = self.header.replication_generation,
+            .next_frame_index = self.wal.?.header.frame_count,
         };
     }
 
-    /// Apply replicated pages to this bucket (for replicas)
-    /// This writes raw page data directly to disk and invalidates the cache
-    /// Buffer format: [BucketHeader (64 bytes)][Page1 (8192)][Page2 (8192)]...
-    pub fn applyReplicatedBatch(self: *Bucket, data: []const u8, page_count: u32) !void {
-        if (self.in_memory) {
-            return error.ReplicationNotSupported;
+    pub fn readReplicationBatch(self: *Bucket, from: ReplicationCursor, max_bytes: usize, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.in_memory or self.wal == null) return error.WalNotActive;
+
+        const generation = self.header.replication_generation;
+        if (from.generation < generation) return error.ReplicationGap;
+        if (from.generation > generation) return error.InvalidCursor;
+
+        const w = &(self.wal.?);
+        const committed_frame_count = w.header.frame_count;
+        if (from.next_frame_index > committed_frame_count) return error.InvalidCursor;
+        if (from.next_frame_index == committed_frame_count) return null;
+
+        if (max_bytes != 0 and max_bytes < ReplicationBatchHeader.byte_size + WAL.frame_size) {
+            return error.InvalidArgument;
         }
 
-        const expected_size = BucketHeader.byteSize + (@as(usize, page_count) * DEFAULT_PAGE_SIZE);
-        if (data.len != expected_size) {
-            return error.InvalidBatchSize;
+        var frame_count = committed_frame_count - from.next_frame_index;
+        if (max_bytes != 0) {
+            const frame_capacity = (max_bytes - ReplicationBatchHeader.byte_size) / WAL.frame_size;
+            if (frame_capacity == 0) return error.InvalidArgument;
+            frame_count = @min(frame_count, @as(u64, @intCast(frame_capacity)));
         }
 
-        const file = if (self.file) |*f| f else return error.StorageUnavailable;
+        const frame_bytes_len = try std.math.mul(usize, @as(usize, @intCast(frame_count)), WAL.frame_size);
+        const total_size = ReplicationBatchHeader.byte_size + frame_bytes_len;
+        const batch = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(batch);
 
-        // Extract and apply bucket header (first 64 bytes)
-        const header_data = data[0..BucketHeader.byteSize];
-        const new_header = BucketHeader.read(header_data);
+        const header = ReplicationBatchHeader{
+            .generation = generation,
+            .start_frame_index = from.next_frame_index,
+            .frame_count = frame_count,
+            .wal_salt = w.header.salt,
+            .latest_tx_timestamp = w.latest_committed_tx,
+        };
+        const header_bytes = header.toBytes();
+        @memcpy(batch[0..ReplicationBatchHeader.byte_size], &header_bytes);
 
-        // Update our header with the replicated values
-        self.header = new_header;
-        try self.flushHeader();
+        const wal_offset = @as(u64, WAL.Header.byte_size) + from.next_frame_index * @as(u64, WAL.frame_size);
+        const n = (std.fs.File{ .handle = w.read_fd }).preadAll(batch[ReplicationBatchHeader.byte_size..], wal_offset) catch return error.WalReadFailed;
+        if (n != frame_bytes_len) return error.WalReadFailed;
+
+        return batch;
+    }
+
+    pub fn applyReplicationBatch(self: *Bucket, batch: []const u8) !ReplicationCursor {
+        if (self.in_memory or self.wal == null) return error.WalNotActive;
+        if (batch.len < ReplicationBatchHeader.byte_size) return error.InvalidFormat;
+
+        const batch_header = ReplicationBatchHeader.fromBytes(batch[0..ReplicationBatchHeader.byte_size]);
+        if (!std.mem.eql(u8, &batch_header.magic, &[_]u8{ 'A', 'R', 'P', 'L' })) return error.InvalidFormat;
+        if (batch_header.version != 1) return error.InvalidFormat;
+        if (batch_header.page_size != DEFAULT_PAGE_SIZE or batch_header.page_size != @as(u16, @intCast(self.header.page_size))) return error.InvalidFormat;
+        if (batch_header.frame_count == 0) return error.InvalidFormat;
+        if (batch_header.generation != self.header.replication_generation) return error.ReplicationGap;
+
+        const frame_bytes_len = try std.math.mul(usize, @as(usize, @intCast(batch_header.frame_count)), WAL.frame_size);
+        const expected_size = ReplicationBatchHeader.byte_size + frame_bytes_len;
+        if (batch.len != expected_size) return error.InvalidFormat;
+
+        const w = &(self.wal.?);
+        if (w.header.frame_count == 0 and w.live_frame_count == 0 and w.header.salt != batch_header.wal_salt) {
+            try w.adoptSalt(batch_header.wal_salt);
+        }
+        if (w.header.salt != batch_header.wal_salt) return error.InvalidFormat;
+
+        const local_frame_count = w.header.frame_count;
+        const incoming_end = batch_header.start_frame_index + batch_header.frame_count;
+        const frame_bytes = batch[ReplicationBatchHeader.byte_size..];
+
+        if (batch_header.start_frame_index < local_frame_count) {
+            if (incoming_end > local_frame_count) return error.ReplicationGap;
+
+            const existing = try self.allocator.alloc(u8, frame_bytes.len);
+            defer self.allocator.free(existing);
+            const wal_offset = @as(u64, WAL.Header.byte_size) + batch_header.start_frame_index * @as(u64, WAL.frame_size);
+            const n = (std.fs.File{ .handle = w.read_fd }).preadAll(existing, wal_offset) catch return error.WalReadFailed;
+            if (n != existing.len) return error.WalReadFailed;
+            if (!std.mem.eql(u8, existing, frame_bytes)) return error.ReplicationGap;
+            return self.replicationCursor();
+        }
+
+        if (batch_header.start_frame_index != local_frame_count) return error.ReplicationGap;
+
+        try w.appendCommittedFrames(frame_bytes, batch_header.latest_tx_timestamp);
 
         var meta_page_replicated = false;
+        var replicated_header: ?BucketHeader = null;
+        var i: u64 = 0;
+        while (i < batch_header.frame_count) : (i += 1) {
+            const frame_start = ReplicationBatchHeader.byte_size + @as(usize, @intCast(i * WAL.frame_size));
+            const frame = batch[frame_start .. frame_start + WAL.frame_size];
+            const frame_header_bytes: *const [WAL.FrameHeader.byte_size]u8 = @ptrCast(frame[0..WAL.FrameHeader.byte_size].ptr);
+            const frame_header = WAL.FrameHeader.fromBytes(frame_header_bytes);
+            const page_data = frame[WAL.FrameHeader.byte_size..];
 
-        // Process each page in the batch
-        var i: u32 = 0;
-        while (i < page_count) : (i += 1) {
-            const page_data_start = BucketHeader.byteSize + (@as(usize, i) * DEFAULT_PAGE_SIZE);
-            const page_data_end = page_data_start + DEFAULT_PAGE_SIZE;
-            const page_data = data[page_data_start..page_data_end];
-
-            // Parse page header to get page_id
-            const page_header = PageHeader.read(page_data[0..PageHeader.byteSize]);
-            const page_id = page_header.page_id;
-
-            // Calculate file offset for this page
-            const page_offset = BucketHeader.byteSize + (page_id * DEFAULT_PAGE_SIZE);
-
-            // Write page data directly to file
-            try file.pwriteAll(page_data, page_offset);
-
-            // Invalidate page cache entry if it exists
-            if (self.pageCache.remove(page_id)) |old_page| {
-                old_page.deinit(self.allocator);
-                self.allocator.destroy(old_page);
-            }
-
-            // Track if meta page was replicated
-            if (page_id == 0) {
-                meta_page_replicated = true;
+            if (frame_header.page_id == WAL.HEADER_PAGE_ID) {
+                replicated_header = BucketHeader.read(page_data[0..BucketHeader.byteSize]);
+            } else {
+                self.invalidateCachedPage(frame_header.page_id);
+                if (frame_header.page_id == 0) {
+                    meta_page_replicated = true;
+                }
             }
         }
 
-        // Sync all changes to disk
-        try file.sync();
+        if (replicated_header) |header| {
+            self.header = header;
+        }
 
-        // Special handling for page 0 (meta page): reload indexes
         if (meta_page_replicated) {
-            // Clear existing indexes
-            var idx_iter = self.indexes.iterator();
-            while (idx_iter.next()) |pair| {
-                const index_ptr = pair.value_ptr.*;
-                const key = pair.key_ptr.*;
-                self.allocator.destroy(index_ptr);
-                self.allocator.free(key);
-            }
-            self.indexes.clearRetainingCapacity();
-
-            // Reload indexes from the newly written meta page
+            self.resetLoadedIndexes();
             const meta_page = try self.loadPage(0);
             try self.loadIndices(meta_page);
         }
+
+        return self.replicationCursor();
     }
 
     pub fn dump(self: *Bucket, dest_path: []const u8) !void {
@@ -1951,7 +1992,7 @@ pub const Bucket = struct {
         try self.flushHeader();
 
         if (autocommit) {
-            // Commit WAL transaction: flush each unique dirty page to WAL once and
+            // Commit WAL transaction: flush each staged page to WAL once and
             // optionally fsync. This is the correct place to do it — all in-memory
             // B+ tree modifications are complete and the page cache holds final state.
             self.commitWalTransaction();
@@ -4109,11 +4150,16 @@ pub const Bucket = struct {
         const tempFileName = try std.fmt.allocPrint(self.allocator, "{s}-temp", .{self.path});
         defer self.allocator.free(tempFileName);
         const cache_capacity = self.pageCache.capacity;
+        const reopen_wal = self.wal != null;
+        const next_generation = try self.nextReplicationGeneration();
         var newBucket = try Bucket.openFileWithOptions(self.allocator, tempFileName, .{
             .page_cache_capacity = cache_capacity,
             .auto_vaccuum = self.autoVaccuum,
+            .oplog_size = self.oplog_size,
         });
         defer newBucket.deinit();
+        newBucket.header.replication_generation = next_generation;
+        try newBucket.flushHeader();
         // defer fs.deleteFileAbsolute(tempFileName) catch |err| {
         // std.debug.print("Failed to delete existing temp file: {any}\n", .{err});
         // };
@@ -4158,6 +4204,10 @@ pub const Bucket = struct {
         // before we swap it into place.
         try newBucket.flush();
         newBucket.checkpointWal();
+        if (newBucket.wal) |*w| {
+            w.consumeAndClose();
+            newBucket.wal = null;
+        }
 
         const path = try self.allocator.dupe(u8, self.path);
         iterator.deinit();
@@ -4186,10 +4236,10 @@ pub const Bucket = struct {
         self.cached_last_data_page = null;
         // Reinitialize and reload indexes from the meta page
         self.indexes = .init(self.allocator);
-        // Reinitialize dirty_pages for replication tracking
-        self.dirty_pages = .init(self.allocator);
         self.wal_pending_pages = .init(self.allocator);
         self.wal_header_pending = false;
+        self.oplog_size = newBucket.oplog_size;
+        self.wal = if (reopen_wal) try initWal(self.allocator, path, self.oplog_size, self.header.replication_generation) else null;
         const meta = try self.loadPage(0);
         try self.loadIndices(meta);
     }
@@ -4209,9 +4259,20 @@ pub const Bucket = struct {
             // Only checkpoint to the main file when we are the last
             // connection — other processes may still be reading the WAL.
             if (w.index.activeConnections() <= 1) {
-                self.checkpointWal();
+                if (self.nextReplicationGeneration()) |next_generation| {
+                    self.header.replication_generation = next_generation;
+                    self.persistHeaderToMainFile();
+                    w.setGeneration(next_generation) catch {};
+                    self.checkpointWal();
+                    w.consumeAndClose();
+                } else |_| {
+                    // Preserve the WAL if generation space is exhausted so we never
+                    // silently wrap and reuse replication cursor history.
+                    w.deinit();
+                }
+            } else {
+                w.consumeAndClose();
             }
-            w.consumeAndClose();
             self.wal = null;
         }
 
@@ -4228,9 +4289,6 @@ pub const Bucket = struct {
         self.pageCache.clear(self.allocator);
         self.pageCache.deinit();
 
-        // Free dirty pages list (only if it has been allocated)
-        // Cleanup dirty pages set
-        self.dirty_pages.deinit();
         self.wal_pending_pages.deinit();
 
         // Free path
@@ -4582,7 +4640,7 @@ test "Bucket.Transaction reduces WAL frame count" {
     const doc_a2 = try bson.fmt.serialize(.{ .seq = @as(i32, 2) }, a_ally);
     _ = try bucket_a.insert(doc_a1);
     _ = try bucket_a.insert(doc_a2);
-    const standalone_frames = bucket_a.wal.?.header.frame_count;
+    const standalone_frames = bucket_a.wal.?.live_frame_count;
 
     var arena_b = std.heap.ArenaAllocator.init(allocator);
     defer arena_b.deinit();
@@ -4597,7 +4655,7 @@ test "Bucket.Transaction reduces WAL frame count" {
     _ = try tx.insert(doc_b1);
     _ = try tx.insert(doc_b2);
     try tx.commit();
-    const transaction_frames = bucket_b.wal.?.header.frame_count;
+    const transaction_frames = bucket_b.wal.?.live_frame_count;
 
     try testing.expect(transaction_frames < standalone_frames);
 }
@@ -5690,59 +5748,39 @@ test "Bucket.reverse index with sort queries" {
     }
 }
 
-test "Bucket.replication with page streaming" {
+test "Bucket.replication with WAL batches" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Create primary bucket
-    var primary = try Bucket.init(allocator, "replication-primary.bucket");
+    const primary_path = "replication-primary.bucket";
+    const primary_wal_path = std.fmt.comptimePrint("{s}-wal", .{primary_path});
+    const primary_shm_path = std.fmt.comptimePrint("{s}-wal-shm", .{primary_path});
+    const replica_path = "replication-replica.bucket";
+    const replica_wal_path = std.fmt.comptimePrint("{s}-wal", .{replica_path});
+    const replica_shm_path = std.fmt.comptimePrint("{s}-wal-shm", .{replica_path});
+
+    platform.deleteFile(primary_path) catch {};
+    std.fs.cwd().deleteFile(primary_wal_path) catch {};
+    std.fs.cwd().deleteFile(primary_shm_path) catch {};
+    platform.deleteFile(replica_path) catch {};
+    std.fs.cwd().deleteFile(replica_wal_path) catch {};
+    std.fs.cwd().deleteFile(replica_shm_path) catch {};
+    defer platform.deleteFile(primary_path) catch {};
+    defer std.fs.cwd().deleteFile(primary_wal_path) catch {};
+    defer std.fs.cwd().deleteFile(primary_shm_path) catch {};
+    defer platform.deleteFile(replica_path) catch {};
+    defer std.fs.cwd().deleteFile(replica_wal_path) catch {};
+    defer std.fs.cwd().deleteFile(replica_shm_path) catch {};
+
+    var primary = try Bucket.openFileWithOptions(allocator, primary_path, .{ .wal = true });
     defer primary.deinit();
-    defer platform.deleteFile("replication-primary.bucket") catch {};
-
-    // Create replica bucket
-    var replica = try Bucket.init(allocator, "replication-replica.bucket");
+    var replica = try Bucket.openFileWithOptions(allocator, replica_path, .{ .wal = true });
     defer replica.deinit();
-    defer platform.deleteFile("replication-replica.bucket") catch {};
-
-    // Context to track replicated pages
-    const ReplicationContext = struct {
-        replica_bucket: *Bucket,
-        pages_replicated: usize = 0,
-        last_page_id: u64 = 0,
-    };
-
-    var ctx = ReplicationContext{
-        .replica_bucket = &replica,
-    };
-
-    // Define callback that applies pages to replica
-    const replicationCallback = struct {
-        fn callback(
-            context: ?*anyopaque,
-            page_data: [*]const u8,
-            data_size: u32,
-            page_count: u32,
-        ) callconv(.c) u8 {
-            const self: *ReplicationContext = @ptrCast(@alignCast(context.?));
-            const page_slice = page_data[0..data_size];
-
-            // Apply page to replica
-            self.replica_bucket.applyReplicatedBatch(page_slice, page_count) catch |err| {
-                std.debug.print("Failed to apply replicated page: {any}\n", .{err});
-                return 1;
-            };
-
-            self.pages_replicated += page_count;
-            return 0;
-        }
-    }.callback;
-
-    // Set replication callback on primary
-    primary.replication_callback = replicationCallback;
-    primary.replication_context = &ctx;
 
     const Person = struct { name: []const u8, age: i32 };
+    const initial_cursor = try primary.replicationCursor();
+
     // Insert documents into primary
     const test_docs = [_]Person{
         .{ .name = "Alice", .age = 30 },
@@ -5759,9 +5797,13 @@ test "Bucket.replication with page streaming" {
     // Force flush to trigger replication
     try primary.flush();
 
-    // Verify pages were replicated
-    try testing.expect(ctx.pages_replicated > 0);
-    // std.debug.print("Replicated {d} pages\n", .{ctx.pages_replicated});
+    const batch1 = (try primary.readReplicationBatch(initial_cursor, 0, allocator)) orelse return error.TestExpectedEqual;
+    defer allocator.free(batch1);
+    const replica_cursor1 = try replica.applyReplicationBatch(batch1);
+    const primary_cursor1 = try primary.replicationCursor();
+    try testing.expectEqual(primary_cursor1.generation, replica_cursor1.generation);
+    try testing.expectEqual(primary_cursor1.next_frame_index, replica_cursor1.next_frame_index);
+    try testing.expect((try primary.readReplicationBatch(primary_cursor1, 0, allocator)) == null);
 
     // Clear replica's cache to force reading from disk
     replica.pageCache.clear(allocator);
@@ -5799,15 +5841,11 @@ test "Bucket.replication with page streaming" {
 
     // Verify all documents were replicated
     try testing.expectEqual(@as(usize, 3), docs_found);
-
-    // Verify expected names exist
     try testing.expect(alice_found);
     try testing.expect(bob_found);
     try testing.expect(carol_found);
 
     // Test incremental replication: insert more docs
-    ctx.pages_replicated = 0; // Reset counter
-
     const more_docs = [_]Person{
         .{ .name = "Dave", .age = 28 },
         .{ .name = "Eve", .age = 32 },
@@ -5821,9 +5859,15 @@ test "Bucket.replication with page streaming" {
 
     try primary.flush();
 
-    // Verify incremental pages were replicated
-    try testing.expect(ctx.pages_replicated > 0);
-    // std.debug.print("Incrementally replicated {d} more pages\n", .{ctx.pages_replicated});
+    const batch2 = (try primary.readReplicationBatch(replica_cursor1, 0, allocator)) orelse return error.TestExpectedEqual;
+    defer allocator.free(batch2);
+    const replica_cursor2 = try replica.applyReplicationBatch(batch2);
+    const primary_cursor2 = try primary.replicationCursor();
+    try testing.expectEqual(primary_cursor2.next_frame_index, replica_cursor2.next_frame_index);
+
+    // Idempotent replay of the same batch is a no-op.
+    const replay_cursor = try replica.applyReplicationBatch(batch2);
+    try testing.expectEqual(replica_cursor2.next_frame_index, replay_cursor.next_frame_index);
 
     // Clear cache again
     replica.pageCache.clear(allocator);
@@ -5839,7 +5883,6 @@ test "Bucket.replication with page streaming" {
     }
 
     try testing.expectEqual(@as(usize, 5), docs_found);
-    // std.debug.print("Replication test completed successfully!\n", .{});
 }
 
 test "Deleting removes index entries for scalar field" {
@@ -5899,7 +5942,7 @@ test "Deleting removes index entries for scalar field" {
     try testing.expectEqual(@as(usize, 0), count_after);
 }
 
-test "Bucket WAL restore recovers data after simulated crash" {
+test "Bucket clean close invalidates saved WAL generation" {
     const allocator = std.testing.allocator;
     const db_path = "albedo_test_wal_restore.bucket";
     const wal_path = "albedo_test_wal_restore.bucket-wal";
@@ -5979,43 +6022,80 @@ test "Bucket WAL restore recovers data after simulated crash" {
         try wal_file.sync();
     }
 
-    // ── Phase 3: reopen — replayWal should restore the data ───────
+    // ── Phase 3: reopen — stale WAL generation should be rejected ─
 
     {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const ally = arena.allocator();
 
-        var bucket = try Bucket.openFile(ally, db_path);
-        defer bucket.deinit();
-
-        // The WAL replay should have restored all three documents.
-        try testing.expectEqual(@as(u64, 3), bucket.header.doc_count);
-
-        // Verify we can actually read back the documents.
-        var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, ally);
-        defer qDoc.deinit(ally);
-        const q = try query.Query.parse(ally, qDoc);
-
-        const docs = try bucket.list(ally, q);
-        try testing.expectEqual(@as(usize, 3), docs.len);
-
-        // Verify names are present (order may vary).
-        var found_alice = false;
-        var found_bob = false;
-        var found_charlie = false;
-        for (docs) |d| {
-            if (d.get("name")) |v| {
-                const name = v.string.value;
-                if (std.mem.eql(u8, name, "Alice")) found_alice = true;
-                if (std.mem.eql(u8, name, "Bob")) found_bob = true;
-                if (std.mem.eql(u8, name, "Charlie")) found_charlie = true;
-            }
-        }
-        try testing.expect(found_alice);
-        try testing.expect(found_bob);
-        try testing.expect(found_charlie);
+        try testing.expectError(BucketInitErrors.InitializationError, Bucket.openFile(ally, db_path));
     }
+}
+
+test "Bucket preserves WAL history when replication generation is exhausted" {
+    const allocator = std.testing.allocator;
+    const db_path = "albedo_test_replication_generation_exhausted.bucket";
+    const wal_path = "albedo_test_replication_generation_exhausted.bucket-wal";
+    const shm_path = "albedo_test_replication_generation_exhausted.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    {
+        var bucket = try Bucket.openFileWithOptions(allocator, db_path, .{ .wal = true });
+        bucket.header.replication_generation = std.math.maxInt(u64);
+        bucket.persistHeaderToMainFile();
+        if (bucket.wal) |*w| {
+            try w.setGeneration(std.math.maxInt(u64));
+        }
+
+        var doc = try bson.fmt.serialize(.{ .name = "Alice" }, allocator);
+        defer doc.deinit(allocator);
+        _ = try bucket.insert(doc);
+        try bucket.flush();
+        bucket.deinit();
+    }
+
+    try std.fs.cwd().access(wal_path, .{});
+    try std.fs.cwd().access(shm_path, .{});
+
+    {
+        var reopened = try Bucket.openFileWithOptions(allocator, db_path, .{ .wal = true });
+        defer reopened.deinit();
+
+        try testing.expectEqual(std.math.maxInt(u64), reopened.header.replication_generation);
+        try testing.expectEqual(@as(u64, 1), reopened.header.doc_count);
+    }
+}
+
+test "Bucket.vacuum fails when replication generation is exhausted" {
+    const allocator = std.testing.allocator;
+    const db_path = "albedo_test_vacuum_generation_exhausted.bucket";
+    const wal_path = "albedo_test_vacuum_generation_exhausted.bucket-wal";
+    const shm_path = "albedo_test_vacuum_generation_exhausted.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var bucket = try Bucket.openFileWithOptions(allocator, db_path, .{ .wal = true });
+    defer bucket.deinit();
+
+    bucket.header.replication_generation = std.math.maxInt(u64);
+    bucket.persistHeaderToMainFile();
+    if (bucket.wal) |*w| {
+        try w.setGeneration(std.math.maxInt(u64));
+    }
+
+    try testing.expectError(error.ReplicationGenerationExhausted, bucket.vacuum());
 }
 
 test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {

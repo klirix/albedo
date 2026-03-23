@@ -64,24 +64,25 @@ const win_mmap = if (builtin.os.tag == .windows) struct {
 /// Supported on POSIX (Linux / macOS) and Windows.
 pub const WAL = struct {
 
-    // ── WAL Header (40 bytes) ─────────────────────────────────────────
+    // ── WAL Header (48 bytes) ─────────────────────────────────────────
 
     /// Persisted at the start of every WAL file.
     pub const Header = extern struct {
         magic: [4]u8 = .{ 'W', 'A', 'L', 0 },
-        version: u16 = 1,
+        version: u16 = 2,
         page_size: u16 = DEFAULT_PAGE_SIZE,
         frame_count: u64 = 0,
         salt: u64 = 0,
         checksum: u64 = 0,
         /// Timestamp of the latest committed transaction.
         tx_timestamp: i64 = 0,
+        generation: u64 = 0,
 
-        pub const byte_size: usize = 40;
+        pub const byte_size: usize = 48;
 
         comptime {
             if (@sizeOf(Header) != byte_size)
-                @compileError("WAL Header must be exactly 40 bytes");
+                @compileError("WAL Header must be exactly 48 bytes");
         }
 
         pub fn toBytes(self: *const Header) [byte_size]u8 {
@@ -93,6 +94,7 @@ pub const WAL = struct {
             std.mem.writeInt(u64, buf[16..24], self.salt, .little);
             std.mem.writeInt(u64, buf[24..32], self.checksum, .little);
             std.mem.writeInt(i64, buf[32..40], self.tx_timestamp, .little);
+            std.mem.writeInt(u64, buf[40..48], self.generation, .little);
             return buf;
         }
 
@@ -105,6 +107,7 @@ pub const WAL = struct {
                 .salt = std.mem.readInt(u64, raw[16..24], .little),
                 .checksum = std.mem.readInt(u64, raw[24..32], .little),
                 .tx_timestamp = std.mem.readInt(i64, raw[32..40], .little),
+                .generation = std.mem.readInt(u64, raw[40..48], .little),
             };
         }
     };
@@ -838,6 +841,8 @@ pub const WAL = struct {
     write_fd: NativeFd,
     read_fd: NativeFd,
     header: Header,
+    /// Total number of frames physically appended to the WAL file.
+    live_frame_count: u64,
     /// Next sequence number to assign.
     next_seq: u64,
     path: []const u8,
@@ -859,7 +864,7 @@ pub const WAL = struct {
     /// was created with a different non-zero size the call returns
     /// `Error.WalOplogSizeMismatch`.
     /// Supported on POSIX (Linux / macOS) and Windows.
-    pub fn init(allocator: std.mem.Allocator, path: []const u8, oplog_size: u32) Error!WAL {
+    pub fn init(allocator: std.mem.Allocator, path: []const u8, oplog_size: u32, generation: u64) Error!WAL {
         const stored_path = allocator.dupe(u8, path) catch return Error.WalOpenFailed;
         errdefer allocator.free(stored_path);
 
@@ -884,13 +889,34 @@ pub const WAL = struct {
             if (!std.mem.eql(u8, &wal_header.magic, &.{ 'W', 'A', 'L', 0 })) {
                 return Error.WalCorrupted;
             }
+            if (wal_header.version != 2) {
+                return Error.WalCorrupted;
+            }
+            if (wal_header.generation != generation) {
+                return Error.WalCorrupted;
+            }
 
-            next_seq = wal_header.frame_count + 1;
+            const committed_size = Header.byte_size + wal_header.frame_count * frame_size;
+            if (file_size_val < committed_size) {
+                return Error.WalCorrupted;
+            }
+            if (file_size_val > committed_size) {
+                ftruncateFile(write_fd, committed_size) catch return Error.WalWriteFailed;
+            }
+
+            if (wal_header.frame_count > 0) {
+                const last_offset = Header.byte_size + (wal_header.frame_count - 1) * frame_size;
+                var last_hdr_buf: [FrameHeader.byte_size]u8 = undefined;
+                preadAll(read_fd, &last_hdr_buf, last_offset) catch return Error.WalReadFailed;
+                const last_hdr = FrameHeader.fromBytes(&last_hdr_buf);
+                next_seq = last_hdr.commit_seq + 1;
+            }
         } else {
             // Seed the salt from OS randomness.
             var salt_bytes: [8]u8 = undefined;
             std.crypto.random.bytes(&salt_bytes);
             wal_header.salt = std.mem.readInt(u64, &salt_bytes, .little);
+            wal_header.generation = generation;
 
             // Write the initial header. Because the write fd is append-only and
             // the file is empty, this lands at offset 0.
@@ -912,6 +938,7 @@ pub const WAL = struct {
             .write_fd = write_fd,
             .read_fd = read_fd,
             .header = wal_header,
+            .live_frame_count = wal_header.frame_count,
             .next_seq = next_seq,
             .path = stored_path,
             .allocator = allocator,
@@ -975,7 +1002,7 @@ pub const WAL = struct {
     pub fn appendPage(self: *WAL, page_id: u64, page_data_buf: []const u8, tx_timestamp: i64) Error!void {
         std.debug.assert(page_data_buf.len == DEFAULT_PAGE_SIZE);
 
-        const wal_offset = Header.byte_size + self.header.frame_count * frame_size;
+        const wal_offset = Header.byte_size + self.live_frame_count * frame_size;
         const checksum = std.hash.XxHash3.hash(self.header.salt, page_data_buf);
 
         const frame_hdr = FrameHeader{
@@ -994,7 +1021,7 @@ pub const WAL = struct {
         writeAll(self.write_fd, &buf) catch return Error.WalWriteFailed;
 
         self.next_seq += 1;
-        self.header.frame_count += 1;
+        self.live_frame_count += 1;
 
         if (tx_timestamp > self.pending_max_tx) {
             self.pending_max_tx = tx_timestamp;
@@ -1011,6 +1038,7 @@ pub const WAL = struct {
     pub fn sync(self: *WAL) Error!void {
         fsync(self.write_fd) catch return Error.WalSyncFailed;
         self.latest_committed_tx = self.pending_max_tx;
+        self.header.frame_count = self.live_frame_count;
         self.header.tx_timestamp = self.latest_committed_tx;
         try self.writeHeader();
     }
@@ -1089,7 +1117,11 @@ pub const WAL = struct {
         ftruncateFile(self.write_fd, Header.byte_size) catch return Error.WalWriteFailed;
 
         self.header.frame_count = 0;
+        self.live_frame_count = 0;
         self.next_seq = 1;
+        self.latest_committed_tx = 0;
+        self.pending_max_tx = 0;
+        self.header.tx_timestamp = 0;
 
         try self.writeHeader();
         fsync(self.write_fd) catch return Error.WalSyncFailed;
@@ -1129,6 +1161,68 @@ pub const WAL = struct {
         const hdr_bytes = self.header.toBytes();
         pwriteAll(fd, &hdr_bytes, 0) catch return Error.WalWriteFailed;
         fsync(fd) catch return Error.WalSyncFailed;
+    }
+
+    pub fn setGeneration(self: *WAL, generation: u64) Error!void {
+        self.header.generation = generation;
+        try self.writeHeader();
+    }
+
+    pub fn adoptSalt(self: *WAL, salt: u64) Error!void {
+        if (self.header.frame_count != 0 or self.live_frame_count != 0) {
+            return Error.WalWriteFailed;
+        }
+        self.header.salt = salt;
+        try self.writeHeader();
+    }
+
+    pub fn appendCommittedFrames(self: *WAL, raw_frames: []const u8, latest_tx_timestamp: i64) Error!void {
+        if (raw_frames.len == 0) return;
+        if (raw_frames.len % frame_size != 0) return Error.WalCorrupted;
+
+        const old_live = self.live_frame_count;
+        const old_committed = self.header.frame_count;
+        const old_next_seq = self.next_seq;
+        const old_latest_tx = self.latest_committed_tx;
+        const old_pending_max = self.pending_max_tx;
+        const old_header_tx = self.header.tx_timestamp;
+        const frame_count: u64 = @intCast(raw_frames.len / frame_size);
+
+        writeAll(self.write_fd, raw_frames) catch return Error.WalWriteFailed;
+        fsync(self.write_fd) catch return Error.WalSyncFailed;
+
+        var last_commit_seq = old_next_seq - 1;
+        self.index.acquireWrite();
+        defer self.index.releaseWrite();
+
+        var i: u64 = 0;
+        while (i < frame_count) : (i += 1) {
+            const start = @as(usize, @intCast(i * frame_size));
+            const hdr_bytes: *const [FrameHeader.byte_size]u8 = @ptrCast(raw_frames[start .. start + FrameHeader.byte_size].ptr);
+            const hdr = FrameHeader.fromBytes(hdr_bytes);
+            const wal_offset = Header.byte_size + (old_live + i) * frame_size;
+            self.index.insert(hdr.page_id, hdr.tx_timestamp, wal_offset) catch {
+                ftruncateFile(self.write_fd, Header.byte_size + old_live * frame_size) catch {};
+                self.live_frame_count = old_live;
+                self.header.frame_count = old_committed;
+                self.next_seq = old_next_seq;
+                self.latest_committed_tx = old_latest_tx;
+                self.pending_max_tx = old_pending_max;
+                self.header.tx_timestamp = old_header_tx;
+                self.index.clear();
+                self.rebuildIndex() catch {};
+                return Error.WalIndexFailed;
+            };
+            last_commit_seq = hdr.commit_seq;
+        }
+
+        self.live_frame_count = old_live + frame_count;
+        self.header.frame_count = self.live_frame_count;
+        self.next_seq = last_commit_seq + 1;
+        self.latest_committed_tx = @max(self.latest_committed_tx, latest_tx_timestamp);
+        self.pending_max_tx = self.latest_committed_tx;
+        self.header.tx_timestamp = self.latest_committed_tx;
+        try self.writeHeader();
     }
 
     // ── Cross-platform file helpers ───────────────────────────────────
@@ -1235,19 +1329,21 @@ test "WAL header round-trip" {
 
     try std.testing.expectEqual(restored.frame_count, 42);
     try std.testing.expectEqual(restored.salt, 0xDEADBEEF);
-    try std.testing.expectEqual(restored.version, 1);
+    try std.testing.expectEqual(restored.version, 2);
     try std.testing.expectEqual(restored.tx_timestamp, 1700000000);
+    try std.testing.expectEqual(restored.generation, 0);
 }
 
 test "WAL header default values" {
     const hdr = WAL.Header{};
     try std.testing.expect(std.mem.eql(u8, &hdr.magic, &.{ 'W', 'A', 'L', 0 }));
-    try std.testing.expectEqual(hdr.version, 1);
+    try std.testing.expectEqual(hdr.version, 2);
     try std.testing.expectEqual(hdr.page_size, DEFAULT_PAGE_SIZE);
     try std.testing.expectEqual(hdr.frame_count, 0);
     try std.testing.expectEqual(hdr.salt, 0);
     try std.testing.expectEqual(hdr.checksum, 0);
     try std.testing.expectEqual(hdr.tx_timestamp, 0);
+    try std.testing.expectEqual(hdr.generation, 0);
 }
 
 test "WAL header serializes magic bytes correctly" {
@@ -1262,22 +1358,24 @@ test "WAL header serializes magic bytes correctly" {
 test "WAL header preserves all fields through round-trip" {
     const hdr = WAL.Header{
         .magic = .{ 'W', 'A', 'L', 0 },
-        .version = 1,
+        .version = 2,
         .page_size = 4096,
         .frame_count = std.math.maxInt(u64),
         .salt = 0x0123456789ABCDEF,
         .checksum = 0xFEDCBA9876543210,
         .tx_timestamp = -1234567890,
+        .generation = 99,
     };
     const bytes = hdr.toBytes();
     const restored = WAL.Header.fromBytes(&bytes);
 
-    try std.testing.expectEqual(restored.version, 1);
+    try std.testing.expectEqual(restored.version, 2);
     try std.testing.expectEqual(restored.page_size, 4096);
     try std.testing.expectEqual(restored.frame_count, std.math.maxInt(u64));
     try std.testing.expectEqual(restored.salt, 0x0123456789ABCDEF);
     try std.testing.expectEqual(restored.checksum, 0xFEDCBA9876543210);
     try std.testing.expectEqual(restored.tx_timestamp, -1234567890);
+    try std.testing.expectEqual(restored.generation, 99);
 }
 
 test "WAL header tx_timestamp survives negative values" {
@@ -1338,9 +1436,9 @@ test "WAL frame header zero values" {
 // ── Struct size tests ─────────────────────────────────────────────────
 
 test "WAL struct sizes" {
-    try std.testing.expectEqual(WAL.Header.byte_size, 40);
+    try std.testing.expectEqual(WAL.Header.byte_size, 48);
     try std.testing.expectEqual(WAL.FrameHeader.byte_size, 32);
-    try std.testing.expectEqual(@sizeOf(WAL.Header), 40);
+    try std.testing.expectEqual(@sizeOf(WAL.Header), 48);
     try std.testing.expectEqual(@sizeOf(WAL.FrameHeader), 32);
 }
 
@@ -1366,7 +1464,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- create & write two frames --
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1383,7 +1481,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- reopen and verify frames survive --
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         try std.testing.expectEqual(wal.header.frame_count, 2);
@@ -1408,7 +1506,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- after checkpoint the WAL is empty --
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
         try std.testing.expectEqual(wal.header.frame_count, 0);
     }
@@ -1430,7 +1528,7 @@ test "WAL corrupted magic is rejected on open" {
         try file.writeAll(&bytes);
     }
 
-    const result = WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    const result = WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     try std.testing.expectError(error.WalCorrupted, result);
 }
 
@@ -1441,7 +1539,7 @@ test "WAL sequence numbers increment correctly" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     try std.testing.expectEqual(wal.next_seq, 1);
@@ -1450,17 +1548,20 @@ test "WAL sequence numbers increment correctly" {
     @memset(&page_buf, 0x11);
     try wal.appendPage(0, &page_buf, 10);
     try std.testing.expectEqual(wal.next_seq, 2);
-    try std.testing.expectEqual(wal.header.frame_count, 1);
+    try std.testing.expectEqual(wal.live_frame_count, 1);
+    try std.testing.expectEqual(wal.header.frame_count, 0);
 
     @memset(&page_buf, 0x22);
     try wal.appendPage(1, &page_buf, 20);
     try std.testing.expectEqual(wal.next_seq, 3);
-    try std.testing.expectEqual(wal.header.frame_count, 2);
+    try std.testing.expectEqual(wal.live_frame_count, 2);
+    try std.testing.expectEqual(wal.header.frame_count, 0);
 
     @memset(&page_buf, 0x33);
     try wal.appendPage(2, &page_buf, 30);
     try std.testing.expectEqual(wal.next_seq, 4);
-    try std.testing.expectEqual(wal.header.frame_count, 3);
+    try std.testing.expectEqual(wal.live_frame_count, 3);
+    try std.testing.expectEqual(wal.header.frame_count, 0);
 }
 
 test "WAL same page can be written multiple times" {
@@ -1471,7 +1572,7 @@ test "WAL same page can be written multiple times" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1490,7 +1591,7 @@ test "WAL same page can be written multiple times" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1518,7 +1619,7 @@ test "WAL checkpoint then append starts fresh sequence" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1554,7 +1655,7 @@ test "WAL checksum validates page data integrity" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1572,7 +1673,7 @@ test "WAL checksum validates page data integrity" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1591,7 +1692,7 @@ test "WAL many frames stress test" {
     const num_frames: u64 = 64;
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1604,7 +1705,7 @@ test "WAL many frames stress test" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         try std.testing.expectEqual(wal.header.frame_count, num_frames);
@@ -1628,7 +1729,7 @@ test "WAL empty iterator returns null immediately" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var it = wal.frames();
@@ -1643,7 +1744,7 @@ test "WAL file size matches expected layout" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1676,14 +1777,14 @@ test "WAL page data is preserved byte-for-byte" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
         try wal.appendPage(42, &original, 1000);
         try wal.sync();
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1702,7 +1803,7 @@ test "WAL latest_committed_tx updates on sync" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     try std.testing.expectEqual(wal.latest_committed_tx, 0);
@@ -1733,7 +1834,7 @@ test "WAL latest_committed_tx persists across reopen" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1743,7 +1844,7 @@ test "WAL latest_committed_tx persists across reopen" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
         try std.testing.expectEqual(wal.latest_committed_tx, 500);
     }
@@ -1758,7 +1859,7 @@ test "WAL page_data returns correct data" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1778,7 +1879,7 @@ test "WAL page_data returns WalPageNotFound for missing page" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     const result = wal.page_data(99, 1000);
@@ -1792,7 +1893,7 @@ test "WAL page_data MVCC returns latest version <= max_tx" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1839,7 +1940,7 @@ test "WAL page_data with multiple pages and MVCC" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1883,7 +1984,7 @@ test "WAL page_data after checkpoint returns not found" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1998,7 +2099,7 @@ test "consumeAndClose deletes WAL and SHM files" {
 
     // Create a WAL, write a frame, then consume and close.
     {
-        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         @memset(&page_buf, 0xAB);
         try w.appendPage(1, &page_buf, 100);
@@ -2048,7 +2149,7 @@ test "deinit does not delete WAL files" {
     defer cleanupTestFiles(wal_path, shm_path);
 
     {
-        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         @memset(&page_buf, 0xCD);
         try w.appendPage(1, &page_buf, 200);
@@ -2069,14 +2170,14 @@ test "consumeAndClose preserves files when another connection is active" {
     defer cleanupTestFiles(wal_path, shm_path);
 
     // Open first WAL and write a frame.
-    var w1 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var w1 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
     @memset(&page_buf, 0xAB);
     try w1.appendPage(1, &page_buf, 100);
     try w1.sync();
 
     // Open a second connection to the same WAL.
-    var w2 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var w2 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
 
     // Two connections should be registered.
     try std.testing.expectEqual(@as(u32, 2), w1.index.activeConnections());
