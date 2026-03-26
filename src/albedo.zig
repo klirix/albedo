@@ -2733,13 +2733,16 @@ pub const Bucket = struct {
                 return error.UnsupportedCursorQuery;
             }
 
-            var root = BSONDocument.initEmpty();
-            var root_owned = false;
-            errdefer if (root_owned) root.deinit(allocator);
-
-            var next_root = try root.set(allocator, "version", .{ .int32 = .{ .value = 1 } });
-            root_owned = true;
-            root = next_root;
+            var builder = bson.Builder.init(allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
+            defer builder.deinit();
+            var root = builder.docEncoder();
+            root.putValue("version", .{ .int32 = .{ .value = 1 } }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
 
             const mode_value: []const u8 = switch (self.plan.source) {
                 .full_scan => "full_scan",
@@ -2748,41 +2751,47 @@ pub const Bucket = struct {
                 else
                     "index_range",
             };
-            next_root = try root.set(allocator, "mode", .{ .string = .{ .value = mode_value } });
-            root.deinit(allocator);
-            root = next_root;
+            root.putValue("mode", .{ .string = .{ .value = mode_value } }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
 
             if (self.plan.source == .index) {
                 const index_path = self.plan.index_path orelse return error.UnsupportedCursorQuery;
-                next_root = try root.set(allocator, "indexPath", BSONValue.init(index_path));
-                root.deinit(allocator);
-                root = next_root;
+                root.putValue("indexPath", BSONValue.init(index_path)) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
             }
 
             if (self.last_emitted) |anchor| {
-                var anchor_doc = BSONDocument.initEmpty();
-                var anchor_owned = false;
-                defer if (anchor_owned) anchor_doc.deinit(allocator);
-
-                var next_anchor = try anchor_doc.set(allocator, "docId", BSONValue.init(anchor.doc_id));
-                anchor_owned = true;
-                anchor_doc = next_anchor;
-                next_anchor = try anchor_doc.set(allocator, "_id", anchor.user_id);
-                anchor_doc.deinit(allocator);
-                anchor_doc = next_anchor;
-                next_anchor = try anchor_doc.set(allocator, "pageId", .{ .int64 = .{ .value = @intCast(anchor.page_id) } });
-                anchor_doc.deinit(allocator);
-                anchor_doc = next_anchor;
-                next_anchor = try anchor_doc.set(allocator, "offset", .{ .int32 = .{ .value = @intCast(anchor.offset) } });
-                anchor_doc.deinit(allocator);
-                anchor_doc = next_anchor;
-
-                next_root = try root.set(allocator, "anchor", BSONValue.init(anchor_doc));
-                root.deinit(allocator);
-                root = next_root;
+                var anchor_doc = root.object("anchor") catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+                anchor_doc.putValue("docId", BSONValue.init(anchor.doc_id)) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+                anchor_doc.putValue("_id", anchor.user_id) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+                anchor_doc.putValue("pageId", .{ .int64 = .{ .value = @intCast(anchor.page_id) } }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+                anchor_doc.putValue("offset", .{ .int32 = .{ .value = @intCast(anchor.offset) } }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+                anchor_doc.end() catch unreachable;
             }
 
-            return root;
+            return builder.finish() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
         }
 
         fn nextIndex(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
@@ -4877,7 +4886,10 @@ fn setupIndexQueryBucket(bucket: *Bucket, allocator: std.mem.Allocator) !void {
 }
 
 fn queryDocWithCursor(allocator: std.mem.Allocator, base: BSONDocument, cursor: BSONDocument) !BSONDocument {
-    return try base.set(allocator, "cursor", BSONValue.init(cursor));
+    var editor = bson.Editor.init(allocator, base);
+    defer editor.deinit();
+    try editor.setValue("cursor", BSONValue.init(cursor));
+    return try editor.finish();
 }
 
 test "Bucket.full scan cursor resumes after partial consumption" {

@@ -893,35 +893,20 @@ test "Query.parse cursor full_scan" {
     const ally = std.testing.allocator;
     const doc_id = try bson.ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
 
-    var anchor = bson.BSONDocument.initEmpty();
-    var next_anchor = try anchor.set(ally, "docId", bson.BSONValue.init(doc_id));
-    defer anchor.deinit(ally);
-    anchor = next_anchor;
-    next_anchor = try anchor.set(ally, "_id", .{ .string = .{ .value = "user-1" } });
-    anchor.deinit(ally);
-    anchor = next_anchor;
-    next_anchor = try anchor.set(ally, "pageId", .{ .int64 = .{ .value = 4 } });
-    anchor.deinit(ally);
-    anchor = next_anchor;
-    next_anchor = try anchor.set(ally, "offset", .{ .int32 = .{ .value = 16 } });
-    anchor.deinit(ally);
-    anchor = next_anchor;
-
-    var cursor = bson.BSONDocument.initEmpty();
-    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 1 } });
-    defer cursor.deinit(ally);
-    cursor = next_cursor;
-    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "full_scan" } });
-    cursor.deinit(ally);
-    cursor = next_cursor;
-    next_cursor = try cursor.set(ally, "anchor", bson.BSONValue.init(anchor));
-    cursor.deinit(ally);
-    cursor = next_cursor;
-
-    var queryDoc = bson.BSONDocument.initEmpty();
-    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    var builder = try bson.Builder.init(ally);
+    defer builder.deinit();
+    var cursor = try builder.object("cursor");
+    try cursor.put("version", @as(i32, 1));
+    try cursor.put("mode", "full_scan");
+    var anchor = try cursor.object("anchor");
+    try anchor.put("docId", doc_id);
+    try anchor.put("_id", "user-1");
+    try anchor.put("pageId", @as(i64, 4));
+    try anchor.put("offset", @as(i32, 16));
+    try anchor.end();
+    try cursor.end();
+    const queryDoc = try builder.finish();
     defer queryDoc.deinit(ally);
-    queryDoc = next_query_doc;
 
     var parsed = try Query.parse(ally, queryDoc);
     defer parsed.deinit(ally);
@@ -936,38 +921,21 @@ test "Query.parse cursor index_range" {
     const ally = std.testing.allocator;
     const doc_id = try bson.ObjectId.parseString("507c7f79bcf86cd7994f6c0f");
 
-    var anchor = bson.BSONDocument.initEmpty();
-    var next_anchor = try anchor.set(ally, "docId", bson.BSONValue.init(doc_id));
-    defer anchor.deinit(ally);
-    anchor = next_anchor;
-    next_anchor = try anchor.set(ally, "_id", .{ .string = .{ .value = "user-2" } });
-    anchor.deinit(ally);
-    anchor = next_anchor;
-    next_anchor = try anchor.set(ally, "pageId", .{ .int64 = .{ .value = 8 } });
-    anchor.deinit(ally);
-    anchor = next_anchor;
-    next_anchor = try anchor.set(ally, "offset", .{ .int32 = .{ .value = 24 } });
-    anchor.deinit(ally);
-    anchor = next_anchor;
-
-    var cursor = bson.BSONDocument.initEmpty();
-    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 1 } });
-    defer cursor.deinit(ally);
-    cursor = next_cursor;
-    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "index_range" } });
-    cursor.deinit(ally);
-    cursor = next_cursor;
-    next_cursor = try cursor.set(ally, "indexPath", .{ .string = .{ .value = "age" } });
-    cursor.deinit(ally);
-    cursor = next_cursor;
-    next_cursor = try cursor.set(ally, "anchor", bson.BSONValue.init(anchor));
-    cursor.deinit(ally);
-    cursor = next_cursor;
-
-    var queryDoc = bson.BSONDocument.initEmpty();
-    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    var builder = try bson.Builder.init(ally);
+    defer builder.deinit();
+    var cursor = try builder.object("cursor");
+    try cursor.put("version", @as(i32, 1));
+    try cursor.put("mode", "index_range");
+    try cursor.put("indexPath", "age");
+    var anchor = try cursor.object("anchor");
+    try anchor.put("docId", doc_id);
+    try anchor.put("_id", "user-2");
+    try anchor.put("pageId", @as(i64, 8));
+    try anchor.put("offset", @as(i32, 24));
+    try anchor.end();
+    try cursor.end();
+    const queryDoc = try builder.finish();
     defer queryDoc.deinit(ally);
-    queryDoc = next_query_doc;
 
     var parsed = try Query.parse(ally, queryDoc);
     defer parsed.deinit(ally);
@@ -978,36 +946,28 @@ test "Query.parse cursor index_range" {
 
 test "Query.parse cursor rejects invalid version" {
     const ally = std.testing.allocator;
-    var cursor = bson.BSONDocument.initEmpty();
-    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 2 } });
-    defer cursor.deinit(ally);
-    cursor = next_cursor;
-    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "full_scan" } });
-    cursor.deinit(ally);
-    cursor = next_cursor;
-
-    var queryDoc = bson.BSONDocument.initEmpty();
-    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    var builder = try bson.Builder.init(ally);
+    defer builder.deinit();
+    var cursor = try builder.object("cursor");
+    try cursor.put("version", @as(i32, 2));
+    try cursor.put("mode", "full_scan");
+    try cursor.end();
+    const queryDoc = try builder.finish();
     defer queryDoc.deinit(ally);
-    queryDoc = next_query_doc;
 
     try std.testing.expectError(error.InvalidCursorVersion, Query.parse(ally, queryDoc));
 }
 
 test "Query.parse cursor rejects missing index path" {
     const ally = std.testing.allocator;
-    var cursor = bson.BSONDocument.initEmpty();
-    var next_cursor = try cursor.set(ally, "version", .{ .int32 = .{ .value = 1 } });
-    defer cursor.deinit(ally);
-    cursor = next_cursor;
-    next_cursor = try cursor.set(ally, "mode", .{ .string = .{ .value = "index_range" } });
-    cursor.deinit(ally);
-    cursor = next_cursor;
-
-    var queryDoc = bson.BSONDocument.initEmpty();
-    const next_query_doc = try queryDoc.set(ally, "cursor", bson.BSONValue.init(cursor));
+    var builder = try bson.Builder.init(ally);
+    defer builder.deinit();
+    var cursor = try builder.object("cursor");
+    try cursor.put("version", @as(i32, 1));
+    try cursor.put("mode", "index_range");
+    try cursor.end();
+    const queryDoc = try builder.finish();
     defer queryDoc.deinit(ally);
-    queryDoc = next_query_doc;
 
     try std.testing.expectError(error.MissingCursorIndexPath, Query.parse(ally, queryDoc));
 }
@@ -1019,17 +979,23 @@ test "Query.match matches objectId correctly" {
 
     const objId = try bson.ObjectId.init();
 
-    var doc = bson.BSONDocument.initEmpty();
-    doc = try doc.set(ally, "_id", bson.BSONValue.init(objId));
+    var doc_builder = try bson.Builder.init(ally);
+    defer doc_builder.deinit();
+    try doc_builder.put("_id", objId);
+    const doc = try doc_builder.finish();
     defer doc.deinit(ally);
 
     const objId2 = try bson.ObjectId.init();
-    var doc2 = bson.BSONDocument.initEmpty();
-    doc2 = try doc.set(ally, "_id", bson.BSONValue.init(objId2));
+    var doc2_builder = try bson.Builder.init(ally);
+    defer doc2_builder.deinit();
+    try doc2_builder.put("_id", objId2);
+    const doc2 = try doc2_builder.finish();
     defer doc2.deinit(ally);
 
-    var queryDoc = bson.BSONDocument.initEmpty();
-    queryDoc = try queryDoc.set(ally, "query", bson.BSONValue.init(doc));
+    var query_builder = try bson.Builder.init(ally);
+    defer query_builder.deinit();
+    try query_builder.put("query", doc);
+    const queryDoc = try query_builder.finish();
     defer queryDoc.deinit(ally);
     // const buffer = try ally.alloc(u8, queryDoc.len);
     // queryDoc.serializeToMemory(buffer);

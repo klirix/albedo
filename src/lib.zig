@@ -289,49 +289,25 @@ pub export fn albedo_list_indexes(bucket: *albedo.Bucket, outDoc: *[*c]u8) Resul
     };
     defer index_info.deinit();
 
-    var indexes_doc = bson.BSONDocument.initEmpty();
-    var indexes_owned = false;
-    defer if (indexes_owned) indexes_doc.deinit(ally);
+    var builder = bson.Builder.init(ally) catch return Result.OutOfMemory;
+    defer builder.deinit();
+    var indexes = builder.object("indexes") catch return Result.OutOfMemory;
 
     for (index_info.indexes) |entry| {
         const options = entry.value.options;
-
-        // Build per-index options subdocument via formatter
-        var options_doc = bson.fmt.serialize(.{
-            .unique = options.unique == 1,
-            .sparse = options.sparse == 1,
-            .reverse = options.reverse == 1,
-        }, ally) catch |err| switch (err) {
-            error.OutOfMemory => return Result.OutOfMemory,
-            else => return Result.Error,
-        };
-        defer options_doc.deinit(ally);
-
-        // Attach options_doc under indexes.<path>
-        const index_value = bson.BSONValue{ .document = options_doc };
-        const next_indexes = indexes_doc.set(ally, entry.key, index_value) catch {
-            return Result.OutOfMemory;
-        };
-
-        if (indexes_owned) {
-            indexes_doc.deinit(ally);
-        } else {
-            indexes_owned = true;
-        }
-        indexes_doc = next_indexes;
-
-        // options_doc is freed via defer; set() copied its bytes
+        var options_doc = indexes.object(entry.key) catch return Result.OutOfMemory;
+        options_doc.put("unique", options.unique == 1) catch return Result.OutOfMemory;
+        options_doc.put("sparse", options.sparse == 1) catch return Result.OutOfMemory;
+        options_doc.put("reverse", options.reverse == 1) catch return Result.OutOfMemory;
+        options_doc.end() catch return Result.Error;
     }
 
-    var root_doc = bson.BSONDocument.initEmpty();
-    var root_owned = false;
-    defer if (root_owned) root_doc.deinit(ally);
-
-    const next_root = root_doc.set(ally, "indexes", bson.BSONValue{ .document = indexes_doc }) catch {
-        return Result.OutOfMemory;
+    indexes.end() catch return Result.Error;
+    const root_doc = builder.finish() catch |err| switch (err) {
+        error.OutOfMemory => return Result.OutOfMemory,
+        else => return Result.Error,
     };
-    root_owned = true;
-    root_doc = next_root;
+    defer root_doc.deinit(ally);
 
     const out_buf = ally.alloc(u8, root_doc.buffer.len) catch {
         return Result.OutOfMemory;

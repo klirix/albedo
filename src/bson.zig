@@ -1116,127 +1116,493 @@ pub const BSONDocument = struct {
     }
 
     pub fn unset(self: *const BSONDocument, allocator: mem.Allocator, key: []const u8) !BSONDocument {
-        // Use ArrayList for single-pass building
-        var list = std.ArrayList(u8){};
-        defer list.deinit(allocator);
-
-        // Reserve space for size field (will be written at the end)
-        try list.resize(allocator, 4);
-
-        var idx: usize = 4;
-        var found = false;
-
-        // Single pass: build new document while scanning
-        while (TypeNamePair.read(self.buffer[idx..])) |pair| {
-            const valueSize = BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
-
-            if (!mem.eql(u8, pair.name, key)) {
-                // Copy this element to the new document
-                try list.append(allocator, @intFromEnum(pair.type));
-                try list.appendSlice(allocator, pair.name);
-                try list.append(allocator, 0); // Null terminator for key
-                try list.appendSlice(allocator, self.buffer[idx + pair.len .. idx + pair.len + valueSize]);
-            } else {
-                found = true;
-            }
-
-            idx += pair.len + valueSize;
-        }
-
-        // Add document null terminator
-        try list.append(allocator, 0);
-
-        // Write the document size at the beginning
-        const finalBuffer = try list.toOwnedSlice(allocator);
-        std.mem.writeInt(u32, finalBuffer[0..4], @truncate(finalBuffer.len), .little);
-
-        return BSONDocument.init(finalBuffer);
+        var editor = Editor.init(allocator, self.*);
+        defer editor.deinit();
+        try editor.unset(key);
+        return try editor.finish();
     }
 
     pub fn set(self: BSONDocument, allocator: mem.Allocator, key: []const u8, value: BSONValue) !BSONDocument {
-        // Use ArrayList for single-pass building
-        var list = std.ArrayList(u8){};
-        defer list.deinit(allocator);
-
-        // Reserve space for size field (will be written at the end)
-        try list.resize(allocator, 4);
-
-        var idx: usize = 4;
-        var keyFound = false;
-
-        // Single pass: copy existing elements, skip the old value if key exists
-        while (TypeNamePair.read(self.buffer[idx..])) |pair| {
-            const valueSize = BSONValue.asessSize(self.buffer[idx + pair.len ..], pair.type);
-
-            if (mem.eql(u8, pair.name, key)) {
-                // Skip the old value - we'll add the new one at the end
-                keyFound = true;
-            } else {
-                // Copy this element to the new document
-                try list.append(allocator, @intFromEnum(pair.type));
-                try list.appendSlice(allocator, pair.name);
-                try list.append(allocator, 0); // Null terminator for key
-                try list.appendSlice(allocator, self.buffer[idx + pair.len .. idx + pair.len + valueSize]);
-            }
-
-            idx += pair.len + valueSize;
-        }
-
-        // Add the new/updated key-value pair
-        try list.append(allocator, @intFromEnum(value.valueType()));
-        try list.appendSlice(allocator, key);
-        try list.append(allocator, 0); // Null terminator for key
-
-        // Write the value based on its type
-        const writeIdx = list.items.len;
-        try list.resize(allocator, writeIdx + value.size());
-        switch (value) {
-            .string => {
-                value.string.write(list.items[writeIdx..]);
-            },
-            .double => {
-                value.double.write(list.items[writeIdx..]);
-            },
-            .int32 => {
-                value.int32.write(list.items[writeIdx..]);
-            },
-            .document, .array => |writable| {
-                @memcpy(list.items[writeIdx .. writeIdx + writable.buffer.len], writable.buffer);
-            },
-            .datetime => {
-                value.datetime.write(list.items[writeIdx..]);
-            },
-            .int64 => {
-                value.int64.write(list.items[writeIdx..]);
-            },
-            .binary => {
-                value.binary.write(list.items[writeIdx..]);
-            },
-            .boolean => {
-                list.items[writeIdx] = if (value.boolean.value) 0x01 else 0x00;
-            },
-            .null => {},
-            .maxKey => {},
-            .minKey => {},
-            .objectId => {
-                @memcpy(list.items[writeIdx .. writeIdx + 12], value.objectId.value.buffer[0..]);
-            },
-        }
-
-        // Add document null terminator
-        try list.append(allocator, 0);
-
-        // Write the document size at the beginning
-        const finalBuffer = try list.toOwnedSlice(allocator);
-        std.mem.writeInt(u32, finalBuffer[0..4], @truncate(finalBuffer.len), .little);
-
-        return BSONDocument.init(finalBuffer);
+        var editor = Editor.init(allocator, self);
+        defer editor.deinit();
+        try editor.setValue(key, value);
+        return try editor.finish();
     }
 
     pub fn deinit(self: *const BSONDocument, allocator: mem.Allocator) void {
         defer allocator.free(self.buffer);
     }
 };
+
+const ContainerKind = enum { document, array };
+
+const ContainerFrame = struct {
+    kind: ContainerKind,
+    len_pos: usize,
+    next_index: usize = 0,
+};
+
+pub const Builder = struct {
+    allocator: mem.Allocator,
+    buffer: std.ArrayList(u8) = .{},
+    frames: std.ArrayList(ContainerFrame) = .{},
+    finished: bool = false,
+
+    pub fn init(allocator: mem.Allocator) !Builder {
+        var builder = Builder{ .allocator = allocator };
+        try builder.buffer.resize(allocator, 4);
+        @memset(builder.buffer.items[0..4], 0);
+        try builder.frames.append(allocator, .{
+            .kind = .document,
+            .len_pos = 0,
+        });
+        return builder;
+    }
+
+    pub fn put(self: *Builder, key: []const u8, value: anytype) !void {
+        var root = self.rootEncoder();
+        try root.put(key, value);
+    }
+
+    pub fn putValue(self: *Builder, key: []const u8, value: BSONValue) !void {
+        var root = self.rootEncoder();
+        try root.putValue(key, value);
+    }
+
+    pub fn putNull(self: *Builder, key: []const u8) !void {
+        var root = self.rootEncoder();
+        try root.putNull(key);
+    }
+
+    pub fn object(self: *Builder, key: []const u8) !DocEncoder {
+        var root = self.rootEncoder();
+        return try root.object(key);
+    }
+
+    pub fn array(self: *Builder, key: []const u8) !ArrayEncoder {
+        var root = self.rootEncoder();
+        return try root.array(key);
+    }
+
+    pub fn finish(self: *Builder) !BSONDocument {
+        if (self.finished) return error.BuilderFinished;
+        if (self.frames.items.len != 1) return error.UnclosedContainer;
+
+        try self.closeContainer(0, true);
+        self.finished = true;
+        const buffer = try self.buffer.toOwnedSlice(self.allocator);
+        return BSONDocument.init(buffer);
+    }
+
+    pub fn deinit(self: *Builder) void {
+        self.buffer.deinit(self.allocator);
+        self.frames.deinit(self.allocator);
+    }
+
+    fn rootEncoder(self: *Builder) DocEncoder {
+        return .{
+            .builder = self,
+            .frame_index = 0,
+        };
+    }
+
+    pub fn docEncoder(self: *Builder) DocEncoder {
+        return self.rootEncoder();
+    }
+
+    fn ensureFrame(self: *Builder, frame_index: usize, expected: ContainerKind) !void {
+        if (self.finished) return error.BuilderFinished;
+        if (frame_index >= self.frames.items.len) return error.ContainerClosed;
+        if (self.frames.items[frame_index].kind != expected) return error.InvalidContainerType;
+        if (frame_index != self.frames.items.len - 1) return error.UnclosedContainer;
+    }
+
+    fn openContainer(self: *Builder, kind: ContainerKind, key: []const u8) !usize {
+        const parent_index = self.frames.items.len - 1;
+        switch (self.frames.items[parent_index].kind) {
+            .document => try self.appendElementHeader(kindValueType(kind), key),
+            .array => try self.appendArrayElementHeader(kindValueType(kind), parent_index),
+        }
+
+        const len_pos = self.buffer.items.len;
+        try self.buffer.resize(self.allocator, len_pos + 4);
+        @memset(self.buffer.items[len_pos .. len_pos + 4], 0);
+
+        try self.frames.append(self.allocator, .{
+            .kind = kind,
+            .len_pos = len_pos,
+        });
+        return self.frames.items.len - 1;
+    }
+
+    fn openArrayChild(self: *Builder, kind: ContainerKind, frame_index: usize) !usize {
+        try self.ensureFrame(frame_index, .array);
+        try self.appendArrayElementHeader(kindValueType(kind), frame_index);
+        const len_pos = self.buffer.items.len;
+        try self.buffer.resize(self.allocator, len_pos + 4);
+        @memset(self.buffer.items[len_pos .. len_pos + 4], 0);
+
+        try self.frames.append(self.allocator, .{
+            .kind = kind,
+            .len_pos = len_pos,
+        });
+        return self.frames.items.len - 1;
+    }
+
+    fn closeContainer(self: *Builder, frame_index: usize, allow_root_end: bool) !void {
+        if (frame_index == 0 and !allow_root_end) return error.CannotEndRoot;
+        if (frame_index >= self.frames.items.len) return error.ContainerClosed;
+        if (frame_index != self.frames.items.len - 1) return error.UnclosedContainer;
+
+        const frame = self.frames.items[frame_index];
+        try self.buffer.append(self.allocator, 0);
+        const len: u32 = @intCast(self.buffer.items.len - frame.len_pos);
+        std.mem.writeInt(u32, self.buffer.items[frame.len_pos..][0..4], len, .little);
+        _ = self.frames.pop();
+    }
+
+    fn appendElementHeader(self: *Builder, value_type: BSONValueType, key: []const u8) !void {
+        try self.buffer.append(self.allocator, @intFromEnum(value_type));
+        try self.buffer.appendSlice(self.allocator, key);
+        try self.buffer.append(self.allocator, 0);
+    }
+
+    fn appendArrayElementHeader(self: *Builder, value_type: BSONValueType, frame_index: usize) !void {
+        var key_buf: [32]u8 = undefined;
+        const frame = &self.frames.items[frame_index];
+        const key = std.fmt.bufPrint(&key_buf, "{d}", .{frame.next_index}) catch unreachable;
+        frame.next_index += 1;
+        try self.appendElementHeader(value_type, key);
+    }
+
+    fn appendValuePayload(self: *Builder, value: BSONValue) !void {
+        const writer = self.buffer.writer(self.allocator);
+        try value.write(writer);
+    }
+};
+
+pub const DocEncoder = struct {
+    builder: *Builder,
+    frame_index: usize,
+
+    pub fn put(self: *DocEncoder, key: []const u8, value: anytype) !void {
+        try fmt.encodeField(self, key, value);
+    }
+
+    pub fn putValue(self: *DocEncoder, key: []const u8, value: BSONValue) !void {
+        try self.builder.ensureFrame(self.frame_index, .document);
+        try self.builder.appendElementHeader(value.valueType(), key);
+        try self.builder.appendValuePayload(value);
+    }
+
+    pub fn putNull(self: *DocEncoder, key: []const u8) !void {
+        try self.putValue(key, .{ .null = .{} });
+    }
+
+    pub fn object(self: *DocEncoder, key: []const u8) !DocEncoder {
+        try self.builder.ensureFrame(self.frame_index, .document);
+        const frame_index = try self.builder.openContainer(.document, key);
+        return .{
+            .builder = self.builder,
+            .frame_index = frame_index,
+        };
+    }
+
+    pub fn array(self: *DocEncoder, key: []const u8) !ArrayEncoder {
+        try self.builder.ensureFrame(self.frame_index, .document);
+        const frame_index = try self.builder.openContainer(.array, key);
+        return .{
+            .builder = self.builder,
+            .frame_index = frame_index,
+        };
+    }
+
+    pub fn end(self: *DocEncoder) !void {
+        try self.builder.closeContainer(self.frame_index, false);
+    }
+};
+
+pub const ArrayEncoder = struct {
+    builder: *Builder,
+    frame_index: usize,
+
+    pub fn append(self: *ArrayEncoder, value: anytype) !void {
+        try fmt.encodeArrayValue(self, value);
+    }
+
+    pub fn appendValue(self: *ArrayEncoder, value: BSONValue) !void {
+        try self.builder.ensureFrame(self.frame_index, .array);
+        try self.builder.appendArrayElementHeader(value.valueType(), self.frame_index);
+        try self.builder.appendValuePayload(value);
+    }
+
+    pub fn object(self: *ArrayEncoder) !DocEncoder {
+        const frame_index = try self.builder.openArrayChild(.document, self.frame_index);
+        return .{
+            .builder = self.builder,
+            .frame_index = frame_index,
+        };
+    }
+
+    pub fn array(self: *ArrayEncoder) !ArrayEncoder {
+        const frame_index = try self.builder.openArrayChild(.array, self.frame_index);
+        return .{
+            .builder = self.builder,
+            .frame_index = frame_index,
+        };
+    }
+
+    pub fn end(self: *ArrayEncoder) !void {
+        try self.builder.closeContainer(self.frame_index, false);
+    }
+};
+
+pub const Editor = struct {
+    allocator: mem.Allocator,
+    current: BSONDocument,
+    owns_current: bool = false,
+    finished: bool = false,
+
+    pub fn init(allocator: mem.Allocator, source_doc: BSONDocument) Editor {
+        return .{
+            .allocator = allocator,
+            .current = source_doc,
+        };
+    }
+
+    pub fn set(self: *Editor, key: []const u8, value: anytype) !void {
+        std.debug.assert(!self.finished);
+
+        var single_field = try Builder.init(self.allocator);
+        defer single_field.deinit();
+        try single_field.put(key, value);
+        const encoded = try single_field.finish();
+        defer encoded.deinit(self.allocator);
+
+        const next = try rewriteDocumentSet(self.current, self.allocator, key, encoded);
+        self.replaceCurrent(next);
+    }
+
+    pub fn setValue(self: *Editor, key: []const u8, value: BSONValue) !void {
+        std.debug.assert(!self.finished);
+
+        var pairs = [1]BSONKeyValuePair{.{
+            .key = key,
+            .value = value,
+        }};
+        const encoded = try BSONDocument.fromPairs(self.allocator, pairs[0..]);
+        defer encoded.deinit(self.allocator);
+
+        const next = try rewriteDocumentSet(self.current, self.allocator, key, encoded);
+        self.replaceCurrent(next);
+    }
+
+    pub fn unset(self: *Editor, key: []const u8) !void {
+        std.debug.assert(!self.finished);
+        const next = try rewriteDocumentUnset(self.current, self.allocator, key);
+        self.replaceCurrent(next);
+    }
+
+    pub fn finish(self: *Editor) !BSONDocument {
+        std.debug.assert(!self.finished);
+        self.finished = true;
+
+        if (self.owns_current) {
+            const out = self.current;
+            self.current = BSONDocument.initEmpty();
+            self.owns_current = false;
+            return out;
+        }
+
+        return try cloneDocument(self.allocator, self.current);
+    }
+
+    pub fn deinit(self: *Editor) void {
+        if (self.owns_current) {
+            self.current.deinit(self.allocator);
+            self.owns_current = false;
+        }
+    }
+
+    fn replaceCurrent(self: *Editor, next: BSONDocument) void {
+        if (self.owns_current) {
+            self.current.deinit(self.allocator);
+        }
+        self.current = next;
+        self.owns_current = true;
+    }
+};
+
+fn kindValueType(kind: ContainerKind) BSONValueType {
+    return switch (kind) {
+        .document => .document,
+        .array => .array,
+    };
+}
+
+fn cloneDocument(allocator: mem.Allocator, doc: BSONDocument) !BSONDocument {
+    const buffer = try allocator.alloc(u8, doc.buffer.len);
+    @memcpy(buffer, doc.buffer);
+    return BSONDocument.init(buffer);
+}
+
+fn appendExistingElement(
+    list: *std.ArrayList(u8),
+    allocator: mem.Allocator,
+    doc: BSONDocument,
+    idx: usize,
+    pair: TypeNamePair,
+    value_size: u32,
+) !void {
+    try list.append(allocator, @intFromEnum(pair.type));
+    try list.appendSlice(allocator, pair.name);
+    try list.append(allocator, 0);
+    try list.appendSlice(allocator, doc.buffer[idx + pair.len .. idx + pair.len + value_size]);
+}
+
+fn appendSingleFieldElement(
+    list: *std.ArrayList(u8),
+    allocator: mem.Allocator,
+    single_field_doc: BSONDocument,
+) !void {
+    const pair = TypeNamePair.read(single_field_doc.buffer[4..]) orelse unreachable;
+    const value_size = BSONValue.asessSize(single_field_doc.buffer[4 + pair.len ..], pair.type);
+    try list.appendSlice(allocator, single_field_doc.buffer[4 .. 4 + pair.len + value_size]);
+}
+
+fn rewriteDocumentSet(
+    doc: BSONDocument,
+    allocator: mem.Allocator,
+    key: []const u8,
+    encoded_field: BSONDocument,
+) !BSONDocument {
+    var list = std.ArrayList(u8){};
+    defer list.deinit(allocator);
+
+    try list.resize(allocator, 4);
+    var idx: usize = 4;
+    while (TypeNamePair.read(doc.buffer[idx..])) |pair| {
+        const value_size = BSONValue.asessSize(doc.buffer[idx + pair.len ..], pair.type);
+        if (!mem.eql(u8, pair.name, key)) {
+            try appendExistingElement(&list, allocator, doc, idx, pair, value_size);
+        }
+        idx += pair.len + value_size;
+    }
+
+    try appendSingleFieldElement(&list, allocator, encoded_field);
+    try list.append(allocator, 0);
+
+    const final_buffer = try list.toOwnedSlice(allocator);
+    std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
+    return BSONDocument.init(final_buffer);
+}
+
+fn rewriteDocumentUnset(
+    doc: BSONDocument,
+    allocator: mem.Allocator,
+    key: []const u8,
+) !BSONDocument {
+    var list = std.ArrayList(u8){};
+    defer list.deinit(allocator);
+
+    try list.resize(allocator, 4);
+    var idx: usize = 4;
+    while (TypeNamePair.read(doc.buffer[idx..])) |pair| {
+        const value_size = BSONValue.asessSize(doc.buffer[idx + pair.len ..], pair.type);
+        if (!mem.eql(u8, pair.name, key)) {
+            try appendExistingElement(&list, allocator, doc, idx, pair, value_size);
+        }
+        idx += pair.len + value_size;
+    }
+
+    try list.append(allocator, 0);
+
+    const final_buffer = try list.toOwnedSlice(allocator);
+    std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
+    return BSONDocument.init(final_buffer);
+}
+
+test "Builder composes flat and nested documents" {
+    const allocator = std.testing.allocator;
+    var builder = try Builder.init(allocator);
+    defer builder.deinit();
+
+    try builder.put("name", "Alice");
+    try builder.put("age", @as(i32, 32));
+
+    var profile = try builder.object("profile");
+    try profile.put("city", "Paris");
+    try profile.put("active", true);
+    try profile.end();
+
+    var tags = try builder.array("tags");
+    try tags.append("db");
+    try tags.append("zig");
+    try tags.end();
+
+    const doc = try builder.finish();
+    defer doc.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Alice", doc.get("name").?.string.value);
+    try std.testing.expectEqual(@as(i32, 32), doc.get("age").?.int32.value);
+    try std.testing.expectEqualStrings("Paris", doc.getPath("profile.city").?.string.value);
+    try std.testing.expectEqual(true, doc.getPath("profile.active").?.boolean.value);
+    try std.testing.expectEqualStrings("db", doc.getPath("tags.0").?.string.value);
+    try std.testing.expectEqualStrings("zig", doc.getPath("tags.1").?.string.value);
+}
+
+test "Builder supports runtime keys" {
+    const allocator = std.testing.allocator;
+    const dynamic_key = try allocator.dupe(u8, "dynamic");
+    defer allocator.free(dynamic_key);
+
+    var builder = try Builder.init(allocator);
+    defer builder.deinit();
+    try builder.put(dynamic_key, @as(i32, 7));
+
+    const doc = try builder.finish();
+    defer doc.deinit(allocator);
+
+    try std.testing.expectEqual(@as(i32, 7), doc.get("dynamic").?.int32.value);
+}
+
+test "Builder finish rejects unclosed containers" {
+    const allocator = std.testing.allocator;
+    var builder = try Builder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.object("profile");
+    try std.testing.expectError(error.UnclosedContainer, builder.finish());
+}
+
+test "Editor updates and unsets top-level fields" {
+    const allocator = std.testing.allocator;
+    var base = try fmt.serialize(.{
+        .a = @as(i32, 1),
+        .b = @as(i32, 2),
+        .c = @as(i32, 3),
+        .nested = .{ .flag = true },
+    }, allocator);
+    defer base.deinit(allocator);
+
+    var editor = Editor.init(allocator, base);
+    defer editor.deinit();
+    try editor.set("b", @as(i32, 20));
+    try editor.unset("a");
+
+    const doc = try editor.finish();
+    defer doc.deinit(allocator);
+
+    try std.testing.expect(doc.get("a") == null);
+    try std.testing.expectEqual(@as(i32, 20), doc.get("b").?.int32.value);
+    try std.testing.expectEqual(true, doc.getPath("nested.flag").?.boolean.value);
+
+    var iter = doc.iter();
+    try std.testing.expectEqualStrings("c", iter.next().?.key);
+    try std.testing.expectEqualStrings("nested", iter.next().?.key);
+    try std.testing.expectEqualStrings("b", iter.next().?.key);
+    try std.testing.expect(iter.next() == null);
+}
 
 test "format" {
     const allocator = std.testing.allocator;
