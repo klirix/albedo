@@ -105,57 +105,68 @@ pub const FileHandle = struct {
     }
 };
 
-pub fn openFile(allocator: std.mem.Allocator, path: []const u8, options: FileOptions) PlatformOpenError!FileHandle {
-    var wasm_handle: WasmHandle = .{ .ptr = undefined, .len = 0 };
-    const rc = wasm_open_file(
-        path.ptr,
-        path.len,
-        @intFromBool(options.read),
-        @intFromBool(options.write),
-        @intFromBool(options.create),
-        @intFromBool(options.truncate),
-        &wasm_handle,
-    );
-    if (rc != 0) return mapStatus(rc);
+pub const Platform = struct {
+    io: std.Io,
 
-    const handle_slice = sliceFromHandle(wasm_handle);
-    const owned = allocator.alloc(u8, handle_slice.len) catch |err| {
-        _ = wasm_close_file(wasm_handle.ptr, wasm_handle.len);
-        return err;
-    };
-    mem.copyForwards(u8, owned, handle_slice);
-
-    return FileHandle{
-        .allocator = allocator,
-        .handle = owned,
-    };
-}
-
-pub fn deleteFile(path: []const u8) PlatformError!void {
-    const rc = wasm_delete_file(path.ptr, path.len);
-    if (rc != 0) return mapStatus(rc);
-}
-
-pub fn renameFile(old_path: []const u8, new_path: []const u8) PlatformError!void {
-    const rc = wasm_rename_file(old_path.ptr, old_path.len, new_path.ptr, new_path.len);
-    if (rc != 0) return mapStatus(rc);
-}
-
-pub fn randomBytes(dest: []u8) PlatformError!void {
-    const rc = wasm_random_bytes(dest.ptr, dest.len);
-    if (rc != 0) return mapStatus(rc);
-}
-
-pub fn nowSeconds() i64 {
-    var out: i64 = 0;
-    const rc = wasm_now_seconds(&out);
-    if (rc != 0) {
-        // On failure fall back to zero; callers treat zero as epoch.
-        return 0;
+    pub fn init(io: std.Io) Platform {
+        return .{ .io = io };
     }
-    return out;
-}
 
-pub fn log(msg: []const u8) void {
-    wasm_log(msg.ptr, msg.len);
-}
+    pub fn openFile(self: Platform, allocator: std.mem.Allocator, path: []const u8, options: FileOptions) PlatformOpenError!FileHandle {
+        _ = self;
+        var wasm_handle: WasmHandle = .{ .ptr = undefined, .len = 0 };
+        const rc = wasm_open_file(
+            path.ptr,
+            path.len,
+            @intFromBool(options.read),
+            @intFromBool(options.write),
+            @intFromBool(options.create),
+            @intFromBool(options.truncate),
+            &wasm_handle,
+        );
+        if (rc != 0) return mapStatus(rc);
+
+        const handle_slice = sliceFromHandle(wasm_handle);
+        const owned = allocator.alloc(u8, handle_slice.len) catch |err| {
+            _ = wasm_close_file(wasm_handle.ptr, wasm_handle.len);
+            return err;
+        };
+        mem.copyForwards(u8, owned, handle_slice);
+
+        return FileHandle{
+            .allocator = allocator,
+            .handle = owned,
+        };
+    }
+
+    pub fn deleteFile(self: Platform, path: []const u8) PlatformError!void {
+        _ = self;
+        const rc = wasm_delete_file(path.ptr, path.len);
+        if (rc != 0) return mapStatus(rc);
+    }
+
+    pub fn renameFile(self: Platform, old_path: []const u8, new_path: []const u8) PlatformError!void {
+        _ = self;
+        const rc = wasm_rename_file(old_path.ptr, old_path.len, new_path.ptr, new_path.len);
+        if (rc != 0) return mapStatus(rc);
+    }
+
+    pub fn randomBytes(self: Platform, dest: []u8) PlatformError!void {
+        _ = self;
+        const rc = wasm_random_bytes(dest.ptr, dest.len);
+        if (rc != 0) return mapStatus(rc);
+    }
+
+    pub fn nowSeconds(self: Platform) i64 {
+        _ = self;
+        var out: i64 = 0;
+        const rc = wasm_now_seconds(&out);
+        if (rc != 0) return 0;
+        return out;
+    }
+
+    pub fn log(self: Platform, msg: []const u8) void {
+        _ = self;
+        wasm_log(msg.ptr, msg.len);
+    }
+};

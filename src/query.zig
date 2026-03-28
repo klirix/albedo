@@ -14,6 +14,7 @@
 /// }
 const std = @import("std");
 const bson = @import("bson.zig");
+const platform = @import("platform.zig");
 const BSONDoc = bson.BSONDocument;
 const Allocator = std.mem.Allocator;
 
@@ -100,7 +101,7 @@ pub const Filter = union(FilterType) {
             .{ "$exists", .exists },
             .{ "$notExists", .notExists },
         });
-        var filters = std.ArrayListUnmanaged(Filter){};
+        var filters: std.ArrayList(Filter) = .empty;
         defer filters.deinit(ally);
 
         var iter = doc.iter();
@@ -201,10 +202,10 @@ pub const Filter = union(FilterType) {
                 if (strValue.len < suffix.len) return false;
                 return std.mem.eql(u8, strValue[strValue.len - suffix.len ..], suffix);
             },
-            .exists => |_| {
+            .exists => {
                 return true;
             },
-            .notExists => |_| {
+            .notExists => {
                 return false;
             },
         }
@@ -977,7 +978,7 @@ test "Query.match matches objectId correctly" {
     const ally = arena.allocator();
     defer arena.deinit();
 
-    const objId = try bson.ObjectId.init();
+    const objId = try bson.ObjectId.init(platform.testing_platform);
 
     var doc_builder = try bson.Builder.init(ally);
     defer doc_builder.deinit();
@@ -985,7 +986,7 @@ test "Query.match matches objectId correctly" {
     const doc = try doc_builder.finish();
     defer doc.deinit(ally);
 
-    const objId2 = try bson.ObjectId.init();
+    const objId2 = try bson.ObjectId.init(platform.testing_platform);
     var doc2_builder = try bson.Builder.init(ally);
     defer doc2_builder.deinit();
     try doc2_builder.put("_id", objId2);

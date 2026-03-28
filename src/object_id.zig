@@ -5,11 +5,11 @@ pub const ObjectIdGenerator = struct {
     machine: u40,
     counter: u24,
 
-    pub fn init() !ObjectIdGenerator {
+    pub fn init(plat: platform.Platform) !ObjectIdGenerator {
         var machine_bytes: [5]u8 = undefined;
         var counter_bytes: [3]u8 = undefined;
-        try platform.randomBytes(machine_bytes[0..]);
-        try platform.randomBytes(counter_bytes[0..]);
+        try plat.randomBytes(machine_bytes[0..]);
+        try plat.randomBytes(counter_bytes[0..]);
         const machine = std.mem.readInt(u40, machine_bytes[0..], .big);
         const counter = std.mem.readInt(u24, counter_bytes[0..], .big);
         return ObjectIdGenerator{
@@ -18,10 +18,10 @@ pub const ObjectIdGenerator = struct {
         };
     }
 
-    pub fn next(self: *ObjectIdGenerator) ObjectId {
+    pub fn next(self: *ObjectIdGenerator, plat: platform.Platform) ObjectId {
         const counter = @atomicRmw(u24, &self.counter, .Add, 1, .monotonic);
         var buffer: [12]u8 = undefined;
-        const time = @as(u32, @intCast(platform.nowSeconds()));
+        const time = @as(u32, @intCast(plat.nowSeconds()));
 
         std.mem.writeInt(u32, buffer[0..4], time, .big);
         std.mem.writeInt(u40, buffer[4..9], self.machine, .little);
@@ -34,10 +34,10 @@ pub const ObjectIdGenerator = struct {
 pub const ObjectId = struct {
     buffer: [12]u8, // 12
 
-    pub fn init() !ObjectId {
-        const time = @as(i32, @truncate(platform.nowSeconds()));
+    pub fn init(plat: platform.Platform) !ObjectId {
+        const time = @as(i32, @truncate(plat.nowSeconds()));
         var rand = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
-        try platform.randomBytes(rand[0..]);
+        try plat.randomBytes(rand[0..]);
         var buffer: [12]u8 = undefined;
         std.mem.writeInt(i32, buffer[0..4], time, .big);
         @memcpy(buffer[4..], &rand);
@@ -94,7 +94,7 @@ test "test timestamp get" {
 }
 
 test "Test2" {
-    _ = try ObjectId.init();
+    _ = try ObjectId.init(platform.testing_platform);
 }
 
 test "test gen str" {

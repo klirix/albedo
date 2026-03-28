@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const platform = @import("platform.zig");
 pub const ObjectId = @import("./object_id.zig").ObjectId;
 pub const fmt = @import("./bson_formatter.zig");
 
@@ -891,7 +892,7 @@ pub const BSONDocument = struct {
     }
 
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
-        var pairs = std.ArrayList(u8){};
+        var pairs: std.ArrayList(u8) = .empty;
         var writer = pairs.writer(allocator);
         try writer.writeInt(u32, 0, .little); // Placeholder for length
         if (try json.next() != .object_begin) {
@@ -998,7 +999,7 @@ pub const BSONDocument = struct {
     }
 
     pub fn fromPairs(allocator: mem.Allocator, pairs: []BSONKeyValuePair) !BSONDocument {
-        var list = std.ArrayList(u8){};
+        var list: std.ArrayList(u8) = .empty;
         const writer = list.writer(allocator);
         try writer.writeInt(u32, 0, .little);
 
@@ -1144,8 +1145,8 @@ const ContainerFrame = struct {
 
 pub const Builder = struct {
     allocator: mem.Allocator,
-    buffer: std.ArrayList(u8) = .{},
-    frames: std.ArrayList(ContainerFrame) = .{},
+    buffer: std.ArrayList(u8) = .empty,
+    frames: std.ArrayList(ContainerFrame) = .empty,
     finished: bool = false,
 
     pub fn init(allocator: mem.Allocator) !Builder {
@@ -1476,7 +1477,7 @@ fn rewriteDocumentSet(
     key: []const u8,
     encoded_field: BSONDocument,
 ) !BSONDocument {
-    var list = std.ArrayList(u8){};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
 
     try list.resize(allocator, 4);
@@ -1502,7 +1503,7 @@ fn rewriteDocumentUnset(
     allocator: mem.Allocator,
     key: []const u8,
 ) !BSONDocument {
-    var list = std.ArrayList(u8){};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
 
     try list.resize(allocator, 4);
@@ -1618,7 +1619,7 @@ test "format" {
 
 test "BSONDocument write" {
     const allocator = std.testing.allocator;
-    var list = std.ArrayList(u8){};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
     var doc = BSONDocument.initEmpty();
     doc = try doc.set(allocator, "test", .{ .string = .{ .value = "test" } });
@@ -1672,7 +1673,7 @@ test "BSONDoc set docs" {
 
     var doc = BSONDocument.init(obj);
 
-    const objid = try ObjectId.init();
+    const objid = try ObjectId.init(platform.testing_platform);
 
     doc = try doc.set(std.testing.allocator, "_id", .{ .objectId = .{ .value = objid } });
     defer doc.deinit(std.testing.allocator);

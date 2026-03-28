@@ -9,8 +9,9 @@ pub const PlatformFileSyncError = common.PlatformFileSyncError;
 pub const PlatformOpenError = common.PlatformOpenError;
 
 const StdFileCtx = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     allocator: std.mem.Allocator,
+    io: std.Io,
 };
 
 fn mapFsError(err: anyerror) PlatformError {
@@ -32,7 +33,7 @@ pub const FileHandle = struct {
 
     pub fn close(self: *FileHandle) void {
         if (self.ctx) |ctx| {
-            ctx.file.close();
+            ctx.file.close(ctx.io);
             ctx.allocator.destroy(ctx);
             self.ctx = null;
         }
@@ -40,82 +41,98 @@ pub const FileHandle = struct {
 
     pub fn preadAll(self: *const FileHandle, dest: []u8, offset: u64) PlatformFileReadError!void {
         const ctx = self.ctx orelse return error.ClosedHandle;
-        _ = ctx.file.preadAll(dest, offset) catch |err| return mapFsError(err);
+        var reader = std.Io.File.Reader.init(ctx.file, ctx.io, &.{});
+        reader.seekTo(offset) catch |err| return mapFsError(err);
+        reader.interface.readSliceAll(dest) catch |err| return mapFsError(err);
     }
 
     pub fn pwriteAll(self: *const FileHandle, src: []const u8, offset: u64) PlatformFileWriteError!void {
         const ctx = self.ctx orelse return error.ClosedHandle;
-        ctx.file.pwriteAll(src, offset) catch |err| return mapFsError(err);
+        var writer = std.Io.File.Writer.init(ctx.file, ctx.io, &.{});
+        writer.seekTo(offset) catch |err| return mapFsError(err);
+        writer.interface.writeAll(src) catch |err| return mapFsError(err);
     }
 
     pub fn sync(self: *const FileHandle) PlatformFileSyncError!void {
         const ctx = self.ctx orelse return error.ClosedHandle;
-        ctx.file.sync() catch |err| return mapFsError(err);
+        ctx.file.sync(ctx.io) catch |err| return mapFsError(err);
     }
 };
 
-pub fn openFile(allocator: std.mem.Allocator, path: []const u8, options: FileOptions) PlatformOpenError!FileHandle {
-    const cwd = std.fs.cwd();
-    const is_abs = std.fs.path.isAbsolute(path);
-    const mode: std.fs.File.OpenMode = if (options.write) .read_write else .read_only;
+pub const Platform = struct {
+    io: std.Io,
 
-    const file = if (options.create) blk: {
-        const create_opts = std.fs.File.CreateFlags{
-            .read = options.read,
-            .truncate = options.truncate,
+    pub fn init(io: std.Io) Platform {
+        return .{ .io = io };
+    }
+
+    pub fn openFile(self: Platform, allocator: std.mem.Allocator, path: []const u8, options: FileOptions) PlatformOpenError!FileHandle {
+        const cwd = std.Io.Dir.cwd();
+        const is_abs = std.fs.path.isAbsolute(path);
+        const mode: std.Io.File.OpenMode = if (options.write) .read_write else .read_only;
+
+        const file = if (options.create) blk: {
+            const create_opts = std.Io.File.CreateFlags{
+                .read = options.read,
+                .truncate = options.truncate,
+            };
+            break :blk (if (is_abs)
+                std.Io.Dir.createFileAbsolute(self.io, path, create_opts)
+            else
+                cwd.createFile(self.io, path, create_opts)) catch |err| return mapFsError(err);
+        } else blk: {
+            break :blk (if (is_abs)
+                std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = mode })
+            else
+                cwd.openFile(self.io, path, .{ .mode = mode })) catch |err| switch (err) {
+                error.FileNotFound => return error.FileNotFound,
+                else => return mapFsError(err),
+            };
         };
-        break :blk (if (is_abs)
-            std.fs.createFileAbsolute(path, create_opts)
-        else
-            cwd.createFile(path, create_opts)) catch |err| return mapFsError(err);
-    } else blk: {
-        break :blk (if (is_abs)
-            std.fs.openFileAbsolute(path, .{ .mode = mode })
-        else
-            cwd.openFile(path, .{ .mode = mode })) catch |err| switch (err) {
-            error.FileNotFound => return error.FileNotFound,
-            else => return mapFsError(err),
+
+        const ctx = try allocator.create(StdFileCtx);
+        ctx.* = .{
+            .file = file,
+            .allocator = allocator,
+            .io = self.io,
         };
-    };
 
-    const ctx = try allocator.create(StdFileCtx);
-    ctx.* = .{
-        .file = file,
-        .allocator = allocator,
-    };
+        return FileHandle{ .ctx = ctx };
+    }
 
-    return FileHandle{ .ctx = ctx };
-}
+    pub fn deleteFile(self: Platform, path: []const u8) PlatformError!void {
+        const cwd = std.Io.Dir.cwd();
+        const is_abs = std.fs.path.isAbsolute(path);
+        (if (is_abs)
+            std.Io.Dir.deleteFileAbsolute(self.io, path)
+        else
+            cwd.deleteFile(self.io, path)) catch |err| return mapFsError(err);
+    }
 
-pub fn deleteFile(path: []const u8) PlatformError!void {
-    const cwd = std.fs.cwd();
-    const is_abs = std.fs.path.isAbsolute(path);
-    (if (is_abs)
-        std.fs.deleteFileAbsolute(path)
-    else
-        cwd.deleteFile(path)) catch |err| return mapFsError(err);
-}
+    pub fn renameFile(self: Platform, old_path: []const u8, new_path: []const u8) PlatformError!void {
+        const cwd = std.Io.Dir.cwd();
+        const old_abs = std.fs.path.isAbsolute(old_path);
+        const new_abs = std.fs.path.isAbsolute(new_path);
+        if (old_abs != new_abs) return error.Unexpected;
 
-pub fn renameFile(old_path: []const u8, new_path: []const u8) PlatformError!void {
-    const cwd = std.fs.cwd();
-    const old_abs = std.fs.path.isAbsolute(old_path);
-    const new_abs = std.fs.path.isAbsolute(new_path);
-    if (old_abs != new_abs) return error.Unexpected;
+        (if (old_abs)
+            std.Io.Dir.renameAbsolute(old_path, new_path, self.io)
+        else
+            cwd.rename(old_path, new_path, cwd, new_path, self.io)) catch |err| return mapFsError(err);
+    }
 
-    (if (old_abs)
-        std.fs.renameAbsolute(old_path, new_path)
-    else
-        cwd.rename(old_path, new_path)) catch |err| return mapFsError(err);
-}
+    pub fn randomBytes(self: Platform, dest: []u8) PlatformError!void {
+        _ = self;
+        std.Random.DefaultCsprng.random(std.crypto.random).bytes(dest);
+    }
 
-pub fn randomBytes(dest: []u8) PlatformError!void {
-    std.crypto.random.bytes(dest);
-}
+    pub fn nowSeconds(self: Platform) i64 {
+        _ = self;
+        return @divFloor(std.time.nanoTimestamp(), std.time.ns_per_s);
+    }
 
-pub fn nowSeconds() i64 {
-    return std.time.timestamp();
-}
-
-pub fn log(msg: []const u8) void {
-    std.debug.print("{s}\n", .{msg});
-}
+    pub fn log(self: Platform, msg: []const u8) void {
+        _ = self;
+        std.debug.print("{s}\n", .{msg});
+    }
+};

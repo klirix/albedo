@@ -1,3 +1,4 @@
+const std = @import("std");
 const builtin = @import("builtin");
 const wasm_impl = @import("platform/wasm.zig");
 const std_impl = @import("platform/standard.zig");
@@ -16,10 +17,8 @@ pub const PlatformFileWriteError = Impl.PlatformFileWriteError;
 pub const PlatformFileSyncError = Impl.PlatformFileSyncError;
 pub const PlatformOpenError = Impl.PlatformOpenError;
 pub const FileHandle = Impl.FileHandle;
-
-pub const openFile = Impl.openFile;
-pub const deleteFile = Impl.deleteFile;
-pub const renameFile = Impl.renameFile;
-pub const randomBytes = Impl.randomBytes;
-pub const nowSeconds = Impl.nowSeconds;
-pub const log = Impl.log;
+pub const Platform = Impl.Platform;
+pub const testing_platform = if (builtin.is_test)
+    Platform.init(std.testing.io)
+else
+    @compileError("testing_platform is only available in tests");

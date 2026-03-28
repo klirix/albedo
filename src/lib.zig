@@ -112,7 +112,9 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     // defer _ = gpa.deinit();
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    db.* = albedo.Bucket.init(ally, pathProper) catch {
+    const threaded: std.Io.Threaded = .init(ally, .{});
+    const io = threaded.io();
+    db.* = albedo.Bucket.init(ally, io, pathProper) catch {
         ally.destroy(db);
         return Result.Error;
     };
@@ -129,7 +131,9 @@ pub export fn albedo_open_with_options(path: [*:0]u8, optionsBuffer: [*]u8, out:
     defer parsed.deinit();
 
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    db.* = albedo.Bucket.openFileWithOptions(ally, pathProper, parsed.value) catch {
+    const threaded: std.Io.Threaded = .init(ally, .{});
+    const io = threaded.io();
+    db.* = albedo.Bucket.openFileWithOptions(ally, io, pathProper, parsed.value) catch {
         ally.destroy(db);
         return Result.Error;
     };
@@ -645,8 +649,8 @@ test "lib API open insert list close" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-open-insert-list-close");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -692,8 +696,8 @@ test "lib API delete removes matched docs" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-delete-removes-matched-docs");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -745,8 +749,8 @@ test "lib API list_indexes returns index options" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-list-indexes-returns-index-options");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -775,8 +779,8 @@ test "lib API transform updates matching doc" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-transform-updates-matching-doc");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -852,18 +856,18 @@ test "lib API transaction commit lifecycle" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-transaction-commit");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
     defer allocator.free(wal_path);
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(wal_path);
 
     const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
     defer allocator.free(shm_path);
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    cwdDeleteFile(shm_path);
+    defer cwdDeleteFile(shm_path);
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -916,18 +920,18 @@ test "lib API transaction rollback transform" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-transaction-rollback-transform");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
     defer allocator.free(wal_path);
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(wal_path);
 
     const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
     defer allocator.free(shm_path);
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    cwdDeleteFile(shm_path);
+    defer cwdDeleteFile(shm_path);
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -989,20 +993,21 @@ test "lib API transaction rollback transform" {
 
 test "lib API transaction guardrails" {
     const allocator = testing.allocator;
+    const io = testIo();
     const path = try makeTempPath(allocator, "lib-api-transaction-guardrails");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
     defer allocator.free(wal_path);
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
 
     const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
     defer allocator.free(shm_path);
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, shm_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, shm_path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1041,8 +1046,8 @@ test "lib API returns errors for invalid query payloads" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-invalid-query-payloads");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1080,8 +1085,8 @@ test "lib API list cursor export resumes stream" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-list-cursor-export");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1132,8 +1137,8 @@ test "lib API list rejects invalid cursor" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-invalid-cursor");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1160,8 +1165,8 @@ test "lib API list rejects unsupported cursor query" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-unsupported-cursor-query");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1191,8 +1196,8 @@ test "lib API insert reports duplicate key" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-insert-duplicate-key");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1227,8 +1232,8 @@ test "lib API default _id index is unique" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-default-id-index-unique");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1260,8 +1265,8 @@ test "lib API drop index returns not found for missing path" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-drop-index-not-found");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1277,8 +1282,8 @@ test "lib API replication_apply rejects invalid payload size" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-replication-apply-invalid-size");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1297,13 +1302,13 @@ test "lib API replication read/apply smoke test" {
 
     const primary_path = try makeTempPath(allocator, "lib-api-replication-primary");
     defer allocator.free(primary_path);
-    platform.deleteFile(primary_path) catch {};
-    defer platform.deleteFile(primary_path) catch {};
+    platform.testing_platform.deleteFile(primary_path) catch {};
+    defer platform.testing_platform.deleteFile(primary_path) catch {};
 
     const replica_path = try makeTempPath(allocator, "lib-api-replication-replica");
     defer allocator.free(replica_path);
-    platform.deleteFile(replica_path) catch {};
-    defer platform.deleteFile(replica_path) catch {};
+    platform.testing_platform.deleteFile(replica_path) catch {};
+    defer platform.testing_platform.deleteFile(replica_path) catch {};
 
     const primary_path_z = try allocator.dupeZ(u8, primary_path);
     defer allocator.free(primary_path_z);
@@ -1362,8 +1367,8 @@ test "lib API open_with_options" {
     {
         const path = try makeTempPath(allocator, "lib-api-opts-defaults");
         defer allocator.free(path);
-        platform.deleteFile(path) catch {};
-        defer platform.deleteFile(path) catch {};
+        platform.testing_platform.deleteFile(path) catch {};
+        defer platform.testing_platform.deleteFile(path) catch {};
 
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
@@ -1384,8 +1389,8 @@ test "lib API open_with_options" {
     {
         const path = try makeTempPath(allocator, "lib-api-opts-full");
         defer allocator.free(path);
-        platform.deleteFile(path) catch {};
-        defer platform.deleteFile(path) catch {};
+        platform.testing_platform.deleteFile(path) catch {};
+        defer platform.testing_platform.deleteFile(path) catch {};
 
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
@@ -1481,18 +1486,18 @@ test "lib API subscription lifecycle does not leak" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-sub-lifecycle");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
     defer allocator.free(wal_path);
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(wal_path);
 
     const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
     defer allocator.free(shm_path);
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    cwdDeleteFile(shm_path);
+    defer cwdDeleteFile(shm_path);
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1532,18 +1537,18 @@ test "lib API subscription idle seqno does not leak" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-sub-seqno");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
     defer allocator.free(wal_path);
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(wal_path);
 
     const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
     defer allocator.free(shm_path);
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    cwdDeleteFile(shm_path);
+    defer cwdDeleteFile(shm_path);
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1572,8 +1577,8 @@ test "lib API close list handle without exhausting does not leak" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-list-early-close");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1608,8 +1613,8 @@ test "lib API transform close without apply does not leak" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-transform-early-close");
     defer allocator.free(path);
-    platform.deleteFile(path) catch {};
-    defer platform.deleteFile(path) catch {};
+    platform.testing_platform.deleteFile(path) catch {};
+    defer platform.testing_platform.deleteFile(path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1636,4 +1641,11 @@ test "lib API transform close without apply does not leak" {
     try testing.expectEqual(Result.OK, albedo_transform_data(iterator, &current_ptr));
 
     try testing.expectEqual(Result.OK, albedo_transform_close(iterator));
+}
+fn testIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn cwdDeleteFile(path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(testIo(), path) catch {};
 }
