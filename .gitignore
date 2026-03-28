@@ -1,4 +1,7 @@
 .zig-cache
 zig-out
 *.bucket
+*.bucket
+*.bucket-wal
+*.bucket-wal-shm
 .vscode

@@ -20,6 +20,15 @@ const ReplicationCursorHandle = struct {
     cursor: ReplicationCursor,
 };
 
+const ApiIoState = enum(u8) {
+    uninitialized,
+    initializing,
+    initialized,
+};
+
+var api_threaded_state: std.atomic.Value(ApiIoState) = .init(.uninitialized);
+var api_threaded: std.Io.Threaded = undefined;
+
 fn createReplicationCursorHandle(cursor: ReplicationCursor) !*ReplicationCursorHandle {
     const handle = try ally.create(ReplicationCursorHandle);
     handle.* = .{ .cursor = cursor };
@@ -107,14 +116,31 @@ fn mapReplicationError(err: anyerror) Result {
     };
 }
 
+fn apiIo() std.Io {
+    if (builtin.is_test) return testing.io;
+    if (platform.isWasm) return std.Io.Threaded.global_single_threaded.io();
+
+    while (true) {
+        switch (api_threaded_state.load(.acquire)) {
+            .initialized => return api_threaded.io(),
+            .uninitialized => {
+                if (api_threaded_state.cmpxchgStrong(.uninitialized, .initializing, .acq_rel, .acquire) == null) {
+                    api_threaded = .init(ally, .{});
+                    api_threaded_state.store(.initialized, .release);
+                    return api_threaded.io();
+                }
+            },
+            .initializing => std.atomic.spinLoopHint(),
+        }
+    }
+}
+
 pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     const pathProper = std.mem.span(path);
     // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     // defer _ = gpa.deinit();
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    var threaded: std.Io.Threaded = .init(ally, .{});
-    const io = threaded.io();
-    db.* = albedo.Bucket.init(ally, io, pathProper) catch {
+    db.* = albedo.Bucket.init(ally, apiIo(), pathProper) catch {
         ally.destroy(db);
         return Result.Error;
     };
@@ -131,9 +157,7 @@ pub export fn albedo_open_with_options(path: [*:0]u8, optionsBuffer: [*]u8, out:
     defer parsed.deinit();
 
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    var threaded: std.Io.Threaded = .init(ally, .{});
-    const io = threaded.io();
-    db.* = albedo.Bucket.openFileWithOptions(ally, io, pathProper, parsed.value) catch {
+    db.* = albedo.Bucket.openFileWithOptions(ally, apiIo(), pathProper, parsed.value) catch {
         ally.destroy(db);
         return Result.Error;
     };

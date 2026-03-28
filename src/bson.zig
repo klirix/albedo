@@ -894,7 +894,7 @@ pub const BSONDocument = struct {
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
         var pairs = std.Io.Writer.Allocating.init(allocator);
         errdefer pairs.deinit();
-        var writer = pairs.writer;
+        const writer = &pairs.writer;
         try writer.writeInt(u32, 0, .little); // Placeholder for length
         if (try json.next() != .object_begin) {
             return error.InvalidJSON;
@@ -1002,14 +1002,14 @@ pub const BSONDocument = struct {
     pub fn fromPairs(allocator: mem.Allocator, pairs: []BSONKeyValuePair) !BSONDocument {
         var list = std.Io.Writer.Allocating.init(allocator);
         errdefer list.deinit();
-        var writer = list.writer;
+        const writer = &list.writer;
         try writer.writeInt(u32, 0, .little);
 
         for (pairs) |pair| {
             try writer.writeByte(@intFromEnum(pair.value.valueType()));
             try writer.writeAll(pair.key);
             try writer.writeByte(0);
-            try pair.value.write(&writer);
+            try pair.value.write(writer);
         }
         try writer.writeByte(0); // Null terminator for the document
 
