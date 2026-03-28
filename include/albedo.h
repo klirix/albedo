@@ -71,6 +71,7 @@ albedo_result albedo_data(albedo_list_handle *handle, uint8_t **out_doc);
 albedo_result albedo_next(albedo_list_handle *handle);
 albedo_result albedo_close_iterator(albedo_list_handle *handle);
 
+albedo_result albedo_checkpoint(albedo_bucket_handle *bucket);
 albedo_result albedo_vacuum(albedo_bucket_handle *bucket);
 albedo_result albedo_flush(albedo_bucket_handle *bucket);
 

@@ -412,6 +412,11 @@ pub export fn albedo_close_iterator(iterator: *ListHandle) Result {
     return Result.OK;
 }
 
+pub export fn albedo_checkpoint(bucket: *Bucket) Result {
+    bucket.checkpoint();
+    return Result.OK;
+}
+
 pub export fn albedo_vacuum(bucket: *Bucket) Result {
     bucket.vacuum() catch |err| return mapTransactionError(err);
     return Result.OK;

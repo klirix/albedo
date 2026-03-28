@@ -64,12 +64,15 @@ const win_mmap = if (builtin.os.tag == .windows) struct {
 /// Supported on POSIX (Linux / macOS) and Windows.
 pub const WAL = struct {
 
-    // ── WAL Header (48 bytes) ─────────────────────────────────────────
+    // ── WAL Header (112 bytes, v3) ──────────────────────────────────────
 
     /// Persisted at the start of every WAL file.
+    /// Version 3 embeds the BucketHeader (64 bytes) directly in the WAL
+    /// header, eliminating the need for full-page HEADER_PAGE_ID sentinel
+    /// frames (which wasted 8 KiB per transaction).
     pub const Header = extern struct {
         magic: [4]u8 = .{ 'W', 'A', 'L', 0 },
-        version: u16 = 2,
+        version: u16 = 3,
         page_size: u16 = DEFAULT_PAGE_SIZE,
         frame_count: u64 = 0,
         salt: u64 = 0,
@@ -77,12 +80,17 @@ pub const WAL = struct {
         /// Timestamp of the latest committed transaction.
         tx_timestamp: i64 = 0,
         generation: u64 = 0,
+        /// Embedded BucketHeader bytes (64 bytes).  All-zero means "not
+        /// set" — the main database file header is authoritative.
+        bucket_header: [64]u8 = [_]u8{0} ** 64,
 
-        pub const byte_size: usize = 48;
+        pub const byte_size: usize = 112;
+        /// Header size for version 2 WAL files (backward compat).
+        pub const v2_byte_size: usize = 48;
 
         comptime {
             if (@sizeOf(Header) != byte_size)
-                @compileError("WAL Header must be exactly 48 bytes");
+                @compileError("WAL Header must be exactly 112 bytes");
         }
 
         pub fn toBytes(self: *const Header) [byte_size]u8 {
@@ -95,6 +103,7 @@ pub const WAL = struct {
             std.mem.writeInt(u64, buf[24..32], self.checksum, .little);
             std.mem.writeInt(i64, buf[32..40], self.tx_timestamp, .little);
             std.mem.writeInt(u64, buf[40..48], self.generation, .little);
+            @memcpy(buf[48..112], &self.bucket_header);
             return buf;
         }
 
@@ -108,6 +117,7 @@ pub const WAL = struct {
                 .checksum = std.mem.readInt(u64, raw[24..32], .little),
                 .tx_timestamp = std.mem.readInt(i64, raw[32..40], .little),
                 .generation = std.mem.readInt(u64, raw[40..48], .little),
+                .bucket_header = raw[48..112].*,
             };
         }
     };
@@ -151,9 +161,9 @@ pub const WAL = struct {
 
     pub const frame_size: usize = FrameHeader.byte_size + DEFAULT_PAGE_SIZE;
 
-    /// Sentinel page_id used for BucketHeader WAL frames.
-    /// When a frame carries this id, its first 64 bytes hold the BucketHeader
-    /// (the remainder is zero-padded) and should be written to file offset 0.
+    /// Legacy sentinel page_id used for BucketHeader WAL frames in v2.
+    /// Kept for backward compatibility when reading old WAL files.
+    /// Version 3+ embeds the BucketHeader in the WAL header instead.
     pub const HEADER_PAGE_ID: u64 = std.math.maxInt(u64);
 
     // ── Skip-list constants ───────────────────────────────────────────
@@ -192,7 +202,15 @@ pub const WAL = struct {
         /// this field — the reserved bytes were zero, so 0 acts as a "legacy/unset"
         /// sentinel and enables seamless migration).
         oplog_size: u32,
-        _reserved: [24]u8,
+        /// Monotonically increasing counter bumped on every WAL checkpoint.
+        /// Readers compare this against a local copy to detect when the
+        /// main DB file was updated and their page cache must be invalidated.
+        checkpoint_generation: u64,
+        /// Latest committed page_count, written atomically by the writer
+        /// so readers can pick it up from shared memory without a disk read.
+        shm_page_count: u64,
+        /// Latest committed doc_count, written atomically by the writer.
+        shm_doc_count: u64,
 
         pub const byte_size: usize = 128;
 
@@ -406,7 +424,9 @@ pub const WAL = struct {
                     .oplog_oldest_seqno = 0,
                     .oplog_write_pos = 0,
                     .oplog_size = oplog_size,
-                    ._reserved = [_]u8{0} ** 24,
+                    .checkpoint_generation = 0,
+                    .shm_page_count = 0,
+                    .shm_doc_count = 0,
                 };
             } else if (shm.oplog_size == 0) {
                 // Older SHM format (oplog_size field was in _reserved and zeroed).
@@ -428,7 +448,9 @@ pub const WAL = struct {
                     .oplog_oldest_seqno = 0,
                     .oplog_write_pos = 0,
                     .oplog_size = oplog_size,
-                    ._reserved = [_]u8{0} ** 24,
+                    .checkpoint_generation = 0,
+                    .shm_page_count = 0,
+                    .shm_doc_count = 0,
                 };
             } else if (shm.oplog_size != oplog_size) {
                 // Explicit mismatch: the SHM was created with a different oplog size.
@@ -853,6 +875,9 @@ pub const WAL = struct {
     pending_max_tx: i64,
     /// mmap'd shared-memory page index.
     index: WalIndex,
+    /// Byte offset where frame data starts in the WAL file.
+    /// 48 for version 2 WALs, 112 for version 3+.
+    data_offset: u64,
 
     // ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -879,24 +904,35 @@ pub const WAL = struct {
         // Try to read an existing header; if the file is empty, write a fresh one.
         var wal_header: Header = .{};
         var next_seq: u64 = 1;
+        var data_start: u64 = Header.byte_size; // default for new v3 WALs
 
         const file_size_val = fileSize(read_fd) catch return Error.WalReadFailed;
-        if (file_size_val >= Header.byte_size) {
-            var hdr_buf: [Header.byte_size]u8 = undefined;
-            preadAll(read_fd, &hdr_buf, 0) catch return Error.WalReadFailed;
-            wal_header = Header.fromBytes(&hdr_buf);
+        if (file_size_val >= Header.v2_byte_size) {
+            // Read the common v2 prefix to determine the version.
+            var hdr_buf: [Header.byte_size]u8 = [_]u8{0} ** Header.byte_size;
+            preadAll(read_fd, hdr_buf[0..Header.v2_byte_size], 0) catch return Error.WalReadFailed;
 
-            if (!std.mem.eql(u8, &wal_header.magic, &.{ 'W', 'A', 'L', 0 })) {
+            if (!std.mem.eql(u8, hdr_buf[0..4], &.{ 'W', 'A', 'L', 0 })) {
                 return Error.WalCorrupted;
             }
-            if (wal_header.version != 2) {
+            const version = std.mem.readInt(u16, hdr_buf[4..6], .little);
+
+            if (version == 3) {
+                if (file_size_val < Header.byte_size) return Error.WalCorrupted;
+                preadAll(read_fd, hdr_buf[Header.v2_byte_size..], Header.v2_byte_size) catch return Error.WalReadFailed;
+                data_start = Header.byte_size; // 112
+            } else if (version == 2) {
+                data_start = Header.v2_byte_size; // 48
+            } else {
                 return Error.WalCorrupted;
             }
+
+            wal_header = Header.fromBytes(&hdr_buf);
             if (wal_header.generation != generation) {
                 return Error.WalCorrupted;
             }
 
-            const committed_size = Header.byte_size + wal_header.frame_count * frame_size;
+            const committed_size = data_start + wal_header.frame_count * frame_size;
             if (file_size_val < committed_size) {
                 return Error.WalCorrupted;
             }
@@ -905,7 +941,7 @@ pub const WAL = struct {
             }
 
             if (wal_header.frame_count > 0) {
-                const last_offset = Header.byte_size + (wal_header.frame_count - 1) * frame_size;
+                const last_offset = data_start + (wal_header.frame_count - 1) * frame_size;
                 var last_hdr_buf: [FrameHeader.byte_size]u8 = undefined;
                 preadAll(read_fd, &last_hdr_buf, last_offset) catch return Error.WalReadFailed;
                 const last_hdr = FrameHeader.fromBytes(&last_hdr_buf);
@@ -945,6 +981,7 @@ pub const WAL = struct {
             .latest_committed_tx = wal_header.tx_timestamp,
             .pending_max_tx = wal_header.tx_timestamp,
             .index = wal_index,
+            .data_offset = data_start,
         };
 
         // Rebuild the SHM index from WAL frames.
@@ -960,24 +997,17 @@ pub const WAL = struct {
         self.allocator.free(self.path);
     }
 
-    /// Sync, checkpoint, close file descriptors, and delete the WAL and
-    /// SHM files. Call this on graceful database close when all WAL frames
-    /// have already been applied to the main database file.
-    /// Files are only removed when this is the last active connection.
-    /// Sync, close file descriptors, and — if this is the last active
-    /// connection — checkpoint (truncate) the WAL and delete both the
-    /// WAL and SHM files.  When other connections are still alive the
-    /// WAL content is preserved so they can keep reading from it.
+    /// Sync, checkpoint (truncate) the WAL, close file descriptors, and
+    /// delete the WAL/SHM files when this is the last connection.
+    /// Checkpointing is always safe because readers detect the bumped
+    /// checkpoint_generation in SHM and invalidate their page caches.
     pub fn consumeAndClose(self: *WAL) void {
         // 1. Sync any pending writes.
         self.sync() catch {};
 
-        // 2. Only truncate the WAL when we are the last user.  Other
-        //    processes may still be serving reads from WAL frames.
-        const is_last = self.index.activeConnections() <= 1;
-        if (is_last) {
-            self.checkpoint() catch {};
-        }
+        // 2. Truncate the WAL.  Other connections will see the bumped
+        //    checkpoint_generation and invalidate their caches.
+        self.checkpoint() catch {};
 
         // 3. Disconnect from SHM and delete the file if we were the last user.
         const last_connection = self.index.deleteFile();
@@ -1002,7 +1032,7 @@ pub const WAL = struct {
     pub fn appendPage(self: *WAL, page_id: u64, page_data_buf: []const u8, tx_timestamp: i64) Error!void {
         std.debug.assert(page_data_buf.len == DEFAULT_PAGE_SIZE);
 
-        const wal_offset = Header.byte_size + self.live_frame_count * frame_size;
+        const wal_offset = self.data_offset + self.live_frame_count * frame_size;
         const checksum = std.hash.XxHash3.hash(self.header.salt, page_data_buf);
 
         const frame_hdr = FrameHeader{
@@ -1073,7 +1103,7 @@ pub const WAL = struct {
     pub fn frames(self: *WAL) FrameIterator {
         return .{
             .wal = self,
-            .offset = Header.byte_size,
+            .offset = self.data_offset,
             .remaining = self.header.frame_count,
         };
     }
@@ -1107,14 +1137,30 @@ pub const WAL = struct {
         return result;
     }
 
+    /// Re-read the embedded BucketHeader (bytes 48..112) from the WAL file
+    /// on disk.  Returns null when the WAL is v2 or when the embedded
+    /// header is all-zero (not yet written by a committing writer).
+    pub fn readBucketHeader(self: *WAL) Error!?[64]u8 {
+        if (self.data_offset < Header.byte_size) return null; // v2
+        var buf: [64]u8 = undefined;
+        preadAll(self.read_fd, &buf, 48) catch return Error.WalReadFailed;
+        const zero: [64]u8 = [_]u8{0} ** 64;
+        if (std.mem.eql(u8, &buf, &zero)) return null;
+        return buf;
+    }
+
     // ── Checkpoint / truncate ─────────────────────────────────────────
 
     /// Truncate the WAL back to just the header, resetting the frame count.
     /// Call this after all WAL frames have been successfully applied to the
     /// main database file.
     pub fn checkpoint(self: *WAL) Error!void {
+        // Upgrade to version 3 if this was a legacy v2 WAL.
+        self.header.version = 3;
+        self.data_offset = Header.byte_size;
+
         // Truncate the file to header-only.
-        ftruncateFile(self.write_fd, Header.byte_size) catch return Error.WalWriteFailed;
+        ftruncateFile(self.write_fd, self.data_offset) catch return Error.WalWriteFailed;
 
         self.header.frame_count = 0;
         self.live_frame_count = 0;
@@ -1122,14 +1168,19 @@ pub const WAL = struct {
         self.latest_committed_tx = 0;
         self.pending_max_tx = 0;
         self.header.tx_timestamp = 0;
+        // Clear embedded header — main DB file is now authoritative.
+        self.header.bucket_header = [_]u8{0} ** 64;
 
         try self.writeHeader();
         fsync(self.write_fd) catch return Error.WalSyncFailed;
 
-        // Clear the SHM index.
+        // Clear the SHM index and bump checkpoint generation so that
+        // readers know their page cache is stale and must be invalidated.
         self.index.acquireWrite();
         defer self.index.releaseWrite();
         self.index.clear();
+        const gen_ptr = &self.index.shmHeader().checkpoint_generation;
+        _ = @atomicRmw(u64, gen_ptr, .Add, 1, .release);
     }
 
     // ── Private helpers ───────────────────────────────────────────────
@@ -1144,7 +1195,7 @@ pub const WAL = struct {
 
         var i: u64 = 0;
         while (i < self.header.frame_count) : (i += 1) {
-            const offset = Header.byte_size + i * frame_size;
+            const offset = self.data_offset + i * frame_size;
             var hdr_buf: [FrameHeader.byte_size]u8 = undefined;
             preadAll(self.read_fd, &hdr_buf, offset) catch return Error.WalReadFailed;
             const fh = FrameHeader.fromBytes(&hdr_buf);
@@ -1159,7 +1210,10 @@ pub const WAL = struct {
         defer closeFd(fd);
 
         const hdr_bytes = self.header.toBytes();
-        pwriteAll(fd, &hdr_bytes, 0) catch return Error.WalWriteFailed;
+        // Write only data_offset bytes so a v2 WAL header doesn't
+        // overwrite the first frame's data with bucket_header bytes.
+        const write_len = @as(usize, @intCast(self.data_offset));
+        pwriteAll(fd, hdr_bytes[0..write_len], 0) catch return Error.WalWriteFailed;
         fsync(fd) catch return Error.WalSyncFailed;
     }
 
@@ -1200,9 +1254,9 @@ pub const WAL = struct {
             const start = @as(usize, @intCast(i * frame_size));
             const hdr_bytes: *const [FrameHeader.byte_size]u8 = @ptrCast(raw_frames[start .. start + FrameHeader.byte_size].ptr);
             const hdr = FrameHeader.fromBytes(hdr_bytes);
-            const wal_offset = Header.byte_size + (old_live + i) * frame_size;
+            const wal_offset = self.data_offset + (old_live + i) * frame_size;
             self.index.insert(hdr.page_id, hdr.tx_timestamp, wal_offset) catch {
-                ftruncateFile(self.write_fd, Header.byte_size + old_live * frame_size) catch {};
+                ftruncateFile(self.write_fd, self.data_offset + old_live * frame_size) catch {};
                 self.live_frame_count = old_live;
                 self.header.frame_count = old_committed;
                 self.next_seq = old_next_seq;
@@ -1329,15 +1383,14 @@ test "WAL header round-trip" {
 
     try std.testing.expectEqual(restored.frame_count, 42);
     try std.testing.expectEqual(restored.salt, 0xDEADBEEF);
-    try std.testing.expectEqual(restored.version, 2);
-    try std.testing.expectEqual(restored.tx_timestamp, 1700000000);
+    try std.testing.expectEqual(restored.version, 3);
     try std.testing.expectEqual(restored.generation, 0);
 }
 
 test "WAL header default values" {
     const hdr = WAL.Header{};
     try std.testing.expect(std.mem.eql(u8, &hdr.magic, &.{ 'W', 'A', 'L', 0 }));
-    try std.testing.expectEqual(hdr.version, 2);
+    try std.testing.expectEqual(hdr.version, 3);
     try std.testing.expectEqual(hdr.page_size, DEFAULT_PAGE_SIZE);
     try std.testing.expectEqual(hdr.frame_count, 0);
     try std.testing.expectEqual(hdr.salt, 0);
@@ -1356,26 +1409,30 @@ test "WAL header serializes magic bytes correctly" {
 }
 
 test "WAL header preserves all fields through round-trip" {
+    var bh: [64]u8 = undefined;
+    @memset(&bh, 0x42);
     const hdr = WAL.Header{
         .magic = .{ 'W', 'A', 'L', 0 },
-        .version = 2,
+        .version = 3,
         .page_size = 4096,
         .frame_count = std.math.maxInt(u64),
         .salt = 0x0123456789ABCDEF,
         .checksum = 0xFEDCBA9876543210,
         .tx_timestamp = -1234567890,
         .generation = 99,
+        .bucket_header = bh,
     };
     const bytes = hdr.toBytes();
     const restored = WAL.Header.fromBytes(&bytes);
 
-    try std.testing.expectEqual(restored.version, 2);
+    try std.testing.expectEqual(restored.version, 3);
     try std.testing.expectEqual(restored.page_size, 4096);
     try std.testing.expectEqual(restored.frame_count, std.math.maxInt(u64));
     try std.testing.expectEqual(restored.salt, 0x0123456789ABCDEF);
     try std.testing.expectEqual(restored.checksum, 0xFEDCBA9876543210);
     try std.testing.expectEqual(restored.tx_timestamp, -1234567890);
     try std.testing.expectEqual(restored.generation, 99);
+    try std.testing.expect(std.mem.eql(u8, &restored.bucket_header, &bh));
 }
 
 test "WAL header tx_timestamp survives negative values" {
@@ -1436,9 +1493,10 @@ test "WAL frame header zero values" {
 // ── Struct size tests ─────────────────────────────────────────────────
 
 test "WAL struct sizes" {
-    try std.testing.expectEqual(WAL.Header.byte_size, 48);
+    try std.testing.expectEqual(WAL.Header.byte_size, 112);
+    try std.testing.expectEqual(WAL.Header.v2_byte_size, 48);
     try std.testing.expectEqual(WAL.FrameHeader.byte_size, 32);
-    try std.testing.expectEqual(@sizeOf(WAL.Header), 48);
+    try std.testing.expectEqual(@sizeOf(WAL.Header), 112);
     try std.testing.expectEqual(@sizeOf(WAL.FrameHeader), 32);
 }
 
