@@ -105,19 +105,22 @@ pub const ReplicationCursor = extern struct {
 
 pub const ReplicationBatchHeader = extern struct {
     magic: [4]u8 = .{ 'A', 'R', 'P', 'L' },
-    version: u16 = 1,
+    version: u16 = 2,
     page_size: u16 = DEFAULT_PAGE_SIZE,
     generation: u64 = 0,
     start_frame_index: u64 = 0,
     frame_count: u64 = 0,
     wal_salt: u64 = 0,
     latest_tx_timestamp: i64 = 0,
+    /// Embedded BucketHeader (v2+).  All-zero for v1 batches.
+    bucket_header: [64]u8 = [_]u8{0} ** 64,
 
-    pub const byte_size: usize = 48;
+    pub const byte_size: usize = 112;
+    pub const v1_byte_size: usize = 48;
 
     comptime {
         if (@sizeOf(ReplicationBatchHeader) != byte_size)
-            @compileError("ReplicationBatchHeader must be exactly 48 bytes");
+            @compileError("ReplicationBatchHeader must be exactly 112 bytes");
     }
 
     pub fn toBytes(self: *const ReplicationBatchHeader) [byte_size]u8 {
@@ -130,11 +133,12 @@ pub const ReplicationBatchHeader = extern struct {
         std.mem.writeInt(u64, buf[24..32], self.frame_count, .little);
         std.mem.writeInt(u64, buf[32..40], self.wal_salt, .little);
         std.mem.writeInt(i64, buf[40..48], self.latest_tx_timestamp, .little);
+        @memcpy(buf[48..112], &self.bucket_header);
         return buf;
     }
 
     pub fn fromBytes(raw: []const u8) ReplicationBatchHeader {
-        return .{
+        var h = ReplicationBatchHeader{
             .magic = raw[0..4].*,
             .version = std.mem.readInt(u16, raw[4..6], .little),
             .page_size = std.mem.readInt(u16, raw[6..8], .little),
@@ -144,6 +148,10 @@ pub const ReplicationBatchHeader = extern struct {
             .wal_salt = std.mem.readInt(u64, raw[32..40], .little),
             .latest_tx_timestamp = std.mem.readInt(i64, raw[40..48], .little),
         };
+        if (raw.len >= byte_size and h.version >= 2) {
+            @memcpy(&h.bucket_header, raw[48..112]);
+        }
+        return h;
     }
 };
 
@@ -398,6 +406,13 @@ pub const Bucket = struct {
     oplog_size: u32 = WAL.DEFAULT_OPLOG_REGION_SIZE,
     wal: ?WAL = null,
     active_tx: ?*Transaction = null,
+    /// Local snapshot of the WAL SHM checkpoint_generation.  When the
+    /// SHM value is higher (another connection checkpointed), the page
+    /// cache is stale and must be cleared before reading.
+    wal_checkpoint_generation: u64 = 0,
+    /// Number of frames after which the WAL is automatically
+    /// checkpointed.  0 disables auto-checkpoint.
+    wal_auto_checkpoint: u64 = 1000,
     /// When true, mutation methods skip oplog emission (used by
     /// TransformIterator to avoid double-emitting for updates).
     _suppress_oplog: bool = false,
@@ -473,6 +488,9 @@ pub const Bucket = struct {
         ///  - .shared  — always consult WAL (safe for multi-process readers)
         ///  - .process — trust local cache, WAL only on miss (fast single-process)
         read_durability: ReadDurability = .shared,
+        /// Number of WAL frames after which an automatic checkpoint is triggered
+        /// at the end of a commit.  0 disables auto-checkpointing entirely.
+        wal_auto_checkpoint: u64 = 1000,
     };
 
     const IndexRootSnapshot = struct {
@@ -894,6 +912,7 @@ pub const Bucket = struct {
             .write_durability = options.write_durability,
             .read_durability = options.read_durability,
             .oplog_size = options.oplog_size,
+            .wal_auto_checkpoint = options.wal_auto_checkpoint,
             .wal = null,
         };
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
@@ -932,6 +951,7 @@ pub const Bucket = struct {
             .wal_pending_pages = std.AutoHashMap(u64, void).init(ally),
             .read_durability = options.read_durability,
             .oplog_size = options.oplog_size,
+            .wal_auto_checkpoint = options.wal_auto_checkpoint,
         };
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
@@ -998,6 +1018,7 @@ pub const Bucket = struct {
             .write_durability = options.write_durability,
             .read_durability = options.read_durability,
             .oplog_size = options.oplog_size,
+            .wal_auto_checkpoint = options.wal_auto_checkpoint,
             .wal = wal_instance,
         };
         errdefer {
@@ -1036,9 +1057,42 @@ pub const Bucket = struct {
         if (self.wal_header_pending) return;
         if (self.wal_pending_pages.count() > 0) return;
         const w = &(self.wal orelse return);
+
+        // Snapshot the current SHM checkpoint generation.
+        self.wal_checkpoint_generation = @atomicLoad(u64, &w.index.shmHeader().checkpoint_generation, .acquire);
+
+        // Fast path: the writer publishes page_count/doc_count to SHM
+        // atomically, so readers can pick them up without any disk I/O.
+        const shm = w.index.shmHeader();
+        const shm_pc = @atomicLoad(u64, &shm.shm_page_count, .acquire);
+        const shm_dc = @atomicLoad(u64, &shm.shm_doc_count, .acquire);
+        if (shm_pc > 0) {
+            if (shm_pc > self.header.page_count) {
+                self.header.page_count = shm_pc;
+            }
+            if (shm_dc > self.header.doc_count) {
+                self.header.doc_count = shm_dc;
+            }
+            return;
+        }
+
+        // Fallback: re-read the embedded BucketHeader from the WAL file
+        // on disk (used when the SHM was freshly created, e.g. after a
+        // crash where the writer had already synced the WAL header).
+        if (w.readBucketHeader() catch null) |bh| {
+            const wal_header = BucketHeader.read(&bh);
+            if (wal_header.page_count > self.header.page_count) {
+                self.header.page_count = wal_header.page_count;
+            }
+            if (wal_header.doc_count > self.header.doc_count) {
+                self.header.doc_count = wal_header.doc_count;
+            }
+            return;
+        }
+
+        // Fallback for v2 WALs: try the HEADER_PAGE_ID sentinel frame.
         const data = w.page_data(WAL.HEADER_PAGE_ID, std.math.maxInt(i64)) catch return;
         const wal_header = BucketHeader.read(data[0..BucketHeader.byteSize]);
-        // Monotonically advance page_count — never let a stale WAL frame shrink it.
         if (wal_header.page_count > self.header.page_count) {
             self.header.page_count = wal_header.page_count;
         }
@@ -1047,24 +1101,41 @@ pub const Bucket = struct {
         }
     }
 
-    /// Apply every WAL frame to the main database file.  Called during
-    /// close when this is the last active connection so that the main
-    /// file is fully up-to-date for the next open.
+    /// Apply every WAL frame to the main database file and write the
+    /// current BucketHeader.  Safe to call even when other readers are
+    /// active — they will detect the new checkpoint_generation in SHM
+    /// and invalidate their page caches.
+    /// Flush all WAL frames to the main database file and truncate the WAL.
+    /// This is a no-op when the WAL is not active or has no pending frames.
+    pub fn checkpoint(self: *Bucket) void {
+        if (self.wal) |*w| {
+            w.sync() catch {};
+        }
+        self.checkpointWal();
+        if (self.wal) |*w| {
+            w.checkpoint() catch {};
+        }
+        if (self.wal) |*w| {
+            self.wal_checkpoint_generation = @atomicLoad(u64, &w.index.shmHeader().checkpoint_generation, .acquire);
+        }
+    }
+
     fn checkpointWal(self: *Bucket) void {
         const w = &(self.wal orelse return);
-        if (w.header.frame_count == 0) return;
+        if (w.header.frame_count == 0 and w.live_frame_count == 0) return;
 
         const f = if (self.file) |*fh| fh else return;
 
         var it = w.frames();
 
         while (it.next() catch null) |frame| {
-            if (frame.header.page_id == WAL.HEADER_PAGE_ID) {
-                f.pwriteAll(frame.data[0..BucketHeader.byteSize], 0) catch return;
-            } else {
-                const offset = BucketHeader.byteSize + frame.header.page_id * DEFAULT_PAGE_SIZE;
-                f.pwriteAll(frame.data, offset) catch return;
-            }
+            // Skip legacy v2 sentinel frames — their data is already
+            // captured in the in-memory BucketHeader via the embedded
+            // WAL header field.
+            if (frame.header.page_id == WAL.HEADER_PAGE_ID) continue;
+
+            const offset = BucketHeader.byteSize + frame.header.page_id * DEFAULT_PAGE_SIZE;
+            f.pwriteAll(frame.data, offset) catch return;
         }
 
         // Write the current in-memory header (most up-to-date).
@@ -1229,6 +1300,10 @@ pub const Bucket = struct {
             return PageError.PageNotFound;
         }
 
+        // Check if another connection checkpointed the WAL.  If so,
+        // the main DB file was updated and our cached pages are stale.
+        self.maybeInvalidateCacheOnCheckpoint();
+
         // read_durability == .process  →  trust the local cache; only
         //   consult the WAL on a cache miss.  This avoids SHM lock +
         //   skip-list lookup + 8 KB pread + checksum on every B+ tree
@@ -1341,6 +1416,36 @@ pub const Bucket = struct {
             _ = evicted;
         }
         return page;
+    }
+
+    /// Compare the SHM checkpoint_generation against our local snapshot.
+    /// If another connection ran a checkpoint, flush the page cache and
+    /// reload the BucketHeader from the main DB file so subsequent reads
+    /// see the freshly-checkpointed data.
+    fn maybeInvalidateCacheOnCheckpoint(self: *Bucket) void {
+        const w = &(self.wal orelse return);
+        const shm_gen = @atomicLoad(u64, &w.index.shmHeader().checkpoint_generation, .acquire);
+        if (shm_gen == self.wal_checkpoint_generation) return;
+
+        // Update generation FIRST to prevent re-entry from loadPage(0) below.
+        self.wal_checkpoint_generation = shm_gen;
+
+        // Another connection checkpointed — clear stale cached pages.
+        self.pageCache.clear(self.allocator);
+        self.cached_last_data_page = null;
+
+        // Re-read the BucketHeader from the main DB file (now authoritative).
+        if (self.file) |*f| {
+            var hdr_bytes: [BucketHeader.byteSize]u8 = undefined;
+            f.preadAll(hdr_bytes[0..], 0) catch {};
+            self.header = BucketHeader.read(hdr_bytes[0..]);
+        }
+
+        // Reload indexes from the (possibly updated) meta page.
+        self.resetLoadedIndexes();
+        if (self.loadPage(0)) |meta| {
+            self.loadIndices(meta) catch {};
+        } else |_| {}
     }
 
     /// Return a nanosecond timestamp (as i64) for WAL frame ordering.
@@ -1487,18 +1592,33 @@ pub const Bucket = struct {
             self.wal_pending_pages.clearRetainingCapacity();
 
             if (self.wal_header_pending) {
-                var header_page: [DEFAULT_PAGE_SIZE]u8 = [_]u8{0} ** DEFAULT_PAGE_SIZE;
+                // Embed the BucketHeader in the WAL header (v3+).
                 const bytes = self.header.toBytes();
-                @memcpy(header_page[0..BucketHeader.byteSize], &bytes);
-                w.appendPage(WAL.HEADER_PAGE_ID, &header_page, tx_ts) catch {};
+                @memcpy(&w.header.bucket_header, bytes[0..BucketHeader.byteSize]);
                 self.wal_header_pending = false;
+
+                // Publish page_count/doc_count to SHM so readers see
+                // them immediately without any disk I/O.
+                const shm = w.index.shmHeader();
+                @atomicStore(u64, &shm.shm_page_count, self.header.page_count, .release);
+                @atomicStore(u64, &shm.shm_doc_count, self.header.doc_count, .release);
             }
 
             if (self.write_durability == .all) {
                 w.sync() catch {};
-                return;
+            } else {
+                self.maybeSyncPeriodic();
             }
-            self.maybeSyncPeriodic();
+
+            // Auto-checkpoint: when the WAL grows past the threshold,
+            // flush frames to the main DB file and truncate.
+            if (self.wal_auto_checkpoint > 0 and w.live_frame_count >= self.wal_auto_checkpoint) {
+                w.sync() catch {};
+                self.checkpointWal();
+                w.checkpoint() catch {};
+                self.wal_checkpoint_generation = @atomicLoad(u64, &w.index.shmHeader().checkpoint_generation, .acquire);
+            }
+
             return;
         }
 
@@ -1625,11 +1745,12 @@ pub const Bucket = struct {
             .frame_count = frame_count,
             .wal_salt = w.header.salt,
             .latest_tx_timestamp = w.latest_committed_tx,
+            .bucket_header = self.header.toBytes()[0..BucketHeader.byteSize].*,
         };
         const header_bytes = header.toBytes();
         @memcpy(batch[0..ReplicationBatchHeader.byte_size], &header_bytes);
 
-        const wal_offset = @as(u64, WAL.Header.byte_size) + from.next_frame_index * @as(u64, WAL.frame_size);
+        const wal_offset = w.data_offset + from.next_frame_index * @as(u64, WAL.frame_size);
         walReadAllAt(w.read_fd, batch[ReplicationBatchHeader.byte_size..], wal_offset) catch return error.WalReadFailed;
 
         return batch;
@@ -1637,17 +1758,18 @@ pub const Bucket = struct {
 
     pub fn applyReplicationBatch(self: *Bucket, batch: []const u8) !ReplicationCursor {
         if (self.in_memory or self.wal == null) return error.WalNotActive;
-        if (batch.len < ReplicationBatchHeader.byte_size) return error.InvalidFormat;
+        if (batch.len < ReplicationBatchHeader.v1_byte_size) return error.InvalidFormat;
 
-        const batch_header = ReplicationBatchHeader.fromBytes(batch[0..ReplicationBatchHeader.byte_size]);
+        const batch_header = ReplicationBatchHeader.fromBytes(batch[0..@min(batch.len, ReplicationBatchHeader.byte_size)]);
         if (!std.mem.eql(u8, &batch_header.magic, &[_]u8{ 'A', 'R', 'P', 'L' })) return error.InvalidFormat;
-        if (batch_header.version != 1) return error.InvalidFormat;
+        if (batch_header.version != 1 and batch_header.version != 2) return error.InvalidFormat;
         if (batch_header.page_size != DEFAULT_PAGE_SIZE or batch_header.page_size != @as(u16, @intCast(self.header.page_size))) return error.InvalidFormat;
         if (batch_header.frame_count == 0) return error.InvalidFormat;
         if (batch_header.generation != self.header.replication_generation) return error.ReplicationGap;
 
+        const hdr_size: usize = if (batch_header.version >= 2) ReplicationBatchHeader.byte_size else ReplicationBatchHeader.v1_byte_size;
         const frame_bytes_len = try std.math.mul(usize, @as(usize, @intCast(batch_header.frame_count)), WAL.frame_size);
-        const expected_size = ReplicationBatchHeader.byte_size + frame_bytes_len;
+        const expected_size = hdr_size + frame_bytes_len;
         if (batch.len != expected_size) return error.InvalidFormat;
 
         const w = &(self.wal.?);
@@ -1658,14 +1780,14 @@ pub const Bucket = struct {
 
         const local_frame_count = w.header.frame_count;
         const incoming_end = batch_header.start_frame_index + batch_header.frame_count;
-        const frame_bytes = batch[ReplicationBatchHeader.byte_size..];
+        const frame_bytes = batch[hdr_size..];
 
         if (batch_header.start_frame_index < local_frame_count) {
             if (incoming_end > local_frame_count) return error.ReplicationGap;
 
             const existing = try self.allocator.alloc(u8, frame_bytes.len);
             defer self.allocator.free(existing);
-            const wal_offset = @as(u64, WAL.Header.byte_size) + batch_header.start_frame_index * @as(u64, WAL.frame_size);
+            const wal_offset = w.data_offset + batch_header.start_frame_index * @as(u64, WAL.frame_size);
             walReadAllAt(w.read_fd, existing, wal_offset) catch return error.WalReadFailed;
             if (!std.mem.eql(u8, existing, frame_bytes)) return error.ReplicationGap;
             return self.replicationCursor();
@@ -1676,17 +1798,27 @@ pub const Bucket = struct {
         try w.appendCommittedFrames(frame_bytes, batch_header.latest_tx_timestamp);
 
         var meta_page_replicated = false;
+        // v2 batch: use the embedded BucketHeader from the batch header.
+        // v1 batch: look for HEADER_PAGE_ID sentinel frames (legacy).
         var replicated_header: ?BucketHeader = null;
+        const zero: [64]u8 = [_]u8{0} ** 64;
+        if (batch_header.version >= 2 and !std.mem.eql(u8, &batch_header.bucket_header, &zero)) {
+            replicated_header = BucketHeader.read(&batch_header.bucket_header);
+        }
+
         var i: u64 = 0;
         while (i < batch_header.frame_count) : (i += 1) {
-            const frame_start = ReplicationBatchHeader.byte_size + @as(usize, @intCast(i * WAL.frame_size));
+            const frame_start = hdr_size + @as(usize, @intCast(i * WAL.frame_size));
             const frame = batch[frame_start .. frame_start + WAL.frame_size];
             const frame_header_bytes: *const [WAL.FrameHeader.byte_size]u8 = @ptrCast(frame[0..WAL.FrameHeader.byte_size].ptr);
             const frame_header = WAL.FrameHeader.fromBytes(frame_header_bytes);
-            const page_data = frame[WAL.FrameHeader.byte_size..];
 
             if (frame_header.page_id == WAL.HEADER_PAGE_ID) {
-                replicated_header = BucketHeader.read(page_data[0..BucketHeader.byteSize]);
+                // Legacy v1 sentinel frame.
+                if (replicated_header == null) {
+                    const page_data = frame[WAL.FrameHeader.byte_size..];
+                    replicated_header = BucketHeader.read(page_data[0..BucketHeader.byteSize]);
+                }
             } else {
                 self.invalidateCachedPage(frame_header.page_id);
                 if (frame_header.page_id == 0) {
@@ -4287,22 +4419,19 @@ pub const Bucket = struct {
 
         // Apply WAL frames to the main file and clean up.
         if (self.wal) |*w| {
-            // Only checkpoint to the main file when we are the last
-            // connection — other processes may still be reading the WAL.
-            if (w.index.activeConnections() <= 1) {
-                if (self.nextReplicationGeneration()) |next_generation| {
-                    self.header.replication_generation = next_generation;
-                    self.persistHeaderToMainFile();
-                    w.setGeneration(next_generation) catch {};
-                    self.checkpointWal();
-                    w.consumeAndClose();
-                } else |_| {
-                    // Preserve the WAL if generation space is exhausted so we never
-                    // silently wrap and reuse replication cursor history.
-                    w.deinit();
-                }
-            } else {
+            // Always checkpoint — even with active readers.  Other connections
+            // will detect the bumped checkpoint_generation in SHM and invalidate
+            // their page caches before the next read.
+            if (self.nextReplicationGeneration()) |next_generation| {
+                self.header.replication_generation = next_generation;
+                self.persistHeaderToMainFile();
+                w.setGeneration(next_generation) catch {};
+                self.checkpointWal();
                 w.consumeAndClose();
+            } else |_| {
+                // Preserve the WAL if generation space is exhausted so we never
+                // silently wrap and reuse replication cursor history.
+                w.deinit();
             }
             self.wal = null;
         }
