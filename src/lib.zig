@@ -112,7 +112,7 @@ pub export fn albedo_open(path: [*:0]u8, out: **albedo.Bucket) Result {
     // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     // defer _ = gpa.deinit();
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    const threaded: std.Io.Threaded = .init(ally, .{});
+    var threaded: std.Io.Threaded = .init(ally, .{});
     const io = threaded.io();
     db.* = albedo.Bucket.init(ally, io, pathProper) catch {
         ally.destroy(db);
@@ -131,7 +131,7 @@ pub export fn albedo_open_with_options(path: [*:0]u8, optionsBuffer: [*]u8, out:
     defer parsed.deinit();
 
     const db = ally.create(albedo.Bucket) catch return Result.OutOfMemory;
-    const threaded: std.Io.Threaded = .init(ally, .{});
+    var threaded: std.Io.Threaded = .init(ally, .{});
     const io = threaded.io();
     db.* = albedo.Bucket.openFileWithOptions(ally, io, pathProper, parsed.value) catch {
         ally.destroy(db);

@@ -1,6 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
-
 fn cwdDeleteFile(io: std.Io, path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
@@ -30,45 +28,7 @@ pub const DEFAULT_PAGE_SIZE: u16 = 8192;
 /// Native file-descriptor / handle type, selected at compile time:
 ///   - POSIX (Linux / macOS): `std.posix.fd_t`  (i32)
 ///   - Windows:               `std.os.windows.HANDLE`
-const NativeFd = std.Io.File.Handle;
-
-/// OS handles stored by WalIndex for the mmap'd SHM file.
-/// On POSIX only the fd is required; on Windows a separate mapping
-/// handle created by CreateFileMappingW must also be kept alive.
-const WalIndexHandles = if (builtin.os.tag == .windows) struct {
-    file: NativeFd,
-    mapping: std.os.windows.HANDLE,
-} else NativeFd;
-
-/// Windows-only shims for file-backed virtual memory.
-/// The entire namespace is compiled away on non-Windows targets.
-const win_mmap = if (builtin.os.tag == .windows) struct {
-    const w = std.os.windows;
-
-    pub const PAGE_READWRITE: w.DWORD = 0x04;
-    pub const FILE_MAP_ALL_ACCESS: w.DWORD = 0x000F_001F;
-
-    pub extern "kernel32" fn CreateFileMappingW(
-        hFile: w.HANDLE,
-        lpFileMappingAttributes: ?*anyopaque,
-        flProtect: w.DWORD,
-        dwMaximumSizeHigh: w.DWORD,
-        dwMaximumSizeLow: w.DWORD,
-        lpName: ?[*:0]const u16,
-    ) callconv(.winapi) ?w.HANDLE;
-
-    pub extern "kernel32" fn MapViewOfFile(
-        hFileMappingObject: w.HANDLE,
-        dwDesiredAccess: w.DWORD,
-        dwFileOffsetHigh: w.DWORD,
-        dwFileOffsetLow: w.DWORD,
-        dwNumberOfBytesToMap: w.SIZE_T,
-    ) callconv(.winapi) ?*anyopaque;
-
-    pub extern "kernel32" fn UnmapViewOfFile(
-        lpBaseAddress: *const anyopaque,
-    ) callconv(.winapi) w.BOOL;
-} else struct {};
+pub const NativeFd = std.Io.File.Handle;
 
 /// Write-Ahead Log for crash recovery and MVCC snapshot reads.
 ///
@@ -318,9 +278,8 @@ pub const WAL = struct {
     // ── WalIndex (mmap'd shared-memory skip list) ─────────────────────
 
     pub const WalIndex = struct {
-        fd: WalIndexHandles,
-        map: [*]align(std.heap.page_size_min) u8,
-        map_len: usize,
+        file: std.Io.File,
+        memory_map: std.Io.File.MemoryMap,
         path: []const u8,
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -345,66 +304,23 @@ pub const WAL = struct {
 
             // ── Open the SHM file and map it into memory ──────────────────────
 
-            const fd: WalIndexHandles = if (builtin.os.tag == .windows) blk: {
-                // Open (or create) the SHM file for read + write.
-                const file_handle = openShmFd(io, path) catch return Error.WalIndexFailed;
-                errdefer closeFd(io, file_handle);
+            const file = openShmFile(io, path) catch return Error.WalIndexFailed;
+            errdefer file.close(io);
 
-                // Ensure the file is at least map_len bytes.
-                ftruncateFile(io, file_handle, map_len) catch return Error.WalIndexFailed;
+            file.setLength(io, map_len) catch return Error.WalIndexFailed;
 
-                // Create a named-less file-mapping object backed by the file.
-                const high: std.os.windows.DWORD = @truncate(map_len >> 32);
-                const low: std.os.windows.DWORD = @truncate(map_len);
-                const mapping = win_mmap.CreateFileMappingW(
-                    file_handle,
-                    null,
-                    win_mmap.PAGE_READWRITE,
-                    high,
-                    low,
-                    null,
-                ) orelse return Error.WalIndexFailed;
-                errdefer std.os.windows.CloseHandle(mapping);
-
-                break :blk .{ .file = file_handle, .mapping = mapping };
-            } else blk: {
-                // POSIX: open for read+write, create if absent.
-                const raw_fd = openShmFd(io, path) catch return Error.WalIndexFailed;
-                errdefer std.posix.close(raw_fd);
-
-                // Ensure the file is at least the required size.
-                std.posix.ftruncate(raw_fd, @intCast(map_len)) catch return Error.WalIndexFailed;
-
-                break :blk raw_fd;
-            };
-
-            // ── Map the file into the process address space ────────────────────
-
-            const map: [*]align(std.heap.page_size_min) u8 = if (builtin.os.tag == .windows) blk: {
-                const ptr = win_mmap.MapViewOfFile(
-                    fd.mapping,
-                    win_mmap.FILE_MAP_ALL_ACCESS,
-                    0,
-                    0,
-                    map_len,
-                ) orelse return Error.WalIndexFailed;
-                break :blk @ptrCast(@alignCast(ptr));
-            } else blk: {
-                const map_slice = std.posix.mmap(
-                    null,
-                    map_len,
-                    std.posix.PROT.READ | std.posix.PROT.WRITE,
-                    .{ .TYPE = .SHARED },
-                    fd,
-                    0,
-                ) catch return Error.WalIndexFailed;
-                break :blk map_slice.ptr;
-            };
+            const memory_map = file.createMemoryMap(io, .{
+                .len = map_len,
+                .protection = .{ .read = true, .write = true },
+            }) catch return Error.WalIndexFailed;
+            errdefer {
+                var mm = memory_map;
+                mm.destroy(io);
+            }
 
             var idx = WalIndex{
-                .fd = fd,
-                .map = map,
-                .map_len = map_len,
+                .file = file,
+                .memory_map = memory_map,
                 .path = stored_path,
                 .allocator = allocator,
                 .io = io,
@@ -469,15 +385,9 @@ pub const WAL = struct {
 
         pub fn deinit(self: *WalIndex) void {
             self.disconnect();
-            if (builtin.os.tag == .windows) {
-                _ = win_mmap.UnmapViewOfFile(@ptrCast(self.map));
-                std.os.windows.CloseHandle(self.fd.mapping);
-                closeFd(self.io, self.fd.file);
-            } else {
-                const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
-                std.posix.munmap(slice);
-                std.posix.close(self.fd);
-            }
+            self.memory_map.write(self.io) catch {};
+            self.memory_map.destroy(self.io);
+            self.file.close(self.io);
             self.allocator.free(self.path);
         }
 
@@ -503,16 +413,9 @@ pub const WAL = struct {
             const path_copy = self.path;
             const ally = self.allocator;
 
-            // Unmap and close the fd(s) first.
-            if (builtin.os.tag == .windows) {
-                _ = win_mmap.UnmapViewOfFile(@ptrCast(self.map));
-                std.os.windows.CloseHandle(self.fd.mapping);
-                closeFd(self.io, self.fd.file);
-            } else {
-                const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
-                std.posix.munmap(slice);
-                std.posix.close(self.fd);
-            }
+            self.memory_map.write(self.io) catch {};
+            self.memory_map.destroy(self.io);
+            self.file.close(self.io);
 
             if (remaining == 0) {
                 cwdDeleteFile(self.io, path_copy);
@@ -524,11 +427,11 @@ pub const WAL = struct {
         }
 
         pub fn shmHeader(self: *WalIndex) *ShmHeader {
-            return @ptrCast(@alignCast(self.map));
+            return @ptrCast(@alignCast(self.memory_map.memory.ptr));
         }
 
         fn nodePtr(self: *WalIndex, idx: u32) *ShmNode {
-            const base: [*]u8 = @ptrCast(self.map);
+            const base: [*]u8 = @ptrCast(self.memory_map.memory.ptr);
             const offset = self.nodesOffset() + @as(usize, idx) * ShmNode.byte_size;
             return @ptrCast(@alignCast(base + offset));
         }
@@ -537,7 +440,7 @@ pub const WAL = struct {
 
         /// Returns a pointer to the start of the oplog ring region.
         fn oplogBase(self: *WalIndex) [*]u8 {
-            const base: [*]u8 = @ptrCast(self.map);
+            const base: [*]u8 = @ptrCast(self.memory_map.memory.ptr);
             return base + oplog_offset;
         }
 
@@ -733,10 +636,10 @@ pub const WAL = struct {
             return a_tx <= b_tx;
         }
 
-        fn randomLevel() u8 {
+        fn randomLevel(self: *WalIndex) u8 {
             var level: u8 = 1;
             var buf: [2]u8 = undefined;
-            std.Random.bytes(&buf);
+            self.io.random(&buf);
             var bits: u16 = std.mem.readInt(u16, &buf, .little);
             while (level < MAX_LEVEL) {
                 if ((bits & 1) == 0) break;
@@ -771,7 +674,7 @@ pub const WAL = struct {
                 update[lvl] = current;
             }
 
-            const new_lvl = randomLevel();
+            const new_lvl = self.randomLevel();
             if (new_lvl > shm.current_level) {
                 var i: u8 = shm.current_level;
                 while (i < new_lvl) : (i += 1) {
@@ -940,7 +843,7 @@ pub const WAL = struct {
         } else {
             // Seed the salt from OS randomness.
             var salt_bytes: [8]u8 = undefined;
-            std.crypto.random.bytes(&salt_bytes);
+            io.random(&salt_bytes);
             wal_header.salt = std.mem.readInt(u64, &salt_bytes, .little);
             wal_header.generation = generation;
 
@@ -1254,24 +1157,12 @@ pub const WAL = struct {
 
     // ── Cross-platform file helpers ───────────────────────────────────
 
-    /// Open or create a file for append-only sequential writes.
-    /// On POSIX the O_APPEND flag delegates positioning to the kernel;
-    /// on Windows the file is opened for writing and each `writeAll` call
-    /// seeks to the end before writing (single-writer WAL, so this is safe).
+    /// Open or create a file for sequential writes.
+    /// `writeAll` seeks to the end before each append, which is sufficient
+    /// for this single-writer WAL implementation.
     fn openWriteFd(io: std.Io, path: []const u8) !NativeFd {
-        if (builtin.os.tag == .windows) {
-            // createFile with truncate=false: opens existing or creates new,
-            // positioned at the beginning. writeAll will seek to end each time.
-            const f = cwdCreateFile(io, path, .{ .truncate = false }) catch return error.OpenFailed;
-            return f.handle;
-        } else {
-            const path_z = std.posix.toPosixPath(path) catch return error.NameTooLong;
-            return std.posix.openZ(&path_z, .{
-                .ACCMODE = .WRONLY,
-                .CREAT = true,
-                .APPEND = true,
-            }, 0o644) catch return error.OpenFailed;
-        }
+        const f = cwdCreateFile(io, path, .{ .truncate = false }) catch return error.OpenFailed;
+        return f.handle;
     }
 
     /// Open an existing file read-only.
@@ -1289,12 +1180,11 @@ pub const WAL = struct {
 
     /// Open (or create) a file for read + write without truncation.
     /// Used for the SHM index file.
-    fn openShmFd(io: std.Io, path: []const u8) !NativeFd {
-        const f = cwdCreateFile(io, path, .{
+    fn openShmFile(io: std.Io, path: []const u8) !std.Io.File {
+        return cwdCreateFile(io, path, .{
             .read = true,
             .truncate = false,
         }) catch return error.OpenFailed;
-        return f.handle;
     }
 
     fn closeFd(io: std.Io, fd: NativeFd) void {
@@ -1313,18 +1203,11 @@ pub const WAL = struct {
         writer.interface.writeAll(buf) catch return error.WriteFailed;
     }
 
-    /// Append `buf` to the file.  On POSIX the fd is O_APPEND so the
-    /// kernel handles positioning atomically.  On Windows we seek to the
-    /// end first (the WAL is single-writer so no race exists).
+    /// Append `buf` to the file by seeking to the current end first.
     fn writeAll(io: std.Io, fd: NativeFd, buf: []const u8) !void {
         const file = fdFile(fd);
-        if (builtin.os.tag == .windows) {
-            var writer = std.Io.File.Writer.initStreaming(file, io, &.{});
-            writer.seekTo(file.length(io) catch return error.WriteFailed) catch return error.WriteFailed;
-            writer.interface.writeAll(buf) catch return error.WriteFailed;
-            return;
-        }
         var writer = std.Io.File.Writer.initStreaming(file, io, &.{});
+        writer.seekTo(file.length(io) catch return error.WriteFailed) catch return error.WriteFailed;
         writer.interface.writeAll(buf) catch return error.WriteFailed;
     }
 

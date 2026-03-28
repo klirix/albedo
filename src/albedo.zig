@@ -381,9 +381,10 @@ pub const Bucket = struct {
     file: ?platform.FileHandle = null,
     path: []const u8,
     allocator: std.mem.Allocator,
+    io: std.Io,
     header: BucketHeader,
     pageCache: PageCache,
-    rwlock: std.Thread.RwLock = .{},
+    rwlock: std.Io.RwLock = .init,
     indexes: std.StringHashMap(*Index),
     autoVaccuum: bool = true,
     objectIdGenerator: ObjectIdGenerator,
@@ -438,8 +439,8 @@ pub const Bucket = struct {
     };
 
     // Update init to include allocator
-    pub fn init(allocator: std.mem.Allocator, path: []const u8) !Bucket {
-        return Bucket.openFile(allocator, path);
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Bucket {
+        return Bucket.openFile(allocator, io, path);
     }
 
     const BucketFileMode = enum {
@@ -499,7 +500,7 @@ pub const Bucket = struct {
         header_dirty: bool = false,
         cached_last_data_page_snapshot: ?*Page,
         index_root_snapshots: []IndexRootSnapshot,
-        deferred_oplog: std.ArrayList(DeferredOplogEntry) = .{},
+        deferred_oplog: std.ArrayList(DeferredOplogEntry) = .empty,
         open_transforms: usize = 0,
         active: bool = true,
 
@@ -615,7 +616,7 @@ pub const Bucket = struct {
             if (!self.active) return;
             self.active = false;
             self.bucket.active_tx = null;
-            self.bucket.rwlock.unlock();
+            self.bucket.unlock();
         }
 
         fn abort(self: *Transaction, force: bool) void {
@@ -644,12 +645,12 @@ pub const Bucket = struct {
                 entry.deinit(self.bucket.allocator);
             }
             self.deferred_oplog.deinit(self.bucket.allocator);
-            self.deferred_oplog = .{};
+            self.deferred_oplog = .empty;
         }
     };
 
     fn loadIndices(self: *Bucket, page: *const Page) !void {
-        var reader = std.io.Reader.fixed(page.data);
+        var reader = std.Io.Reader.fixed(page.data);
         while (true) {
             // Stop when we hit the first NUL at the beginning (no more entries)
             const b = try reader.peekByte();
@@ -683,7 +684,7 @@ pub const Bucket = struct {
         const meta_page = try self.loadPage(0);
 
         var buffer: [DEFAULT_PAGE_SIZE - @sizeOf(PageHeader)]u8 = undefined;
-        var writer = std.io.Writer.fixed(&buffer);
+        var writer = std.Io.Writer.fixed(&buffer);
 
         var it = self.indexes.iterator();
 
@@ -708,13 +709,29 @@ pub const Bucket = struct {
         try self.writePage(meta_page);
     }
 
+    fn lock(self: *Bucket) !void {
+        try self.rwlock.lock(self.io);
+    }
+
+    fn unlock(self: *Bucket) void {
+        self.rwlock.unlock(self.io);
+    }
+
+    fn lockShared(self: *Bucket) !void {
+        try self.rwlock.lockShared(self.io);
+    }
+
+    fn unlockShared(self: *Bucket) void {
+        self.rwlock.unlockShared(self.io);
+    }
+
     pub fn beginTransaction(self: *Bucket) !*Transaction {
         if (self.active_tx != null) return error.TransactionActive;
-        self.rwlock.lock();
-        errdefer self.rwlock.unlock();
+        try self.lock();
+        errdefer self.unlock();
         if (self.active_tx != null) return error.TransactionActive;
 
-        var root_snapshots = std.ArrayList(IndexRootSnapshot){};
+        var root_snapshots: std.ArrayList(IndexRootSnapshot) = .empty;
         defer root_snapshots.deinit(self.allocator);
 
         var idx_iter = self.indexes.iterator();
@@ -812,8 +829,8 @@ pub const Bucket = struct {
 
     pub fn dropIndex(self: *Bucket, path: []const u8) !void {
         try self.ensureNoActiveTransaction();
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        try self.lock();
+        defer self.unlock();
 
         var removed = self.indexes.fetchRemove(path) orelse return error.IndexNotFound;
         errdefer {
@@ -830,12 +847,13 @@ pub const Bucket = struct {
         self.allocator.free(@constCast(removed.key));
     }
 
-    pub fn openFile(ally: std.mem.Allocator, path: []const u8) BucketInitErrors!Bucket {
-        return Bucket.openFileWithOptions(ally, path, .{});
+    pub fn openFile(ally: std.mem.Allocator, io: std.Io, path: []const u8) BucketInitErrors!Bucket {
+        return Bucket.openFileWithOptions(ally, io, path, .{});
     }
 
-    fn createEmptyDBFile(path: []const u8, ally: mem.Allocator, options: OpenBucketOptions) BucketInitErrors!Bucket {
-        var new_file = platform.openFile(ally, path, .{
+    fn createEmptyDBFile(path: []const u8, ally: mem.Allocator, io: std.Io, options: OpenBucketOptions) BucketInitErrors!Bucket {
+        const plat = platform.Platform.init(io);
+        var new_file = plat.openFile(ally, path, .{
             .read = true,
             .write = true,
             .create = true,
@@ -853,7 +871,7 @@ pub const Bucket = struct {
             return BucketInitErrors.OutOfMemory;
         };
 
-        const generator = ObjectIdGenerator.init() catch {
+        const generator = ObjectIdGenerator.init(plat) catch {
             new_file.close();
             ally.free(stored_path);
             return BucketInitErrors.UnexpectedError;
@@ -867,6 +885,7 @@ pub const Bucket = struct {
             .path = stored_path,
             .header = .init(),
             .allocator = ally,
+            .io = io,
             .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
             .autoVaccuum = options.auto_vaccuum,
@@ -890,20 +909,21 @@ pub const Bucket = struct {
         if (bucket.file) |*f| f.sync() catch {};
 
         // Now attach the WAL for subsequent operations (if enabled).
-        bucket.wal = if (options.wal) try initWal(ally, path, options.oplog_size, bucket.header.replication_generation) else null;
+        bucket.wal = if (options.wal) try initWal(ally, io, path, options.oplog_size, bucket.header.replication_generation) else null;
 
-        bucket.rwlock = .{};
+        bucket.rwlock = .init;
 
         return bucket;
     }
 
-    fn createInMemoryBucket(ally: mem.Allocator, options: OpenBucketOptions) BucketInitErrors!Bucket {
-        const generator = ObjectIdGenerator.init() catch return BucketInitErrors.UnexpectedError;
+    fn createInMemoryBucket(ally: mem.Allocator, io: std.Io, options: OpenBucketOptions) BucketInitErrors!Bucket {
+        const generator = ObjectIdGenerator.init(platform.Platform.init(io)) catch return BucketInitErrors.UnexpectedError;
         var bucket = Bucket{
             .file = null,
             .path = ally.dupe(u8, ":memory:") catch return BucketInitErrors.OutOfMemory,
             .header = .init(),
             .allocator = ally,
+            .io = io,
             .pageCache = PageCache.init(ally, std.math.maxInt(usize)),
             .indexes = .init(ally),
             .autoVaccuum = options.auto_vaccuum,
@@ -918,24 +938,25 @@ pub const Bucket = struct {
         bucket.ensureIndex("_id", .{ .unique = 1 }) catch return BucketInitErrors.InitializationError;
         bucket.writePage(meta) catch return BucketInitErrors.FileWriteError;
 
-        bucket.rwlock = .{};
+        bucket.rwlock = .init;
 
         return bucket;
     }
 
     // Path may be relative or absolute
-    pub fn openFileWithOptions(ally: std.mem.Allocator, path: []const u8, options: OpenBucketOptions) BucketInitErrors!Bucket {
+    pub fn openFileWithOptions(ally: std.mem.Allocator, io: std.Io, path: []const u8, options: OpenBucketOptions) BucketInitErrors!Bucket {
         if (mem.eql(u8, path, ":memory:")) {
-            return createInMemoryBucket(ally, options);
+            return createInMemoryBucket(ally, io, options);
         }
 
-        var file = platform.openFile(ally, path, .{
+        const plat = platform.Platform.init(io);
+        var file = plat.openFile(ally, path, .{
             .read = true,
             .write = options.mode == .ReadWrite,
         }) catch |err| switch (err) {
             error.FileNotFound => {
                 if (options.mode != .ReadWrite) return BucketInitErrors.FileNotFound;
-                return createEmptyDBFile(path, ally, options);
+                return createEmptyDBFile(path, ally, io, options);
             },
             else => return BucketInitErrors.FileOpenError,
         };
@@ -954,19 +975,20 @@ pub const Bucket = struct {
             return BucketInitErrors.OutOfMemory;
         };
 
-        const generator = ObjectIdGenerator.init() catch {
+        const generator = ObjectIdGenerator.init(plat) catch {
             file.close();
             ally.free(stored_path);
             return BucketInitErrors.UnexpectedError;
         };
 
         const existing_header = BucketHeader.read(header_bytes[0..BucketHeader.byteSize]);
-        const wal_instance: ?WAL = if (options.wal) try initWal(ally, path, options.oplog_size, existing_header.replication_generation) else null;
+        const wal_instance: ?WAL = if (options.wal) try initWal(ally, io, path, options.oplog_size, existing_header.replication_generation) else null;
 
         var bucket = Bucket{
             .file = file,
             .path = stored_path,
             .allocator = ally,
+            .io = io,
             .header = existing_header,
             .pageCache = PageCache.init(ally, options.page_cache_capacity),
             .indexes = .init(ally),
@@ -1054,12 +1076,12 @@ pub const Bucket = struct {
     /// Build the WAL path (<db_path>-wal) and open/create the WAL.
     /// Returns `error.OplogSizeMismatch` when the SHM file was created with a
     /// different non-zero oplog_size, so the caller can surface it properly.
-    fn initWal(ally: std.mem.Allocator, db_path: []const u8, oplog_size: u32, generation: u64) BucketInitErrors!WAL {
+    fn initWal(ally: std.mem.Allocator, io: std.Io, db_path: []const u8, oplog_size: u32, generation: u64) BucketInitErrors!WAL {
         const wal_path = ally.alloc(u8, db_path.len + 4) catch return BucketInitErrors.OutOfMemory;
         defer ally.free(wal_path);
         @memcpy(wal_path[0..db_path.len], db_path);
         @memcpy(wal_path[db_path.len..], "-wal");
-        return WAL.init(ally, wal_path, oplog_size, generation) catch |err| switch (err) {
+        return WAL.init(ally, io, wal_path, oplog_size, generation) catch |err| switch (err) {
             WAL.Error.WalOplogSizeMismatch => return BucketInitErrors.OplogSizeMismatch,
             WAL.Error.WalOpenFailed,
             WAL.Error.WalReadFailed,
@@ -1113,9 +1135,9 @@ pub const Bucket = struct {
 
     pub fn buildIndex(self: *Bucket, path: []const u8, options: IndexOptions) !void {
         try self.ensureNoActiveTransaction();
-        self.rwlock.lock();
+        try self.lock();
         defer {
-            self.rwlock.unlock();
+            self.unlock();
         }
 
         if (self.indexes.contains(path)) {
@@ -1142,7 +1164,7 @@ pub const Bucket = struct {
 
             var doc = BSONDocument{ .buffer = doc_result.data };
 
-            var values = std.ArrayList(BSONValue){};
+            var values: std.ArrayList(BSONValue) = .empty;
             defer values.deinit(temp_allocator);
 
             const has_values = try self.gatherIndexValuesForPath(&doc, path, options, &values);
@@ -1324,8 +1346,8 @@ pub const Bucket = struct {
     /// Return a nanosecond timestamp (as i64) for WAL frame ordering.
     /// Using nanoseconds instead of seconds avoids duplicate tx_timestamp
     /// values when multiple pages are written in the same second.
-    inline fn walTimestamp() i64 {
-        return @intCast(std.time.nanoTimestamp());
+    inline fn walTimestamp(self: *Bucket) i64 {
+        return @truncate(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
     }
 
     pub fn writePage(self: *Bucket, page: *const Page) !void {
@@ -1397,7 +1419,7 @@ pub const Bucket = struct {
         if (self.in_memory) return;
         const w = &(self.wal orelse return);
 
-        const ts = walTimestamp();
+        const ts = self.walTimestamp();
 
         // Determine payload kind and actual bytes to write.
         var payload_kind: WAL.PayloadKind = .none;
@@ -1442,7 +1464,7 @@ pub const Bucket = struct {
         }
 
         if (self.wal) |*w| {
-            const tx_ts = walTimestamp();
+            const tx_ts = self.walTimestamp();
 
             var it = self.wal_pending_pages.keyIterator();
             while (it.next()) |page_id_ptr| {
@@ -1608,8 +1630,7 @@ pub const Bucket = struct {
         @memcpy(batch[0..ReplicationBatchHeader.byte_size], &header_bytes);
 
         const wal_offset = @as(u64, WAL.Header.byte_size) + from.next_frame_index * @as(u64, WAL.frame_size);
-        const n = (std.fs.File{ .handle = w.read_fd }).preadAll(batch[ReplicationBatchHeader.byte_size..], wal_offset) catch return error.WalReadFailed;
-        if (n != frame_bytes_len) return error.WalReadFailed;
+        walReadAllAt(w.read_fd, batch[ReplicationBatchHeader.byte_size..], wal_offset) catch return error.WalReadFailed;
 
         return batch;
     }
@@ -1645,8 +1666,7 @@ pub const Bucket = struct {
             const existing = try self.allocator.alloc(u8, frame_bytes.len);
             defer self.allocator.free(existing);
             const wal_offset = @as(u64, WAL.Header.byte_size) + batch_header.start_frame_index * @as(u64, WAL.frame_size);
-            const n = (std.fs.File{ .handle = w.read_fd }).preadAll(existing, wal_offset) catch return error.WalReadFailed;
-            if (n != existing.len) return error.WalReadFailed;
+            walReadAllAt(w.read_fd, existing, wal_offset) catch return error.WalReadFailed;
             if (!std.mem.eql(u8, existing, frame_bytes)) return error.ReplicationGap;
             return self.replicationCursor();
         }
@@ -1689,10 +1709,10 @@ pub const Bucket = struct {
     }
 
     pub fn dump(self: *Bucket, dest_path: []const u8) !void {
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        try self.lock();
+        defer self.unlock();
 
-        var out_file = try platform.openFile(self.allocator, dest_path, .{
+        var out_file = try platform.Platform.init(self.io).openFile(self.allocator, dest_path, .{
             .read = true,
             .write = true,
             .create = true,
@@ -1823,14 +1843,14 @@ pub const Bucket = struct {
 
     pub fn insert(self: *Bucket, insertable: bson.BSONDocument) !DocInsertResult {
         try self.ensureNoActiveTransaction();
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        try self.lock();
+        defer self.unlock();
         return self.insertLocked(insertable, true);
     }
 
     fn insertLocked(self: *Bucket, insertable: bson.BSONDocument, autocommit: bool) !DocInsertResult {
         var doc = insertable;
-        const docId = self.objectIdGenerator.next();
+        const docId = self.objectIdGenerator.next(platform.Platform.init(self.io));
         const needCleanup = doc.get("_id") == null;
         if (needCleanup) {
             // If the document doesn't have an _id, generate one
@@ -1847,7 +1867,7 @@ pub const Bucket = struct {
         const encoded_doc = doc.buffer;
         var page: *Page = undefined;
 
-        var planned_index_inserts = std.ArrayList(PlannedIndexInsert){};
+        var planned_index_inserts: std.ArrayList(PlannedIndexInsert) = .empty;
         defer {
             for (planned_index_inserts.items) |*plan| {
                 plan.values.deinit(self.allocator);
@@ -1857,7 +1877,7 @@ pub const Bucket = struct {
 
         var idx_iter = self.indexes.iterator();
         while (idx_iter.next()) |entry| {
-            var values = std.ArrayList(BSONValue){};
+            var values: std.ArrayList(BSONValue) = .empty;
             var retain_values = false;
             defer {
                 if (!retain_values) {
@@ -2034,7 +2054,7 @@ pub const Bucket = struct {
 
     const PlannedIndexInsert = struct {
         index: *Index,
-        values: std.ArrayList(BSONValue) = .{},
+        values: std.ArrayList(BSONValue) = .empty,
     };
 
     const IndexValueError = error{
@@ -2400,7 +2420,7 @@ pub const Bucket = struct {
         index_iterator_initialized: bool = false,
         point_iterator: Index.RangeIterator = undefined,
         point_iterator_initialized: bool = false,
-        point_values: std.ArrayListUnmanaged(bson.BSONValue) = .{},
+        point_values: std.ArrayList(bson.BSONValue) = .empty,
         point_values_consumed: usize = 0,
         point_value_total: usize = 0,
         // Optimize for common case: single-point queries don't need deduplication
@@ -2430,7 +2450,7 @@ pub const Bucket = struct {
 
         pub fn prequery(self: *ListIterator) !void {
             const ally = self.arena.allocator();
-            var docList: std.ArrayList(BSONDocument) = .{};
+            var docList: std.ArrayList(BSONDocument) = .empty;
             try self.bucket.collectDocs(&docList, ally, &self.query, &self.plan);
 
             var resultSlice = docList.items;
@@ -2740,7 +2760,6 @@ pub const Bucket = struct {
             defer builder.deinit();
             var root = builder.docEncoder();
             root.putValue("version", .{ .int32 = .{ .value = 1 } }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };
 
@@ -2752,37 +2771,37 @@ pub const Bucket = struct {
                     "index_range",
             };
             root.putValue("mode", .{ .string = .{ .value = mode_value } }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                // error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };
 
             if (self.plan.source == .index) {
                 const index_path = self.plan.index_path orelse return error.UnsupportedCursorQuery;
                 root.putValue("indexPath", BSONValue.init(index_path)) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
+                    // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
             }
 
             if (self.last_emitted) |anchor| {
                 var anchor_doc = root.object("anchor") catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
+                    // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
                 anchor_doc.putValue("docId", BSONValue.init(anchor.doc_id)) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
+                    // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
                 anchor_doc.putValue("_id", anchor.user_id) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
+                    // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
                 anchor_doc.putValue("pageId", .{ .int64 = .{ .value = @intCast(anchor.page_id) } }) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
+                    // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
                 anchor_doc.putValue("offset", .{ .int32 = .{ .value = @intCast(anchor.offset) } }) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
+                    // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
                 anchor_doc.end() catch unreachable;
@@ -3028,7 +3047,7 @@ pub const Bucket = struct {
                         }
                     }
                 },
-                .endsWith => |_| {
+                .endsWith => {
                     // No indexable strategy for suffix matching.
                 },
                 else => {},
@@ -3350,7 +3369,7 @@ pub const Bucket = struct {
             const a = self.bucket.allocator;
 
             // Collect matching events.
-            var event_docs = std.ArrayList(BSONDocument){};
+            var event_docs = std.ArrayList(BSONDocument).empty;
             defer {
                 for (event_docs.items) |edoc| edoc.deinit(a);
                 event_docs.deinit(a);
@@ -3470,7 +3489,7 @@ pub const Bucket = struct {
             .index_iterator_initialized = false,
             .point_iterator = undefined,
             .point_iterator_initialized = false,
-            .point_values = .{},
+            .point_values = .empty,
             .point_values_consumed = 0,
             .point_value_total = 0,
             .point_dedup_strategy = .none,
@@ -3708,7 +3727,7 @@ pub const Bucket = struct {
 
             var doc = try self.ensureDoc();
 
-            var owned_strings = std.ArrayList([]u8){};
+            var owned_strings: std.ArrayList([]u8) = .empty;
             defer {
                 for (owned_strings.items) |str| {
                     self.bucket.allocator.free(str);
@@ -3730,7 +3749,7 @@ pub const Bucket = struct {
                 }
             }
 
-            var planned_index_deletes = std.ArrayList(PlannedIndexInsert){};
+            var planned_index_deletes = std.ArrayList(PlannedIndexInsert).empty;
             defer {
                 for (planned_index_deletes.items) |*plan| {
                     plan.values.deinit(self.bucket.allocator);
@@ -3743,7 +3762,7 @@ pub const Bucket = struct {
                 const index_ptr = pair.value_ptr.*;
                 const path = pair.key_ptr.*;
 
-                var values = std.ArrayList(BSONValue){};
+                var values = std.ArrayList(BSONValue).empty;
                 var retain_values = false;
                 defer {
                     if (!retain_values) values.deinit(self.bucket.allocator);
@@ -3811,7 +3830,10 @@ pub const Bucket = struct {
 
                 if (cloned_id) |id_val| {
                     if (insert_doc.get("_id") == null) {
-                        insert_doc = try insert_doc.set(self.bucket.allocator, "_id", id_val);
+                        insert_doc = insert_doc.set(self.bucket.allocator, "_id", id_val) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return error.ScanError,
+                        };
                         owns_doc = true;
                     }
                 }
@@ -3876,12 +3898,12 @@ pub const Bucket = struct {
     fn transformIterateInternal(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query, tx: ?*Transaction) !*TransformIterator {
         var plan = self.planQuery(&q);
 
-        var target_list = std.ArrayList(DocumentLocation){};
+        var target_list = std.ArrayList(DocumentLocation).empty;
         defer target_list.deinit(arena.allocator());
 
         if (tx == null) {
-            self.rwlock.lockShared();
-            defer self.rwlock.unlockShared();
+            try self.lockShared();
+            defer self.unlockShared();
         }
         try self.collectTargets(&plan, &q, &target_list, arena);
 
@@ -3937,7 +3959,7 @@ pub const Bucket = struct {
 
     pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]BSONDocument {
         var plan = self.planQuery(&q);
-        var docList: std.ArrayList(BSONDocument) = .{};
+        var docList: std.ArrayList(BSONDocument) = .empty;
         if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(allocator, limit);
 
         try self.collectDocs(&docList, allocator, &q, &plan);
@@ -4048,8 +4070,8 @@ pub const Bucket = struct {
 
     pub fn delete(self: *Bucket, q: query.Query) !void {
         try self.ensureNoActiveTransaction();
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        try self.lock();
+        defer self.unlock();
         try self.deleteLocked(q, true);
     }
 
@@ -4057,7 +4079,7 @@ pub const Bucket = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        var locations = std.ArrayList(DocumentMeta){};
+        var locations = std.ArrayList(DocumentMeta).empty;
         var iterator = try ScanIterator.init(self, allocator);
 
         // std.debug.print("iterator state: {any}\n", .{iterator.offset});
@@ -4078,7 +4100,7 @@ pub const Bucket = struct {
             var doc = try self.readDocAt(allocator, .{ .page_id = location.page_id, .offset = location.offset });
 
             // Gather all per-index values to delete (mirrors insert path)
-            var planned_index_deletes = std.ArrayList(PlannedIndexInsert){};
+            var planned_index_deletes = std.ArrayList(PlannedIndexInsert).empty;
             defer {
                 for (planned_index_deletes.items) |*plan| {
                     plan.values.deinit(self.allocator);
@@ -4091,7 +4113,7 @@ pub const Bucket = struct {
                 const index_ptr = pair.value_ptr.*;
                 const path = pair.key_ptr.*;
 
-                var values = std.ArrayList(BSONValue){};
+                var values = std.ArrayList(BSONValue).empty;
                 var retain_values = false;
                 defer {
                     if (!retain_values) values.deinit(self.allocator);
@@ -4161,7 +4183,7 @@ pub const Bucket = struct {
         const cache_capacity = self.pageCache.capacity;
         const reopen_wal = self.wal != null;
         const next_generation = try self.nextReplicationGeneration();
-        var newBucket = try Bucket.openFileWithOptions(self.allocator, tempFileName, .{
+        var newBucket = try Bucket.openFileWithOptions(self.allocator, self.io, tempFileName, .{
             .page_cache_capacity = cache_capacity,
             .auto_vaccuum = self.autoVaccuum,
             .oplog_size = self.oplog_size,
@@ -4180,7 +4202,7 @@ pub const Bucket = struct {
         // //     return BucketInitErrors.LoadIndexError;
         // // };
         // try newBucket.recordIndexes();
-        var idxReader = std.io.Reader.fixed(oldMeta.data);
+        var idxReader = std.Io.Reader.fixed(oldMeta.data);
         while (true) {
             // Stop when we hit the first NUL at the beginning (no more entries)
             const b = try idxReader.peekByte();
@@ -4222,16 +4244,16 @@ pub const Bucket = struct {
         iterator.deinit();
         self.deinit();
 
-        platform.deleteFile(path) catch |err| {
+        platform.Platform.init(self.io).deleteFile(path) catch |err| {
             // std.debug.print("Failed to delete old file: {any}\n", .{err});
             return err;
         };
-        platform.renameFile(tempFileName, path) catch |err| {
+        platform.Platform.init(self.io).renameFile(tempFileName, path) catch |err| {
             // std.debug.print("Failed to rename temp file: {any}\n", .{err});
             return err;
         };
 
-        self.file = try platform.openFile(self.allocator, path, .{
+        self.file = try platform.Platform.init(self.io).openFile(self.allocator, path, .{
             .read = true,
             .write = true,
         });
@@ -4248,7 +4270,7 @@ pub const Bucket = struct {
         self.wal_pending_pages = .init(self.allocator);
         self.wal_header_pending = false;
         self.oplog_size = newBucket.oplog_size;
-        self.wal = if (reopen_wal) try initWal(self.allocator, path, self.oplog_size, self.header.replication_generation) else null;
+        self.wal = if (reopen_wal) try initWal(self.allocator, self.io, path, self.oplog_size, self.header.replication_generation) else null;
         const meta = try self.loadPage(0);
         try self.loadIndices(meta);
     }
@@ -4313,6 +4335,36 @@ pub const Bucket = struct {
 
 const testing = std.testing;
 
+fn cwdDeleteFile(path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+}
+
+fn cwdStatFile(path: []const u8) !std.Io.File.Stat {
+    return std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+}
+
+fn cwdOpenFile(path: []const u8, flags: std.Io.File.OpenFlags) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(std.testing.io, path, flags);
+}
+
+fn cwdCreateFile(path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(std.testing.io, path, flags);
+}
+
+fn cwdAccess(path: []const u8) !void {
+    return std.Io.Dir.cwd().access(std.testing.io, path, .{});
+}
+
+fn walReadAllAt(fd: wal_mod.NativeFd, dest: []u8, offset: u64) !void {
+    const file: std.Io.File = .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+    var reader = std.Io.File.Reader.init(file, std.testing.io, &.{});
+    try reader.seekTo(offset);
+    try reader.interface.readSliceAll(dest);
+}
+
 fn testListCount(bucket: *Bucket, allocator: std.mem.Allocator, json: []const u8) !usize {
     var query_doc = try bson.BSONDocument.fromJSON(allocator, json);
     defer query_doc.deinit(allocator);
@@ -4338,11 +4390,11 @@ test "Bucket.TransformIterator updates document" {
     defer bucket_arena.deinit();
     const allocator = bucket_arena.allocator();
 
-    _ = platform.deleteFile("transform-update.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "transform-update.bucket");
+    _ = platform.testing_platform.deleteFile("transform-update.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "transform-update.bucket");
     defer {
         bucket.deinit();
-        platform.deleteFile("transform-update.bucket") catch {};
+        platform.testing_platform.deleteFile("transform-update.bucket") catch {};
     }
 
     var insert_doc = try bson.fmt.serialize(.{ .name = "Alice", .age = 37 }, allocator);
@@ -4417,11 +4469,11 @@ test "Bucket.TransformIterator deletes document when null transform" {
     // defer bucket_arena.deinit();
     const allocator = std.testing.allocator;
 
-    _ = platform.deleteFile("transform-delete.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "transform-delete.bucket");
+    _ = platform.testing_platform.deleteFile("transform-delete.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "transform-delete.bucket");
     defer {
         bucket.deinit();
-        platform.deleteFile("transform-delete.bucket") catch {};
+        platform.testing_platform.deleteFile("transform-delete.bucket") catch {};
     }
 
     var insert_doc = try bson.fmt.serialize(.{ .name = "Bob", .age = 30 }, allocator);
@@ -4474,23 +4526,23 @@ test "Bucket.Transaction commit keeps writes hidden until commit" {
     const wal_path = "transaction_commit_visibility.bucket-wal";
     const shm_path = "transaction_commit_visibility.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     var writer_arena = std.heap.ArenaAllocator.init(allocator);
     defer writer_arena.deinit();
     const w_ally = writer_arena.allocator();
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{ .wal = true });
     defer writer.deinit();
 
     var reader_arena = std.heap.ArenaAllocator.init(allocator);
     defer reader_arena.deinit();
     const r_ally = reader_arena.allocator();
-    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    var reader = try Bucket.openFileWithOptions(r_ally, std.testing.io, db_path, .{ .wal = true });
     defer reader.deinit();
 
     const seed_doc = try bson.fmt.serialize(.{ .name = "seed" }, w_ally);
@@ -4523,18 +4575,18 @@ test "Bucket.Transaction rollback restores state" {
     const wal_path = "transaction_rollback_restore.bucket-wal";
     const shm_path = "transaction_rollback_restore.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const ally = arena.allocator();
 
-    var bucket = try Bucket.openFileWithOptions(ally, db_path, .{ .wal = true });
+    var bucket = try Bucket.openFileWithOptions(ally, std.testing.io, db_path, .{ .wal = true });
     defer bucket.deinit();
 
     const original = try bson.fmt.serialize(.{ .name = "Alice" }, ally);
@@ -4575,23 +4627,23 @@ test "Bucket.Transaction delays oplog until commit" {
     const wal_path = "transaction_oplog_delay.bucket-wal";
     const shm_path = "transaction_oplog_delay.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     var writer_arena = std.heap.ArenaAllocator.init(allocator);
     defer writer_arena.deinit();
     const w_ally = writer_arena.allocator();
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{ .wal = true });
     defer writer.deinit();
 
     var reader_arena = std.heap.ArenaAllocator.init(allocator);
     defer reader_arena.deinit();
     const r_ally = reader_arena.allocator();
-    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    var reader = try Bucket.openFileWithOptions(r_ally, std.testing.io, db_path, .{ .wal = true });
     defer reader.deinit();
 
     var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, r_ally);
@@ -4626,23 +4678,23 @@ test "Bucket.Transaction reduces WAL frame count" {
     const wal_path_b = "transaction_wal_compare_b.bucket-wal";
     const shm_path_b = "transaction_wal_compare_b.bucket-wal-shm";
 
-    platform.deleteFile(db_path_a) catch {};
-    std.fs.cwd().deleteFile(wal_path_a) catch {};
-    std.fs.cwd().deleteFile(shm_path_a) catch {};
-    platform.deleteFile(db_path_b) catch {};
-    std.fs.cwd().deleteFile(wal_path_b) catch {};
-    std.fs.cwd().deleteFile(shm_path_b) catch {};
-    defer platform.deleteFile(db_path_a) catch {};
-    defer std.fs.cwd().deleteFile(wal_path_a) catch {};
-    defer std.fs.cwd().deleteFile(shm_path_a) catch {};
-    defer platform.deleteFile(db_path_b) catch {};
-    defer std.fs.cwd().deleteFile(wal_path_b) catch {};
-    defer std.fs.cwd().deleteFile(shm_path_b) catch {};
+    platform.testing_platform.deleteFile(db_path_a) catch {};
+    cwdDeleteFile(wal_path_a);
+    cwdDeleteFile(shm_path_a);
+    platform.testing_platform.deleteFile(db_path_b) catch {};
+    cwdDeleteFile(wal_path_b);
+    cwdDeleteFile(shm_path_b);
+    defer platform.testing_platform.deleteFile(db_path_a) catch {};
+    defer cwdDeleteFile(wal_path_a);
+    defer cwdDeleteFile(shm_path_a);
+    defer platform.testing_platform.deleteFile(db_path_b) catch {};
+    defer cwdDeleteFile(wal_path_b);
+    defer cwdDeleteFile(shm_path_b);
 
     var arena_a = std.heap.ArenaAllocator.init(allocator);
     defer arena_a.deinit();
     const a_ally = arena_a.allocator();
-    var bucket_a = try Bucket.openFileWithOptions(a_ally, db_path_a, .{ .wal = true });
+    var bucket_a = try Bucket.openFileWithOptions(a_ally, std.testing.io, db_path_a, .{ .wal = true });
     defer bucket_a.deinit();
 
     const doc_a1 = try bson.fmt.serialize(.{ .seq = @as(i32, 1) }, a_ally);
@@ -4654,7 +4706,7 @@ test "Bucket.Transaction reduces WAL frame count" {
     var arena_b = std.heap.ArenaAllocator.init(allocator);
     defer arena_b.deinit();
     const b_ally = arena_b.allocator();
-    var bucket_b = try Bucket.openFileWithOptions(b_ally, db_path_b, .{ .wal = true });
+    var bucket_b = try Bucket.openFileWithOptions(b_ally, std.testing.io, db_path_b, .{ .wal = true });
     defer bucket_b.deinit();
 
     var tx = try bucket_b.beginTransaction();
@@ -4675,17 +4727,17 @@ test "Bucket.Transaction guardrails" {
     const wal_path = "transaction_guardrails.bucket-wal";
     const shm_path = "transaction_guardrails.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const ally = arena.allocator();
-    var bucket = try Bucket.openFileWithOptions(ally, db_path, .{ .wal = true });
+    var bucket = try Bucket.openFileWithOptions(ally, std.testing.io, db_path, .{ .wal = true });
     defer bucket.deinit();
 
     const base = try bson.fmt.serialize(.{ .name = "guard" }, ally);
@@ -4716,9 +4768,9 @@ test "Bucket.insert" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var bucket = try Bucket.init(allocator, "test.bucket");
+    var bucket = try Bucket.init(allocator, std.testing.io, "test.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("test.bucket") catch |err| {
+    defer platform.testing_platform.deleteFile("test.bucket") catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -4732,7 +4784,7 @@ test "Bucket.insert" {
     const qDoc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
     const q1 = try query.Query.parse(allocator, qDoc);
 
-    var res1list = std.ArrayList(BSONDocument){};
+    var res1list: std.ArrayList(BSONDocument) = .empty;
     defer res1list.deinit(allocator);
     var res1iter = try bucket.listIterate(&arena, q1);
     while (try res1iter.next(res1iter)) |docItem| {
@@ -4747,7 +4799,7 @@ test "Bucket.insert" {
     defer q2Doc.deinit(allocator);
     const q2 = try query.Query.parse(allocator, q2Doc);
 
-    var res2list = std.ArrayList(BSONDocument){};
+    var res2list: std.ArrayList(BSONDocument) = .empty;
     defer res2list.deinit(allocator);
     var res2iter = try bucket.listIterate(&arena, q2);
     while (try res2iter.next(res2iter)) |docItem| {
@@ -4769,7 +4821,7 @@ test "Bucket.unique index rejects duplicate string values" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var bucket = try Bucket.init(allocator, ":memory:");
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
     defer bucket.deinit();
 
     try bucket.ensureIndex("email", .{ .unique = 1 });
@@ -4804,7 +4856,7 @@ test "Bucket._id unique index rejects duplicate ObjectId" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var bucket = try Bucket.init(allocator, ":memory:");
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
     defer bucket.deinit();
 
     const oid = try ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
@@ -4829,7 +4881,7 @@ test "Bucket.dump supports :memory: storage" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var in_mem_bucket = try Bucket.init(allocator, ":memory:");
+    var in_mem_bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
     defer in_mem_bucket.deinit();
 
     var doc = try bson.fmt.serialize(.{ .name = "InMemory" }, allocator);
@@ -4837,13 +4889,13 @@ test "Bucket.dump supports :memory: storage" {
     _ = try in_mem_bucket.insert(doc);
 
     const dump_path = "memory_dump.bucket";
-    defer platform.deleteFile(dump_path) catch |err| {
+    defer platform.testing_platform.deleteFile(dump_path) catch |err| {
         std.debug.print("Failed to delete dump file: {any}\n", .{err});
     };
 
     try in_mem_bucket.dump(dump_path);
 
-    var disk_bucket = try Bucket.init(allocator, dump_path);
+    var disk_bucket = try Bucket.init(allocator, std.testing.io, dump_path);
     defer disk_bucket.deinit();
 
     var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
@@ -4896,10 +4948,10 @@ test "Bucket.full scan cursor resumes after partial consumption" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-full-scan.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-full-scan.bucket");
+    platform.testing_platform.deleteFile("cursor-full-scan.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-full-scan.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-full-scan.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-full-scan.bucket") catch {};
 
     const docs = [_][]const u8{ "A", "B", "C" };
     for (docs) |name| {
@@ -4943,11 +4995,11 @@ test "Bucket.index range cursor resumes after partial consumption" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-index-range.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-index-range.bucket");
+    platform.testing_platform.deleteFile("cursor-index-range.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-index-range.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-index-range.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-index-range.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = .{ .@"$gte" = 35 } } }, allocator);
     defer qdoc.deinit(allocator);
@@ -4984,10 +5036,10 @@ test "Bucket.cursor exported before first read resumes from beginning" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-before-first-read.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-before-first-read.bucket");
+    platform.testing_platform.deleteFile("cursor-before-first-read.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-before-first-read.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-before-first-read.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-before-first-read.bucket") catch {};
 
     var doc = try bson.fmt.serialize(.{ .name = "Alpha" }, allocator);
     defer doc.deinit(allocator);
@@ -5021,10 +5073,10 @@ test "Bucket.cursor exported after eos resumes from end and sees later inserts" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-after-eos.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-after-eos.bucket");
+    platform.testing_platform.deleteFile("cursor-after-eos.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-after-eos.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-after-eos.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-after-eos.bucket") catch {};
 
     var doc1 = try bson.fmt.serialize(.{ .name = "A" }, allocator);
     defer doc1.deinit(allocator);
@@ -5068,10 +5120,10 @@ test "Bucket.cursor with deleted anchor returns invalid cursor" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-deleted-anchor.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-deleted-anchor.bucket");
+    platform.testing_platform.deleteFile("cursor-deleted-anchor.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-deleted-anchor.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-deleted-anchor.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-deleted-anchor.bucket") catch {};
 
     var doc1 = try bson.fmt.serialize(.{ .name = "A" }, allocator);
     defer doc1.deinit(allocator);
@@ -5111,10 +5163,10 @@ test "Bucket.cursor query rejects sort" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-sort-unsupported.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-sort-unsupported.bucket");
+    platform.testing_platform.deleteFile("cursor-sort-unsupported.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-sort-unsupported.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-sort-unsupported.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-sort-unsupported.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{
         .sort = .{ .asc = "name" },
@@ -5131,10 +5183,10 @@ test "Bucket.cursor query rejects sector" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-sector-unsupported.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-sector-unsupported.bucket");
+    platform.testing_platform.deleteFile("cursor-sector-unsupported.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-sector-unsupported.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-sector-unsupported.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-sector-unsupported.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{
         .sector = .{ .limit = 1 },
@@ -5151,11 +5203,11 @@ test "Bucket.cursor query rejects point strategy index scans" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("cursor-point-unsupported.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "cursor-point-unsupported.bucket");
+    platform.testing_platform.deleteFile("cursor-point-unsupported.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "cursor-point-unsupported.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("cursor-point-unsupported.bucket") catch {};
+    defer platform.testing_platform.deleteFile("cursor-point-unsupported.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{
         .query = .{ .age = .{ .@"$in" = [_]i32{ 30, 40 } } },
@@ -5172,11 +5224,11 @@ test "Bucket.indexed query equality uses range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("index-query-eq.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "index-query-eq.bucket");
+    platform.testing_platform.deleteFile("index-query-eq.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "index-query-eq.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("index-query-eq.bucket") catch {};
+    defer platform.testing_platform.deleteFile("index-query-eq.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = 30 } }, allocator);
     defer qdoc.deinit(allocator);
@@ -5204,11 +5256,11 @@ test "Bucket.indexed query startsWith uses range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("index-query-startswith.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "index-query-startswith.bucket");
+    platform.testing_platform.deleteFile("index-query-startswith.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "index-query-startswith.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("index-query-startswith.bucket") catch {};
+    defer platform.testing_platform.deleteFile("index-query-startswith.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{ .query = .{ .name = .{ .@"$startsWith" = "A" } } }, allocator);
     defer qdoc.deinit(allocator);
@@ -5238,11 +5290,11 @@ test "Bucket.indexed query range bounds combine" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("index-query-range.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "index-query-range.bucket");
+    platform.testing_platform.deleteFile("index-query-range.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "index-query-range.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("index-query-range.bucket") catch {};
+    defer platform.testing_platform.deleteFile("index-query-range.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(
         .{ .query = .{ .age = .{ .@"$gte" = 35, .@"$lte" = 40 } } },
@@ -5297,11 +5349,11 @@ test "Bucket.indexed query in uses points" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("index-query-in.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "index-query-in.bucket");
+    platform.testing_platform.deleteFile("index-query-in.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "index-query-in.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("index-query-in.bucket") catch {};
+    defer platform.testing_platform.deleteFile("index-query-in.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = .{ .@"$in" = [_]i32{ 30, 40 } } } }, allocator);
     defer qdoc.deinit(allocator);
@@ -5340,11 +5392,11 @@ test "Bucket.indexed query between uses range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("index-query-between.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "index-query-between.bucket");
+    platform.testing_platform.deleteFile("index-query-between.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "index-query-between.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("index-query-between.bucket") catch {};
+    defer platform.testing_platform.deleteFile("index-query-between.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{ .query = .{ .age = .{ .@"$between" = [_]i32{ 29, 38 } } } }, allocator);
     defer qdoc.deinit(allocator);
@@ -5380,11 +5432,11 @@ test "Bucket.indexed query in scores avoids duplicates" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = std.testing.allocator;
-    platform.deleteFile("index-query-scores.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "index-query-scores.bucket");
+    platform.testing_platform.deleteFile("index-query-scores.bucket") catch {};
+    var bucket = try Bucket.init(allocator, std.testing.io, "index-query-scores.bucket");
     try setupIndexQueryBucket(&bucket, allocator);
     defer bucket.deinit();
-    defer platform.deleteFile("index-query-scores.bucket") catch {};
+    defer platform.testing_platform.deleteFile("index-query-scores.bucket") catch {};
 
     var qdoc = try bson.fmt.serialize(.{ .query = .{ .scores = .{ .@"$in" = [_]i32{7} } } }, allocator);
     defer qdoc.deinit(allocator);
@@ -5397,7 +5449,7 @@ test "Bucket.indexed query in scores avoids duplicates" {
     try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
     try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "scores"));
 
-    var doc_list: std.ArrayList(BSONDocument) = .{};
+    var doc_list: std.ArrayList(BSONDocument) = .empty;
     defer doc_list.deinit(allocator);
     try bucket.collectDocs(&doc_list, allocator, &q, &plan);
 
@@ -5425,11 +5477,11 @@ test "Page cache enforces capacity with LRU eviction" {
     const allocator = arena.allocator();
     const bucket_path = "cache-capacity.bucket";
 
-    var bucket = try Bucket.openFileWithOptions(allocator, bucket_path, .{
+    var bucket = try Bucket.openFileWithOptions(allocator, std.testing.io, bucket_path, .{
         .page_cache_capacity = 2,
     });
     defer bucket.deinit();
-    defer platform.deleteFile(bucket_path) catch {
+    defer platform.testing_platform.deleteFile(bucket_path) catch {
         // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -5458,9 +5510,9 @@ test "Page overflow" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     const allocator = arena.allocator();
     defer arena.deinit();
-    var bucket = try Bucket.openFile(allocator, "overflow.bucket");
+    var bucket = try Bucket.openFile(allocator, std.testing.io, "overflow.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("overflow.bucket") catch {
+    defer platform.testing_platform.deleteFile("overflow.bucket") catch {
         // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
     for (0..900) |i| {
@@ -5476,7 +5528,7 @@ test "Page overflow" {
     defer q1Doc.deinit(allocator);
     const q1 = try query.Query.parse(allocator, q1Doc);
 
-    var res3list = std.ArrayList(BSONDocument){};
+    var res3list: std.ArrayList(BSONDocument) = .empty;
     defer res3list.deinit(allocator);
     var res3iter = try bucket.listIterate(&arena, q1);
     while (try res3iter.next(res3iter)) |doc| {
@@ -5492,9 +5544,9 @@ test "Bucket.delete" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var bucket = try Bucket.init(allocator, "DELETE.bucket");
+    var bucket = try Bucket.init(allocator, std.testing.io, "DELETE.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("DELETE.bucket") catch {
+    defer platform.testing_platform.deleteFile("DELETE.bucket") catch {
         // std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -5509,7 +5561,7 @@ test "Bucket.delete" {
     defer listQDoc.deinit(allocator);
     const listQ = try query.Query.parse(allocator, listQDoc);
 
-    var docsList = std.ArrayList(BSONDocument){};
+    var docsList: std.ArrayList(BSONDocument) = .empty;
     defer docsList.deinit(allocator);
     var docsIter = try bucket.listIterate(&arena, listQ);
     while (try docsIter.next(docsIter)) |docItem| {
@@ -5527,7 +5579,7 @@ test "Bucket.delete" {
     // Delete the document from the bucket
     _ = try bucket.delete(deleteQ);
 
-    var newDocsList = std.ArrayList(BSONDocument){};
+    var newDocsList = std.ArrayList(BSONDocument).empty;
     defer newDocsList.deinit(allocator);
     var newDocsIter = try bucket.listIterate(&arena, listQ);
     while (try newDocsIter.next(newDocsIter)) |docItem| {
@@ -5541,7 +5593,7 @@ test "Bucket.delete" {
 
     _ = try bucket.insert(doc);
 
-    var afterInsertList = std.ArrayList(BSONDocument){};
+    var afterInsertList = std.ArrayList(BSONDocument).empty;
     defer afterInsertList.deinit(allocator);
     var afterInsertIter = try bucket.listIterate(&arena, listQ);
     while (try afterInsertIter.next(afterInsertIter)) |docItem| {
@@ -5558,9 +5610,9 @@ test "Deleted docs disappear after vacuum" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var bucket = try Bucket.init(allocator, "VACUUM.bucket");
+    var bucket = try Bucket.init(allocator, std.testing.io, "VACUUM.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("VACUUM.bucket") catch |err| {
+    defer platform.testing_platform.deleteFile("VACUUM.bucket") catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
@@ -5579,7 +5631,7 @@ test "Deleted docs disappear after vacuum" {
     defer listQDoc.deinit(allocator);
     const listQ = try query.Query.parse(allocator, listQDoc);
 
-    var docsList = std.ArrayList(BSONDocument){};
+    var docsList = std.ArrayList(BSONDocument).empty;
     defer docsList.deinit(allocator);
     var docsIter = try bucket.listIterate(&arena, listQ);
     while (try docsIter.next(docsIter)) |docItem| {
@@ -5599,7 +5651,7 @@ test "Deleted docs disappear after vacuum" {
         return err;
     };
 
-    var afterVacuumList = std.ArrayList(BSONDocument){};
+    var afterVacuumList = std.ArrayList(BSONDocument).empty;
     defer afterVacuumList.deinit(allocator);
     var afterVacuumIter = try bucket.listIterate(&arena, listQ);
     while (try afterVacuumIter.next(afterVacuumIter)) |docItem| {
@@ -5616,12 +5668,12 @@ test "Bucket.dropIndex removes metadata entry" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const file_name = "drop-index.bucket";
-    defer platform.deleteFile(file_name) catch |err| {
+    defer platform.testing_platform.deleteFile(file_name) catch |err| {
         std.debug.print("Failed to delete test file: {any}\n", .{err});
     };
 
     {
-        var bucket = try Bucket.init(allocator, file_name);
+        var bucket = try Bucket.init(allocator, std.testing.io, file_name);
         defer bucket.deinit();
 
         try bucket.ensureIndex("age", .{});
@@ -5636,7 +5688,7 @@ test "Bucket.dropIndex removes metadata entry" {
     }
 
     {
-        var reopened = try Bucket.init(allocator, file_name);
+        var reopened = try Bucket.init(allocator, std.testing.io, file_name);
         defer reopened.deinit();
 
         try testing.expect(!reopened.indexes.contains("age"));
@@ -5648,9 +5700,9 @@ test "Bucket.reverse index with sort queries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var bucket = try Bucket.init(allocator, "reverse-index-sort.bucket");
+    var bucket = try Bucket.init(allocator, std.testing.io, "reverse-index-sort.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("reverse-index-sort.bucket") catch {};
+    defer platform.testing_platform.deleteFile("reverse-index-sort.bucket") catch {};
 
     // Create a reverse index on the "score" field
     try bucket.ensureIndex("score", .{ .reverse = 1 });
@@ -5772,22 +5824,22 @@ test "Bucket.replication with WAL batches" {
     const replica_wal_path = std.fmt.comptimePrint("{s}-wal", .{replica_path});
     const replica_shm_path = std.fmt.comptimePrint("{s}-wal-shm", .{replica_path});
 
-    platform.deleteFile(primary_path) catch {};
-    std.fs.cwd().deleteFile(primary_wal_path) catch {};
-    std.fs.cwd().deleteFile(primary_shm_path) catch {};
-    platform.deleteFile(replica_path) catch {};
-    std.fs.cwd().deleteFile(replica_wal_path) catch {};
-    std.fs.cwd().deleteFile(replica_shm_path) catch {};
-    defer platform.deleteFile(primary_path) catch {};
-    defer std.fs.cwd().deleteFile(primary_wal_path) catch {};
-    defer std.fs.cwd().deleteFile(primary_shm_path) catch {};
-    defer platform.deleteFile(replica_path) catch {};
-    defer std.fs.cwd().deleteFile(replica_wal_path) catch {};
-    defer std.fs.cwd().deleteFile(replica_shm_path) catch {};
+    platform.testing_platform.deleteFile(primary_path) catch {};
+    cwdDeleteFile(primary_wal_path);
+    cwdDeleteFile(primary_shm_path);
+    platform.testing_platform.deleteFile(replica_path) catch {};
+    cwdDeleteFile(replica_wal_path);
+    cwdDeleteFile(replica_shm_path);
+    defer platform.testing_platform.deleteFile(primary_path) catch {};
+    defer cwdDeleteFile(primary_wal_path);
+    defer cwdDeleteFile(primary_shm_path);
+    defer platform.testing_platform.deleteFile(replica_path) catch {};
+    defer cwdDeleteFile(replica_wal_path);
+    defer cwdDeleteFile(replica_shm_path);
 
-    var primary = try Bucket.openFileWithOptions(allocator, primary_path, .{ .wal = true });
+    var primary = try Bucket.openFileWithOptions(allocator, std.testing.io, primary_path, .{ .wal = true });
     defer primary.deinit();
-    var replica = try Bucket.openFileWithOptions(allocator, replica_path, .{ .wal = true });
+    var replica = try Bucket.openFileWithOptions(allocator, std.testing.io, replica_path, .{ .wal = true });
     defer replica.deinit();
 
     const Person = struct { name: []const u8, age: i32 };
@@ -5903,9 +5955,9 @@ test "Deleting removes index entries for scalar field" {
     const allocator = arena.allocator();
 
     const file_name = "index-delete.bucket";
-    var bucket = try Bucket.init(allocator, file_name);
+    var bucket = try Bucket.init(allocator, std.testing.io, file_name);
     defer bucket.deinit();
-    defer platform.deleteFile(file_name) catch {};
+    defer platform.testing_platform.deleteFile(file_name) catch {};
 
     try bucket.ensureIndex("age", .{});
 
@@ -5961,12 +6013,12 @@ test "Bucket clean close invalidates saved WAL generation" {
     const shm_path = "albedo_test_wal_restore.bucket-wal-shm";
 
     // Clean up any leftovers from previous runs.
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     // ── Phase 1: create bucket, insert documents, and save the WAL ──
 
@@ -5979,11 +6031,11 @@ test "Bucket clean close invalidates saved WAL generation" {
         defer arena.deinit();
         const ally = arena.allocator();
 
-        var bucket = try Bucket.init(ally, db_path);
+        var bucket = try Bucket.init(ally, std.testing.io, db_path);
 
         // After init + meta page write, grab pre-insert file size.
         try bucket.flush();
-        const db_stat = try std.fs.cwd().statFile(db_path);
+        const db_stat = try cwdStatFile(db_path);
         pre_insert_db_size = db_stat.size;
 
         // Insert three documents.
@@ -6004,12 +6056,14 @@ test "Bucket clean close invalidates saved WAL generation" {
         try testing.expectEqual(@as(u64, 3), bucket.header.doc_count);
 
         // Save WAL bytes to a heap buffer before deinit consumes it.
-        const wal_file = try std.fs.cwd().openFile(wal_path, .{});
-        defer wal_file.close();
-        const wal_stat = try wal_file.stat();
+        const wal_file = try cwdOpenFile(wal_path, .{});
+        defer wal_file.close(std.testing.io);
+        const wal_stat = try wal_file.stat(std.testing.io);
         saved_wal_bytes = try allocator.alloc(u8, wal_stat.size);
-        const n = try wal_file.readAll(saved_wal_bytes);
-        try testing.expect(n == saved_wal_bytes.len);
+        var wal_reader = std.Io.File.Reader.init(wal_file, std.testing.io, &.{});
+        wal_reader.interface.readSliceAll(saved_wal_bytes) catch {
+            return error.TestUnexpectedResult;
+        };
 
         // Normal close — this consumes the WAL.
         bucket.deinit();
@@ -6020,18 +6074,18 @@ test "Bucket clean close invalidates saved WAL generation" {
 
     // Truncate the main DB file back to its pre-insert size (lose data pages).
     {
-        const db_file = try std.fs.cwd().openFile(db_path, .{ .mode = .read_write });
-        defer db_file.close();
-        try db_file.setEndPos(pre_insert_db_size);
-        try db_file.sync();
+        const db_file = try cwdOpenFile(db_path, .{ .mode = .read_write });
+        defer db_file.close(std.testing.io);
+        try db_file.setLength(std.testing.io, pre_insert_db_size);
+        try db_file.sync(std.testing.io);
     }
 
     // Restore the saved WAL (as if the WAL survived the crash).
     {
-        const wal_file = try std.fs.cwd().createFile(wal_path, .{});
-        defer wal_file.close();
-        try wal_file.writeAll(saved_wal_bytes);
-        try wal_file.sync();
+        const wal_file = try cwdCreateFile(wal_path, .{});
+        defer wal_file.close(std.testing.io);
+        try wal_file.writeStreamingAll(std.testing.io, saved_wal_bytes);
+        try wal_file.sync(std.testing.io);
     }
 
     // ── Phase 3: reopen — stale WAL generation should be rejected ─
@@ -6041,7 +6095,7 @@ test "Bucket clean close invalidates saved WAL generation" {
         defer arena.deinit();
         const ally = arena.allocator();
 
-        try testing.expectError(BucketInitErrors.InitializationError, Bucket.openFile(ally, db_path));
+        try testing.expectError(BucketInitErrors.InitializationError, Bucket.openFile(ally, std.testing.io, db_path));
     }
 }
 
@@ -6051,15 +6105,15 @@ test "Bucket preserves WAL history when replication generation is exhausted" {
     const wal_path = "albedo_test_replication_generation_exhausted.bucket-wal";
     const shm_path = "albedo_test_replication_generation_exhausted.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     {
-        var bucket = try Bucket.openFileWithOptions(allocator, db_path, .{ .wal = true });
+        var bucket = try Bucket.openFileWithOptions(allocator, std.testing.io, db_path, .{ .wal = true });
         bucket.header.replication_generation = std.math.maxInt(u64);
         bucket.persistHeaderToMainFile();
         if (bucket.wal) |*w| {
@@ -6073,11 +6127,11 @@ test "Bucket preserves WAL history when replication generation is exhausted" {
         bucket.deinit();
     }
 
-    try std.fs.cwd().access(wal_path, .{});
-    try std.fs.cwd().access(shm_path, .{});
+    try cwdAccess(wal_path);
+    try cwdAccess(shm_path);
 
     {
-        var reopened = try Bucket.openFileWithOptions(allocator, db_path, .{ .wal = true });
+        var reopened = try Bucket.openFileWithOptions(allocator, std.testing.io, db_path, .{ .wal = true });
         defer reopened.deinit();
 
         try testing.expectEqual(std.math.maxInt(u64), reopened.header.replication_generation);
@@ -6091,14 +6145,14 @@ test "Bucket.vacuum fails when replication generation is exhausted" {
     const wal_path = "albedo_test_vacuum_generation_exhausted.bucket-wal";
     const shm_path = "albedo_test_vacuum_generation_exhausted.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
-    var bucket = try Bucket.openFileWithOptions(allocator, db_path, .{ .wal = true });
+    var bucket = try Bucket.openFileWithOptions(allocator, std.testing.io, db_path, .{ .wal = true });
     defer bucket.deinit();
 
     bucket.header.replication_generation = std.math.maxInt(u64);
@@ -6117,12 +6171,12 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
     const shm_path = "albedo_test_wal_crash.bucket-wal-shm";
 
     // Clean up any leftovers from previous runs.
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     // ── Phase 1: create bucket, insert documents, then crash ──────
 
@@ -6133,11 +6187,11 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
         defer arena.deinit();
         const ally = arena.allocator();
 
-        var bucket = try Bucket.init(ally, db_path);
+        var bucket = try Bucket.init(ally, std.testing.io, db_path);
 
         // Grab the file size before any inserts.
         try bucket.flush();
-        const db_stat = try std.fs.cwd().statFile(db_path);
+        const db_stat = try cwdStatFile(db_path);
         pre_insert_db_size = db_stat.size;
 
         // Insert documents.
@@ -6165,14 +6219,14 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
     }
 
     // The WAL file should still exist on disk after the "crash".
-    _ = try std.fs.cwd().statFile(wal_path);
+    _ = try cwdStatFile(wal_path);
 
     // Truncate the main DB file to lose the data pages written after init.
     {
-        const db_file = try std.fs.cwd().openFile(db_path, .{ .mode = .read_write });
-        defer db_file.close();
-        try db_file.setEndPos(pre_insert_db_size);
-        try db_file.sync();
+        const db_file = try cwdOpenFile(db_path, .{ .mode = .read_write });
+        defer db_file.close(std.testing.io);
+        try db_file.setLength(std.testing.io, pre_insert_db_size);
+        try db_file.sync(std.testing.io);
     }
 
     // ── Phase 2: reopen — WAL replay should restore everything ────
@@ -6182,7 +6236,7 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
         defer arena.deinit();
         const ally = arena.allocator();
 
-        var bucket = try Bucket.openFile(ally, db_path);
+        var bucket = try Bucket.openFile(ally, std.testing.io, db_path);
         defer bucket.deinit();
 
         // After replay the header should reflect both documents.
@@ -6210,7 +6264,7 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
     }
 
     // After the clean reopen + deinit the WAL should have been consumed.
-    if (std.fs.cwd().statFile(wal_path)) |_| {
+    if (cwdStatFile(wal_path)) |_| {
         return error.TestUnexpectedResult; // WAL should be gone after clean close
     } else |_| {}
 }
@@ -6222,19 +6276,19 @@ test "WAL live-tail: reader polls for docs written by another connection" {
     const shm_path = "albedo_test_wal_live_tail.bucket-wal-shm";
 
     // Clean up leftovers.
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     // ── Writer: create the database and insert the first batch ──────
     var writer_arena = std.heap.ArenaAllocator.init(allocator);
     defer writer_arena.deinit();
     const w_ally = writer_arena.allocator();
 
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{
         .wal = true,
     });
     defer writer.deinit();
@@ -6251,7 +6305,7 @@ test "WAL live-tail: reader polls for docs written by another connection" {
     defer reader_arena.deinit();
     const r_ally = reader_arena.allocator();
 
-    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{
+    var reader = try Bucket.openFileWithOptions(r_ally, std.testing.io, db_path, .{
         .wal = true,
     });
     defer reader.deinit();
@@ -6315,19 +6369,19 @@ test "WAL live-tail: reader polls empty DB then sees docs after writer inserts" 
     const wal_path = "albedo_test_wal_empty_poll.bucket-wal";
     const shm_path = "albedo_test_wal_empty_poll.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     // ── Reader: open an empty DB and create an iterator ─────────────
     var reader_arena = std.heap.ArenaAllocator.init(allocator);
     defer reader_arena.deinit();
     const r_ally = reader_arena.allocator();
 
-    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    var reader = try Bucket.openFileWithOptions(r_ally, std.testing.io, db_path, .{ .wal = true });
     defer reader.deinit();
 
     var iter_arena = std.heap.ArenaAllocator.init(allocator);
@@ -6348,7 +6402,7 @@ test "WAL live-tail: reader polls empty DB then sees docs after writer inserts" 
     defer writer_arena.deinit();
     const w_ally = writer_arena.allocator();
 
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{ .wal = true });
     defer writer.deinit();
 
     const doc1 = try bson.fmt.serialize(.{ .name = "A" }, w_ally);
@@ -6375,25 +6429,25 @@ test "subscription: reader sees inserts via oplog poll" {
     const wal_path = "albedo_test_sub_insert.bucket-wal";
     const shm_path = "albedo_test_sub_insert.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     // Writer
     var w_arena = std.heap.ArenaAllocator.init(allocator);
     defer w_arena.deinit();
     const w_ally = w_arena.allocator();
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{ .wal = true });
     defer writer.deinit();
 
     // Reader
     var r_arena = std.heap.ArenaAllocator.init(allocator);
     defer r_arena.deinit();
     const r_ally = r_arena.allocator();
-    var reader = try Bucket.openFileWithOptions(r_ally, db_path, .{ .wal = true });
+    var reader = try Bucket.openFileWithOptions(r_ally, std.testing.io, db_path, .{ .wal = true });
     defer reader.deinit();
 
     // Subscribe with an empty query (match all).
@@ -6433,17 +6487,17 @@ test "subscription: delete events appear in oplog" {
     const wal_path = "albedo_test_sub_delete.bucket-wal";
     const shm_path = "albedo_test_sub_delete.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     var w_arena = std.heap.ArenaAllocator.init(allocator);
     defer w_arena.deinit();
     const w_ally = w_arena.allocator();
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true, .auto_vaccuum = false });
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{ .wal = true, .auto_vaccuum = false });
     defer writer.deinit();
 
     // Insert a document before subscribing.
@@ -6479,17 +6533,17 @@ test "subscription: query-filtered subscription skips non-matching inserts" {
     const wal_path = "albedo_test_sub_filter.bucket-wal";
     const shm_path = "albedo_test_sub_filter.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     var w_arena = std.heap.ArenaAllocator.init(allocator);
     defer w_arena.deinit();
     const w_ally = w_arena.allocator();
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{ .wal = true });
     defer writer.deinit();
 
     // Subscribe with filter: only status == "active"
@@ -6523,17 +6577,17 @@ test "subscription: seqno is monotonically increasing" {
     const wal_path = "albedo_test_sub_seqno.bucket-wal";
     const shm_path = "albedo_test_sub_seqno.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    platform.testing_platform.deleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer platform.testing_platform.deleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
 
     var w_arena = std.heap.ArenaAllocator.init(allocator);
     defer w_arena.deinit();
     const w_ally = w_arena.allocator();
-    var writer = try Bucket.openFileWithOptions(w_ally, db_path, .{ .wal = true });
+    var writer = try Bucket.openFileWithOptions(w_ally, std.testing.io, db_path, .{ .wal = true });
     defer writer.deinit();
 
     var qDoc = try bson.fmt.serialize(.{ .sector = .{} }, w_ally);

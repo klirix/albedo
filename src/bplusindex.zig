@@ -399,8 +399,9 @@ pub const Index = struct {
             }
 
             self.page.data[insert_offset_u] = @intFromEnum(value.valueType());
-            var stream = std.io.fixedBufferStream(self.page.data[insert_offset_u + 1 .. insert_offset_u + 1 + value_size]);
-            try value.write(stream.writer());
+            var stream = std.Io.Writer.fixed(self.page.data[insert_offset_u + 1 .. insert_offset_u + 1 + value_size]);
+
+            try value.write(&stream);
 
             const loc_pos = insert_offset_u + 1 + value_size;
             const page_bytes_ptr = @as(*[8]u8, @ptrCast(self.page.data[loc_pos .. loc_pos + 8].ptr));
@@ -506,19 +507,19 @@ pub const Index = struct {
 
             const total = self.leafEntryCount();
             if (total == 0) return error.CorruptedNode;
-            
+
             var mid = @divFloor(total, 2);
             if (insert_value) |iv| {
                 const rightmost_entry = self.leafEntryAt(total - 1).?;
                 const leftmost_entry = self.leafEntryAt(0).?;
-                
+
                 if (self.index.compare(iv, rightmost_entry.value()) == .gt) {
                     mid = total - 1;
                 } else if (self.index.compare(iv, leftmost_entry.value()) == .lt) {
                     mid = 1;
                 }
             }
-            
+
             const first_right = self.leafEntryAt(mid) orelse return error.CorruptedNode;
 
             const move_start = first_right.offset;
@@ -1031,7 +1032,7 @@ test "range handles duplicates" {
     try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 111, .offset = 1110 });
 
     var iter = try index.point(key);
-    var results = std.ArrayList(u16){};
+    var results = std.ArrayList(u16).empty;
     defer results.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1085,7 +1086,7 @@ test "range respects bounds" {
     const lower = BSONValue{ .int32 = .{ .value = 10 } };
     const upper = BSONValue{ .int32 = .{ .value = 20 } };
     var iter = try index.range(Index.RangeBound.gte(lower), Index.RangeBound.lte(upper));
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1124,7 +1125,7 @@ test "range supports exclusive bounds" {
     const lower = BSONValue{ .int32 = .{ .value = 10 } };
     const upper = BSONValue{ .int32 = .{ .value = 20 } };
     var iter = try index.range(.gt(lower), .lt(upper));
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1162,7 +1163,7 @@ test "Index orders strings lexicographically" {
     }
 
     var iter = try index.range(null, null);
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1202,7 +1203,7 @@ test "Index orders ObjectIds lexicographically" {
     }
 
     var iter = try index.range(null, null);
-    var offsets = std.ArrayList(u16){};
+    var offsets: std.ArrayList(u16) = .empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1312,7 +1313,7 @@ test "reverse index orders descending" {
 
     // Range scan should return entries in descending order (25, 20, 15, 10, 5)
     var iter = try index.range(null, null);
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1349,7 +1350,7 @@ test "reverse index with range bounds" {
 
     // First verify full scan works
     var full_iter = try index.range(null, null);
-    var full_offsets = std.ArrayList(u16){};
+    var full_offsets = std.ArrayList(u16).empty;
     defer full_offsets.deinit(testing.allocator);
     while (try full_iter.next()) |loc| {
         try full_offsets.append(testing.allocator, loc.offset);
@@ -1361,7 +1362,7 @@ test "reverse index with range bounds" {
     const upper = BSONValue{ .int32 = .{ .value = 20 } };
 
     var iter = try index.range(Index.RangeBound.gte(lower), Index.RangeBound.lte(upper));
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {

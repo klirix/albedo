@@ -118,17 +118,15 @@ pub const Platform = struct {
         (if (old_abs)
             std.Io.Dir.renameAbsolute(old_path, new_path, self.io)
         else
-            cwd.rename(old_path, new_path, cwd, new_path, self.io)) catch |err| return mapFsError(err);
+            std.Io.Dir.rename(cwd, old_path, cwd, new_path, self.io)) catch |err| return mapFsError(err);
     }
 
     pub fn randomBytes(self: Platform, dest: []u8) PlatformError!void {
-        _ = self;
-        std.Random.DefaultCsprng.random(std.crypto.random).bytes(dest);
+        self.io.random(dest);
     }
 
     pub fn nowSeconds(self: Platform) i64 {
-        _ = self;
-        return @divFloor(std.time.nanoTimestamp(), std.time.ns_per_s);
+        return std.Io.Timestamp.now(self.io, .real).toSeconds();
     }
 
     pub fn log(self: Platform, msg: []const u8) void {

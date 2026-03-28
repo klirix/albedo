@@ -673,7 +673,7 @@ pub const BSONValue = union(BSONValueType) {
         };
     }
 
-    pub fn write(self: *const BSONValue, writer: anytype) !void {
+    pub fn write(self: *const BSONValue, writer: *std.Io.Writer) !void {
         switch (self.*) {
             .string => {
                 try writer.writeInt(u32, @as(u32, @truncate(self.string.value.len)) + 1, .little);
@@ -892,8 +892,9 @@ pub const BSONDocument = struct {
     }
 
     fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
-        var pairs: std.ArrayList(u8) = .empty;
-        var writer = pairs.writer(allocator);
+        var pairs = std.Io.Writer.Allocating.init(allocator);
+        errdefer pairs.deinit();
+        var writer = pairs.writer;
         try writer.writeInt(u32, 0, .little); // Placeholder for length
         if (try json.next() != .object_begin) {
             return error.InvalidJSON;
@@ -968,9 +969,9 @@ pub const BSONDocument = struct {
             allocator.free(key);
             token = try json.nextAlloc(allocator, .alloc_always);
         }
-        std.mem.writeInt(u32, pairs.items[0..4], @truncate(pairs.items.len + 1), .little);
+        std.mem.writeInt(u32, pairs.written()[0..4], @truncate(pairs.written().len + 1), .little);
         try writer.writeByte(0); // Null terminator for the document
-        return pairs.toOwnedSlice(allocator);
+        return pairs.toOwnedSlice();
     }
 
     const PairIterator = struct {
@@ -999,24 +1000,25 @@ pub const BSONDocument = struct {
     }
 
     pub fn fromPairs(allocator: mem.Allocator, pairs: []BSONKeyValuePair) !BSONDocument {
-        var list: std.ArrayList(u8) = .empty;
-        const writer = list.writer(allocator);
+        var list = std.Io.Writer.Allocating.init(allocator);
+        errdefer list.deinit();
+        var writer = list.writer;
         try writer.writeInt(u32, 0, .little);
 
         for (pairs) |pair| {
             try writer.writeByte(@intFromEnum(pair.value.valueType()));
             try writer.writeAll(pair.key);
             try writer.writeByte(0);
-            try pair.value.write(writer);
+            try pair.value.write(&writer);
         }
         try writer.writeByte(0); // Null terminator for the document
 
-        std.mem.writeInt(u32, list.items[0..4], @as(u32, @truncate(list.items.len)), .little);
+        std.mem.writeInt(u32, list.written()[0..4], @as(u32, @truncate(list.written().len)), .little);
 
-        return BSONDocument{ .buffer = try list.toOwnedSlice(allocator) };
+        return BSONDocument{ .buffer = try list.toOwnedSlice() };
     }
 
-    pub fn write(self: *const BSONDocument, writer: anytype) !void {
+    pub fn write(self: *const BSONDocument, writer: *std.Io.Writer) !void {
         try writer.writeAll(self.buffer);
     }
 
@@ -1145,14 +1147,17 @@ const ContainerFrame = struct {
 
 pub const Builder = struct {
     allocator: mem.Allocator,
-    buffer: std.ArrayList(u8) = .empty,
+    buffer: std.Io.Writer.Allocating,
     frames: std.ArrayList(ContainerFrame) = .empty,
     finished: bool = false,
 
     pub fn init(allocator: mem.Allocator) !Builder {
-        var builder = Builder{ .allocator = allocator };
-        try builder.buffer.resize(allocator, 4);
-        @memset(builder.buffer.items[0..4], 0);
+        var builder = Builder{
+            .allocator = allocator,
+            .buffer = std.Io.Writer.Allocating.init(allocator),
+        };
+        errdefer builder.buffer.deinit();
+        try builder.buffer.writer.writeInt(u32, 0, .little);
         try builder.frames.append(allocator, .{
             .kind = .document,
             .len_pos = 0,
@@ -1191,12 +1196,12 @@ pub const Builder = struct {
 
         try self.closeContainer(0, true);
         self.finished = true;
-        const buffer = try self.buffer.toOwnedSlice(self.allocator);
+        const buffer = try self.buffer.toOwnedSlice();
         return BSONDocument.init(buffer);
     }
 
     pub fn deinit(self: *Builder) void {
-        self.buffer.deinit(self.allocator);
+        self.buffer.deinit();
         self.frames.deinit(self.allocator);
     }
 
@@ -1225,9 +1230,8 @@ pub const Builder = struct {
             .array => try self.appendArrayElementHeader(kindValueType(kind), parent_index),
         }
 
-        const len_pos = self.buffer.items.len;
-        try self.buffer.resize(self.allocator, len_pos + 4);
-        @memset(self.buffer.items[len_pos .. len_pos + 4], 0);
+        const len_pos = self.buffer.written().len;
+        try self.buffer.writer.writeInt(u32, 0, .little);
 
         try self.frames.append(self.allocator, .{
             .kind = kind,
@@ -1239,9 +1243,8 @@ pub const Builder = struct {
     fn openArrayChild(self: *Builder, kind: ContainerKind, frame_index: usize) !usize {
         try self.ensureFrame(frame_index, .array);
         try self.appendArrayElementHeader(kindValueType(kind), frame_index);
-        const len_pos = self.buffer.items.len;
-        try self.buffer.resize(self.allocator, len_pos + 4);
-        @memset(self.buffer.items[len_pos .. len_pos + 4], 0);
+        const len_pos = self.buffer.written().len;
+        try self.buffer.writer.writeInt(u32, 0, .little);
 
         try self.frames.append(self.allocator, .{
             .kind = kind,
@@ -1256,16 +1259,16 @@ pub const Builder = struct {
         if (frame_index != self.frames.items.len - 1) return error.UnclosedContainer;
 
         const frame = self.frames.items[frame_index];
-        try self.buffer.append(self.allocator, 0);
-        const len: u32 = @intCast(self.buffer.items.len - frame.len_pos);
-        std.mem.writeInt(u32, self.buffer.items[frame.len_pos..][0..4], len, .little);
+        try self.buffer.writer.writeByte(0);
+        const len: u32 = @intCast(self.buffer.written().len - frame.len_pos);
+        std.mem.writeInt(u32, self.buffer.written()[frame.len_pos..][0..4], len, .little);
         _ = self.frames.pop();
     }
 
     fn appendElementHeader(self: *Builder, value_type: BSONValueType, key: []const u8) !void {
-        try self.buffer.append(self.allocator, @intFromEnum(value_type));
-        try self.buffer.appendSlice(self.allocator, key);
-        try self.buffer.append(self.allocator, 0);
+        try self.buffer.writer.writeByte(@intFromEnum(value_type));
+        try self.buffer.writer.writeAll(key);
+        try self.buffer.writer.writeByte(0);
     }
 
     fn appendArrayElementHeader(self: *Builder, value_type: BSONValueType, frame_index: usize) !void {
@@ -1277,8 +1280,7 @@ pub const Builder = struct {
     }
 
     fn appendValuePayload(self: *Builder, value: BSONValue) !void {
-        const writer = self.buffer.writer(self.allocator);
-        try value.write(writer);
+        try value.write(&self.buffer.writer);
     }
 };
 
@@ -1448,27 +1450,25 @@ fn cloneDocument(allocator: mem.Allocator, doc: BSONDocument) !BSONDocument {
 }
 
 fn appendExistingElement(
-    list: *std.ArrayList(u8),
-    allocator: mem.Allocator,
+    writer: *std.Io.Writer,
     doc: BSONDocument,
     idx: usize,
     pair: TypeNamePair,
     value_size: u32,
 ) !void {
-    try list.append(allocator, @intFromEnum(pair.type));
-    try list.appendSlice(allocator, pair.name);
-    try list.append(allocator, 0);
-    try list.appendSlice(allocator, doc.buffer[idx + pair.len .. idx + pair.len + value_size]);
+    try writer.writeByte(@intFromEnum(pair.type));
+    try writer.writeAll(pair.name);
+    try writer.writeByte(0);
+    try writer.writeAll(doc.buffer[idx + pair.len .. idx + pair.len + value_size]);
 }
 
 fn appendSingleFieldElement(
-    list: *std.ArrayList(u8),
-    allocator: mem.Allocator,
+    writer: *std.Io.Writer,
     single_field_doc: BSONDocument,
 ) !void {
     const pair = TypeNamePair.read(single_field_doc.buffer[4..]) orelse unreachable;
     const value_size = BSONValue.asessSize(single_field_doc.buffer[4 + pair.len ..], pair.type);
-    try list.appendSlice(allocator, single_field_doc.buffer[4 .. 4 + pair.len + value_size]);
+    try writer.writeAll(single_field_doc.buffer[4 .. 4 + pair.len + value_size]);
 }
 
 fn rewriteDocumentSet(
@@ -1477,23 +1477,22 @@ fn rewriteDocumentSet(
     key: []const u8,
     encoded_field: BSONDocument,
 ) !BSONDocument {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(allocator);
-
-    try list.resize(allocator, 4);
+    var list = std.Io.Writer.Allocating.init(allocator);
+    errdefer list.deinit();
+    try list.writer.writeInt(u32, 0, .little);
     var idx: usize = 4;
     while (TypeNamePair.read(doc.buffer[idx..])) |pair| {
         const value_size = BSONValue.asessSize(doc.buffer[idx + pair.len ..], pair.type);
         if (!mem.eql(u8, pair.name, key)) {
-            try appendExistingElement(&list, allocator, doc, idx, pair, value_size);
+            try appendExistingElement(&list.writer, doc, idx, pair, value_size);
         }
         idx += pair.len + value_size;
     }
 
-    try appendSingleFieldElement(&list, allocator, encoded_field);
-    try list.append(allocator, 0);
+    try appendSingleFieldElement(&list.writer, encoded_field);
+    try list.writer.writeByte(0);
 
-    const final_buffer = try list.toOwnedSlice(allocator);
+    const final_buffer = try list.toOwnedSlice();
     std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
     return BSONDocument.init(final_buffer);
 }
@@ -1503,22 +1502,21 @@ fn rewriteDocumentUnset(
     allocator: mem.Allocator,
     key: []const u8,
 ) !BSONDocument {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(allocator);
-
-    try list.resize(allocator, 4);
+    var list = std.Io.Writer.Allocating.init(allocator);
+    errdefer list.deinit();
+    try list.writer.writeInt(u32, 0, .little);
     var idx: usize = 4;
     while (TypeNamePair.read(doc.buffer[idx..])) |pair| {
         const value_size = BSONValue.asessSize(doc.buffer[idx + pair.len ..], pair.type);
         if (!mem.eql(u8, pair.name, key)) {
-            try appendExistingElement(&list, allocator, doc, idx, pair, value_size);
+            try appendExistingElement(&list.writer, doc, idx, pair, value_size);
         }
         idx += pair.len + value_size;
     }
 
-    try list.append(allocator, 0);
+    try list.writer.writeByte(0);
 
-    const final_buffer = try list.toOwnedSlice(allocator);
+    const final_buffer = try list.toOwnedSlice();
     std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
     return BSONDocument.init(final_buffer);
 }
@@ -1619,16 +1617,16 @@ test "format" {
 
 test "BSONDocument write" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(allocator);
+    var list = std.Io.Writer.Allocating.init(allocator);
+    defer list.deinit();
     var doc = BSONDocument.initEmpty();
     doc = try doc.set(allocator, "test", .{ .string = .{ .value = "test" } });
     defer doc.deinit(allocator);
     // const actual = allocator.alloc(u8, 100) catch unreachable;
 
-    try doc.write(list.writer(allocator));
+    try doc.write(&list.writer);
     const expected_string = ("\x14\x00\x00\x00\x02test\x00\x05\x00\x00\x00test\x00\x00");
-    try std.testing.expectEqualSlices(u8, expected_string, list.allocatedSlice()[0..doc.buffer.len]);
+    try std.testing.expectEqualSlices(u8, expected_string, list.written());
 }
 
 test "BSONDocument serializeToMemory" {
