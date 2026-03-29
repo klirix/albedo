@@ -89,7 +89,7 @@ albedo_close(db);
 | Delete | `albedo_delete` | Tombstones matching docs; triggers auto-vacuum when deleted > live |
 | Update | `albedo_transform` → `albedo_transform_data` / `albedo_transform_apply` | Iterate matches and apply per-document transforms |
 | Indexes | `albedo_ensure_index`, `albedo_drop_index`, `albedo_list_indexes` | B⁺-tree indexes on arbitrary field paths |
-| Maintenance | `albedo_vacuum`, `albedo_flush` | Compact the file or force-sync to disk (`flush` fsyncs the WAL in WAL mode) |
+| Maintenance | `albedo_checkpoint`, `albedo_vacuum`, `albedo_flush` | Checkpoint the WAL into the main DB file, compact the file, or force-sync to disk (`flush` fsyncs the WAL in WAL mode) |
 | Replication | `albedo_replication_cursor`, `albedo_replication_read`, `albedo_replication_apply`, `albedo_replication_cursor_close` | Cursor-based WAL replication — see [REPLICATION.md](REPLICATION.md) |
 | Subscriptions | `albedo_subscribe`, `albedo_subscribe_poll`, `albedo_subscribe_close` | Real-time oplog change stream (insert / update / delete events) — requires WAL mode |
 
@@ -134,6 +134,32 @@ processes read the latest page versions without blocking each other.
 The WAL is checkpointed (applied to the main DB file and deleted) automatically
 when the last connection closes. While any connection is open the WAL is kept
 alive so other readers can continue using it.
+
+### WAL checkpointing
+
+A checkpoint copies all committed WAL frames back into the main `.bucket` file,
+syncs the result, truncates the WAL back to its header, and bumps the shared
+checkpoint generation so other readers know to invalidate stale cached pages.
+
+You can trigger that explicitly with `albedo_checkpoint` / `Bucket.checkpoint()`.
+This is useful when you want to:
+
+- bound WAL file growth during a long-running process
+- force recent committed changes into the main DB file before handing the file
+  to another tool
+- leave the database in a compact, checkpointed state without waiting for the
+  last connection to close
+
+`albedo_flush` and `albedo_checkpoint` are different operations:
+
+- `albedo_flush` makes committed WAL writes durable on disk, but leaves them in
+  the WAL
+- `albedo_checkpoint` flushes pending WAL writes, applies them to the main DB
+  file, and clears the WAL
+
+Checkpointing is safe while readers are still open. Existing readers will
+notice the checkpoint generation change through the shared WAL index and refresh
+their cached pages as needed.
 
 ---
 
