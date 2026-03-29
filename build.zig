@@ -50,7 +50,6 @@ fn buildWasmTarget(b: *std.Build, libModule: *std.Build.Module) void {
         "albedo_delete",
         "albedo_list",
         "albedo_data",
-        "albedo_next",
         "albedo_close_iterator",
         "albedo_vacuum",
         "albedo_version",

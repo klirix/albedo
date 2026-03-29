@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const albedo = @import("albedo.zig");
 const bson = @import("bson.zig");
@@ -6,7 +7,6 @@ const query = @import("query.zig");
 const BSONValue = bson.BSONValue;
 const Bucket = albedo.Bucket;
 const Page = albedo.Page;
-const platform = @import("platform.zig");
 
 pub const IndexOptions = packed struct {
     unique: u1 = 0,
@@ -921,19 +921,20 @@ pub const Index = struct {
 
 const testing = std.testing;
 
-fn testIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+fn tryCwdDeleteFile(path: []const u8) !void {
+    if (!builtin.is_test) unreachable;
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
 }
 
 test "Index inserts" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_test.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_test.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_test.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_test.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
     var seed: u64 = undefined;
-    try platform.testing_platform.randomBytes(std.mem.asBytes(&seed));
+    std.testing.io.random(std.mem.asBytes(&seed));
     var prng = std.Random.DefaultPrng.init(blk: {
         break :blk seed;
     });
@@ -949,9 +950,9 @@ test "Index inserts" {
 }
 
 test "leaf split updates parent links" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_split.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_split.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_split.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_split.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -993,9 +994,9 @@ test "leaf split updates parent links" {
 }
 
 test "Index range" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_test1.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_test1.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_test1.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_test1.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1012,9 +1013,9 @@ test "Index range" {
 }
 
 test "range handles duplicates" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_range_dupes.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_range_dupes.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_range_dupes.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_range_dupes.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1043,9 +1044,9 @@ test "range handles duplicates" {
 }
 
 test "unique index rejects duplicates" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_unique.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_unique.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_unique.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_unique.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1059,9 +1060,9 @@ test "unique index rejects duplicates" {
 }
 
 test "range respects bounds" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_range_bounds.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_range_bounds.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_range_bounds.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_range_bounds.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1098,9 +1099,9 @@ test "range respects bounds" {
 }
 
 test "range supports exclusive bounds" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_range_exclusive.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_range_exclusive.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_range_exclusive.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_range_exclusive.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1137,9 +1138,9 @@ test "range supports exclusive bounds" {
 }
 
 test "Index orders strings lexicographically" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_strings.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_strings.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_strings.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_strings.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1175,9 +1176,9 @@ test "Index orders strings lexicographically" {
 }
 
 test "Index orders ObjectIds lexicographically" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_objectids.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_objectids.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_objectids.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_objectids.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1215,9 +1216,9 @@ test "Index orders ObjectIds lexicographically" {
 }
 
 test "Index delete" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_test2.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_test2.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_test2.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_test2.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1234,9 +1235,9 @@ test "Index delete" {
 }
 
 test "Index load from root and query" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_load.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_load.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_load.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_load.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1284,9 +1285,9 @@ test "Index load from root and query" {
 }
 
 test "reverse index orders descending" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_reverse.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_reverse.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_reverse.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_reverse.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1326,9 +1327,9 @@ test "reverse index orders descending" {
 }
 
 test "reverse index with range bounds" {
-    var bucket = try Bucket.openFile(testing.allocator, testIo(), "bplus_reverse_range.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_reverse_range.bucket");
     defer bucket.deinit();
-    defer platform.testing_platform.deleteFile("bplus_reverse_range.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_reverse_range.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 

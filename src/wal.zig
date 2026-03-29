@@ -1,17 +1,30 @@
 const std = @import("std");
+const builtin = @import("builtin");
 fn cwdDeleteFile(io: std.Io, path: []const u8) void {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
 fn cwdStatFile(io: std.Io, path: []const u8) !std.Io.File.Stat {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
     return std.Io.Dir.cwd().statFile(io, path, .{});
 }
 
 fn cwdOpenFile(io: std.Io, path: []const u8, flags: std.Io.File.OpenFlags) !std.Io.File {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
     return std.Io.Dir.cwd().openFile(io, path, flags);
 }
 
 fn cwdCreateFile(io: std.Io, path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
     return std.Io.Dir.cwd().createFile(io, path, flags);
 }
 
@@ -1110,7 +1123,11 @@ pub const WAL = struct {
         defer self.index.releaseWrite();
         self.index.clear();
         const gen_ptr = &self.index.shmHeader().checkpoint_generation;
-        _ = @atomicRmw(u64, gen_ptr, .Add, 1, .release);
+        if (builtin.single_threaded) {
+            gen_ptr.* += 1;
+        } else {
+            _ = @atomicRmw(u64, gen_ptr, .Add, 1, .release);
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────

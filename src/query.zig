@@ -14,7 +14,6 @@
 /// }
 const std = @import("std");
 const bson = @import("bson.zig");
-const platform = @import("platform.zig");
 const BSONDoc = bson.BSONDocument;
 const Allocator = std.mem.Allocator;
 
@@ -978,7 +977,7 @@ test "Query.match matches objectId correctly" {
     const ally = arena.allocator();
     defer arena.deinit();
 
-    const objId = try bson.ObjectId.init(platform.testing_platform);
+    const objId = bson.ObjectId.init(std.testing.io);
 
     var doc_builder = try bson.Builder.init(ally);
     defer doc_builder.deinit();
@@ -986,7 +985,7 @@ test "Query.match matches objectId correctly" {
     const doc = try doc_builder.finish();
     defer doc.deinit(ally);
 
-    const objId2 = try bson.ObjectId.init(platform.testing_platform);
+    const objId2 = bson.ObjectId.init(std.testing.io);
     var doc2_builder = try bson.Builder.init(ally);
     defer doc2_builder.deinit();
     try doc2_builder.put("_id", objId2);

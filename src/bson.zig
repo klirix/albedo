@@ -1,6 +1,5 @@
 const std = @import("std");
 const mem = std.mem;
-const platform = @import("platform.zig");
 pub const ObjectId = @import("./object_id.zig").ObjectId;
 pub const fmt = @import("./bson_formatter.zig");
 
@@ -1671,7 +1670,7 @@ test "BSONDoc set docs" {
 
     var doc = BSONDocument.init(obj);
 
-    const objid = try ObjectId.init(platform.testing_platform);
+    const objid = ObjectId.init(std.testing.io);
 
     doc = try doc.set(std.testing.allocator, "_id", .{ .objectId = .{ .value = objid } });
     defer doc.deinit(std.testing.allocator);
