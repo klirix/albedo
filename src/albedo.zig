@@ -2718,17 +2718,6 @@ pub const Bucket = struct {
                 }
             }
 
-            if (self.query.sector) |sector| {
-                if (sector.offset) |offset| {
-                    if (offset < resultSlice.len) {
-                        const start: usize = @intCast(offset);
-                        std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[start..]);
-                    } else {
-                        resultSlice = resultSlice[0..0];
-                    }
-                }
-            }
-
             const offset = if (self.query.sector) |sector| sector.offset orelse 0 else 0;
             const limit = if (self.query.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
@@ -4229,17 +4218,6 @@ pub const Bucket = struct {
             }
         }
 
-        if (q.sector) |sector| {
-            if (sector.offset) |offset| {
-                if (offset < resultSlice.len) {
-                    const start: usize = @intCast(offset);
-                    std.mem.copyForwards(BSONDocument, resultSlice, resultSlice[start..]);
-                } else {
-                    resultSlice = resultSlice[0..0];
-                }
-            }
-        }
-
         const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
         const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
@@ -5080,6 +5058,50 @@ test "Bucket.insert" {
     //     // const oId = item.get("_id").?.objectId.value;
     // std.debug.print("Document _id: {s}, timestamp: {any}\n", .{ oId.toString(), oId });
     // }
+}
+
+test "Bucket.listIterate eager sort applies offset once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const file_name = "sort-offset-once.bucket";
+    defer platform.deleteFile(file_name) catch {};
+
+    var bucket = try Bucket.init(allocator, file_name);
+    defer bucket.deinit();
+
+    // Insert out of order so sorting is required.
+    var doc_c = try bson.fmt.serialize(.{ .name = "C" }, allocator);
+    defer doc_c.deinit(allocator);
+    _ = try bucket.insert(doc_c);
+
+    var doc_a = try bson.fmt.serialize(.{ .name = "A" }, allocator);
+    defer doc_a.deinit(allocator);
+    _ = try bucket.insert(doc_a);
+
+    var doc_b = try bson.fmt.serialize(.{ .name = "B" }, allocator);
+    defer doc_b.deinit(allocator);
+    _ = try bucket.insert(doc_b);
+
+    var q_doc = try bson.fmt.serialize(.{
+        .sort = .{ .asc = "name" },
+        .sector = .{ .offset = 1, .limit = 1 },
+    }, allocator);
+    defer q_doc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, q_doc);
+    defer q.deinit(allocator);
+
+    var iter_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer iter_arena.deinit();
+
+    var iter = try bucket.listIterate(&iter_arena, q);
+    defer iter.deinit() catch {};
+
+    const first = (try iter.next(iter)).?;
+    try testing.expectEqualStrings("B", first.get("name").?.string.value);
+    try testing.expectEqual(@as(?BSONDocument, null), try iter.next(iter));
 }
 
 test "Bucket.unique index rejects duplicate string values" {
