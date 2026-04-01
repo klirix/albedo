@@ -119,47 +119,18 @@ platform-specific notes and Android cross-compilation.
 
 ## Write-Ahead Log (WAL)
 
-On Linux and macOS, Albedo opens databases in WAL mode by default. Every page
-write is appended to a `<name>-wal` file instead of modifying the main DB file
-directly. A memory-mapped shared-memory index (`<name>-wal-shm`) lets multiple
-processes read the latest page versions without blocking each other.
+On Linux and macOS, Albedo opens databases in WAL mode by default. This provides:
 
-**What WAL gives you:**
+- **Crash recovery** — uncommitted data is replayed on the next open.
+- **MVCC reads** — readers see a consistent snapshot; writers never block readers.
+- **Live-tail streaming** — keep an iterator open to observe new documents as they are written, even across multiple processes.
+- **Better throughput** — writes don't require disk synchronization on every operation.
 
-- **Crash recovery** — uncommitted data in the WAL is replayed on the next open.
-- **MVCC reads** — readers always see a consistent snapshot; writers never block readers.
-- **Live-tail / document streaming** — a reader can keep a `listIterate` iterator open and call `next()` in a poll loop. When the iterator is exhausted it automatically refreshes from the WAL and picks up documents added by another connection.
-- **Throughput** — page writes bypass `fsync` by default (`.manual` write-durability mode), matching SQLite's `synchronous=NORMAL` in WAL mode.
+You can manually checkpoint the WAL (apply it to the main DB file and clear it) with `albedo_checkpoint` / `Bucket.checkpoint()`. This is useful to:
 
-The WAL is checkpointed (applied to the main DB file and deleted) automatically
-when the last connection closes. While any connection is open the WAL is kept
-alive so other readers can continue using it.
-
-### WAL checkpointing
-
-A checkpoint copies all committed WAL frames back into the main `.bucket` file,
-syncs the result, truncates the WAL back to its header, and bumps the shared
-checkpoint generation so other readers know to invalidate stale cached pages.
-
-You can trigger that explicitly with `albedo_checkpoint` / `Bucket.checkpoint()`.
-This is useful when you want to:
-
-- bound WAL file growth during a long-running process
-- force recent committed changes into the main DB file before handing the file
-  to another tool
-- leave the database in a compact, checkpointed state without waiting for the
-  last connection to close
-
-`albedo_flush` and `albedo_checkpoint` are different operations:
-
-- `albedo_flush` makes committed WAL writes durable on disk, but leaves them in
-  the WAL
-- `albedo_checkpoint` flushes pending WAL writes, applies them to the main DB
-  file, and clears the WAL
-
-Checkpointing is safe while readers are still open. Existing readers will
-notice the checkpoint generation change through the shared WAL index and refresh
-their cached pages as needed.
+- Bound WAL file growth during long-running processes
+- Compact the database before handing it to another tool
+- Leave the database in a clean state without waiting for all connections to close
 
 ---
 
@@ -170,28 +141,28 @@ to `albedo_open_with_options` in C).
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `wal` | `bool` | `true` | Enable the Write-Ahead Log. Disable only for read-heavy single-process workloads that do not need crash recovery or MVCC. |
-| `oplog_size` | `u32` | `4 MiB` | Size of the oplog circular ring buffer in bytes. `0` disables the oplog entirely (change-stream subscriptions will not work). Must match the value used when the SHM file was first created; a mismatch returns an error. Older SHM files (reserved bytes were zero) are seamlessly re-initialized. |
-| `write_durability` | see below | `.{ .periodic = 100 }` | Controls when `fsync` is called. |
-| `read_durability` | see below | `.shared` | Controls how page reads interact with the WAL. |
-| `auto_vaccuum` | `bool` | `true` | Automatically compact the database when deleted pages exceed live pages. |
-| `page_cache_capacity` | `usize` | `256` | Maximum number of pages held in the in-process LRU page cache. |
-| `mode` | `ReadOnly` / `ReadWrite` | `ReadWrite` | Open the file read-only or read-write. |
+| `wal` | `bool` | `true` | Enable the Write-Ahead Log. Disable only for single-process read-only workloads. |
+| `oplog_size` | `u32` | `4 MiB` | Size of the change-stream oplog buffer. Set to `0` to disable subscriptions. |
+| `write_durability` | see below | `.{ .periodic = 100 }` | Durability level for writes. |
+| `read_durability` | see below | `.shared` | Consistency level for reads. |
+| `auto_vaccuum` | `bool` | `true` | Automatically compact the database after deletions. |
+| `page_cache_capacity` | `usize` | `256` | Maximum cached pages in memory. |
+| `mode` | `ReadOnly` / `ReadWrite` | `ReadWrite` | Open read-only or read-write. |
 
 **Write-durability modes** (`write_durability`):
 
 | Mode | Behaviour |
 |------|-----------|
-| `.all` | `fsync` after every page write — safest, slowest |
-| `.{ .periodic = N }` | `fsync` every N page writes (default: 100) |
-| `.manual` | Never auto-`fsync`; call `albedo_flush` / `flush()` when you need a durability guarantee |
+| `.all` | Guarantee durability after every write (slowest) |
+| `.{ .periodic = N }` | Guarantee durability every N writes (default: 100) |
+| `.manual` | No automatic durability; call `albedo_flush()` when you need it (fastest) |
 
 **Read-durability modes** (`read_durability`):
 
 | Mode | Behaviour |
-|------|-----------|
-| `.shared` | Always consult the WAL before returning a cached page — safe for multi-process readers |
-| `.process` | Trust the local in-process cache; fall back to the WAL only on a cache miss — best performance for single-process workloads |
+|------|----------|
+| `.shared` | Always see the latest writes from other processes (safe for multi-process) |
+| `.process` | See local process writes immediately; other processes' writes may lag (faster for single-process) |
 
 ---
 
@@ -413,28 +384,14 @@ Both are optional. Without them, all matching documents are returned.
 
 ### Query planning and index use
 
-Albedo's query planner automatically selects the best query strategy:
+Albedo's query planner automatically chooses the best execution strategy, including:
 
-1. **Full scan** — if no indexed filter applies
-2. **Index range** — if a single field is indexed and a range operator applies (`$lt`, `$lte`, `$gt`, `$gte`, `$eq`, `$between`, `$startsWith`)
-3. **Index point** — if a single field is indexed and `$in` is used (matches discrete values)
-4. **Index union** — if a `$or` query has multiple branches and **all branches are covered by indexes** (one index per branch minimum)
-5. **Index exclusion** — if a `$nor` query has multiple branches and **all branches are covered by indexes**; Albedo excludes those matches from the `_id` index scan
+- **Index range scan** — when filtering on an indexed field with comparison operators
+- **Index point scan** — when using `$in` on an indexed field
+- **Index union** — when a `$or` query can use multiple indexes
+- **Full scan** — when no index can help
 
-Explicit `$and` does not have its own separate strategy name. Instead, its inner predicates are folded into the normal planner, so an explicit `$and` can still produce a range or point plan.
-
-**Score-based planning:** When multiple filters apply, the planner scores strategies and picks the highest score:
-
-- `$eq`: 100 (exact match is best)
-- `$in`: 95 (finite set of values)
-- `$between`: 85
-- `$lt`, `$lte`, `$gt`, `$gte`: 80
-- `$startsWith`: 70
-- `$or` union: 60 (multiple index lookups + dedup)
-- `$nor` exclusion: 50 (branch index scans + exclusion over `_id`)
-- Full scan: 0 (fallback)
-
-If the top-scoring strategy doesn't cover the sort, the planner sets `eager = true`, materializing all results before sorting. `$nor` exclusion is also eager even without sorting.
+The planner prioritizes exact matches (`$eq`) and narrow ranges over broader filters. For sorted queries, if the sort field is indexed and matches the query strategy, sorting is covered (no additional cost). Otherwise results are materialized before sorting.
 
 ### Example queries
 
