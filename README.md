@@ -295,7 +295,7 @@ Combine multiple filter groups with `$or`, `$and`, and `$nor`. Each group is an 
 }
 ```
 
-Matches if **any** group matches (inclusive OR). Indexes are used if all branches are covered.
+Matches if **any** group matches (inclusive OR). If every branch has at least one indexable predicate, Albedo uses an index-union plan and deduplicates overlapping matches.
 
 #### `$and` — All groups must match
 
@@ -311,6 +311,12 @@ Matches if **any** group matches (inclusive OR). Indexes are used if all branche
 
 All filters in all groups must match. Useful for explicit grouping when combining with other logical operators.
 
+Explicit `$and` participates in planning just like top-level implicit AND:
+
+- inner indexed predicates can drive the scan
+- multiple range predicates on the same indexed field can tighten bounds
+- inner `$in` predicates can use the point strategy
+
 #### `$nor` — No group matches
 
 ```bson
@@ -322,7 +328,15 @@ All filters in all groups must match. Useful for explicit grouping when combinin
 }
 ```
 
-Matches if **no** group matches. Internally performs a full scan; no index optimization.
+Matches if **no** group matches.
+
+When **every** `$nor` branch is index-covered, Albedo uses an exclusion plan:
+
+1. scan each branch index to collect documents that must be rejected
+2. scan the canonical `_id` index
+3. return only documents not present in the exclusion set
+
+This keeps `$nor` semantics correct, including sparse / missing-field cases, but it is currently **eager** (materialized before streaming) and does **not** support cursors.
 
 #### Mixed logical operators
 
@@ -404,6 +418,9 @@ Albedo's query planner automatically selects the best query strategy:
 2. **Index range** — if a single field is indexed and a range operator applies (`$lt`, `$lte`, `$gt`, `$gte`, `$eq`, `$between`, `$startsWith`)
 3. **Index point** — if a single field is indexed and `$in` is used (matches discrete values)
 4. **Index union** — if a `$or` query has multiple branches and **all branches are covered by indexes** (one index per branch minimum)
+5. **Index exclusion** — if a `$nor` query has multiple branches and **all branches are covered by indexes**; Albedo excludes those matches from the `_id` index scan
+
+Explicit `$and` does not have its own separate strategy name. Instead, its inner predicates are folded into the normal planner, so an explicit `$and` can still produce a range or point plan.
 
 **Score-based planning:** When multiple filters apply, the planner scores strategies and picks the highest score:
 
@@ -413,9 +430,10 @@ Albedo's query planner automatically selects the best query strategy:
 - `$lt`, `$lte`, `$gt`, `$gte`: 80
 - `$startsWith`: 70
 - `$or` union: 60 (multiple index lookups + dedup)
+- `$nor` exclusion: 50 (branch index scans + exclusion over `_id`)
 - Full scan: 0 (fallback)
 
-If the top-scoring strategy doesn't cover the sort, the planner sets `eager = true`, materializing all results before sorting.
+If the top-scoring strategy doesn't cover the sort, the planner sets `eager = true`, materializing all results before sorting. `$nor` exclusion is also eager even without sorting.
 
 ### Example queries
 

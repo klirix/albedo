@@ -2453,8 +2453,12 @@ pub const Bucket = struct {
             range,
             points,
             /// All branches of a `$or` filter are covered by indexes.
-            /// `or_branches[0..or_branch_count]` holds one index + bounds per branch.
+            /// `logical_branches[0..logical_branch_count]` holds one index + bounds per branch.
             or_union,
+            /// All branches of a `$nor` filter are covered by indexes, and results
+            /// are produced by scanning the canonical `_id` index while excluding
+            /// any document locations seen in the branch scans.
+            nor_exclusion,
         };
 
         const IndexBounds = struct {
@@ -2462,13 +2466,13 @@ pub const Bucket = struct {
             upper: ?Index.RangeBound = null,
         };
 
-        /// Per-branch plan used by the `or_union` strategy.
-        const OrBranchPlan = struct {
+        /// Per-branch plan used by logical union/exclusion strategies.
+        const BranchPlan = struct {
             index: *Index,
             bounds: IndexBounds,
         };
 
-        const MAX_OR_BRANCHES = 32;
+        const MAX_LOGICAL_BRANCHES = 32;
 
         source: Source = .full_scan,
         index: ?*Index = null,
@@ -2478,19 +2482,13 @@ pub const Bucket = struct {
         eager: bool = false,
         sort_covered: bool = false,
         index_strategy: IndexStrategy = .range,
-        or_branches: [MAX_OR_BRANCHES]OrBranchPlan = undefined,
-        or_branch_count: u8 = 0,
+        point_values: ?bson.BSONValue = null,
+        logical_branches: [MAX_LOGICAL_BRANCHES]BranchPlan = undefined,
+        logical_branch_count: u8 = 0,
     };
 
-    inline fn planUsesPointStrategy(plan: *const QueryPlan, filters: []const query.Filter) bool {
-        if (plan.index_strategy != .points) return false;
-        if (plan.filter_index) |idx| {
-            return switch (filters[idx]) {
-                .in => true,
-                else => false,
-            };
-        }
-        return false;
+    inline fn planUsesPointStrategy(plan: *const QueryPlan) bool {
+        return plan.index_strategy == .points and plan.point_values != null;
     }
 
     inline fn planMatchesRange(plan: *const QueryPlan, index_ptr: *Index, path: []const u8) bool {
@@ -2531,6 +2529,236 @@ pub const Bucket = struct {
         }
     }
 
+    const PlannedLeaf = struct {
+        score: u8,
+        index: *Index,
+        path: []const u8,
+        bounds: QueryPlan.IndexBounds = .{},
+        strategy: QueryPlan.IndexStrategy,
+        point_values: ?bson.BSONValue = null,
+    };
+
+    fn planLeafFilter(self: *Bucket, filter: query.Filter) ?PlannedLeaf {
+        return switch (filter) {
+            .eq => |data| blk: {
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 100,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .bounds = .{
+                        .lower = Index.RangeBound.gte(data.value),
+                        .upper = Index.RangeBound.lte(data.value),
+                    },
+                    .strategy = .range,
+                };
+            },
+            .lt => |data| blk: {
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 80,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .bounds = .{ .upper = Index.RangeBound.lt(data.value) },
+                    .strategy = .range,
+                };
+            },
+            .lte => |data| blk: {
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 80,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .bounds = .{ .upper = Index.RangeBound.lte(data.value) },
+                    .strategy = .range,
+                };
+            },
+            .gt => |data| blk: {
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 80,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .bounds = .{ .lower = Index.RangeBound.gt(data.value) },
+                    .strategy = .range,
+                };
+            },
+            .gte => |data| blk: {
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 80,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .bounds = .{ .lower = Index.RangeBound.gte(data.value) },
+                    .strategy = .range,
+                };
+            },
+            .between => |data| blk: {
+                const lower = data.value.array.get("0") orelse break :blk null;
+                const upper = data.value.array.get("1") orelse break :blk null;
+                if (!isIndexableValue(lower) or !isIndexableValue(upper)) break :blk null;
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 85,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .bounds = .{
+                        .lower = Index.RangeBound.gt(lower),
+                        .upper = Index.RangeBound.lt(upper),
+                    },
+                    .strategy = .range,
+                };
+            },
+            .in => |data| blk: {
+                if (data.value != bson.BSONValueType.array) break :blk null;
+                var iter = data.value.array.iter();
+                var count: usize = 0;
+                while (iter.next()) |pair| {
+                    if (!isIndexableValue(pair.value)) break :blk null;
+                    count += 1;
+                }
+                if (count == 0) break :blk null;
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 95,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .strategy = .points,
+                    .point_values = data.value,
+                };
+            },
+            .startsWith => |data| blk: {
+                if (data.value != .string or !isIndexableValue(data.value)) break :blk null;
+                const index_ptr = self.indexes.get(data.path) orelse break :blk null;
+                break :blk .{
+                    .score = 70,
+                    .index = index_ptr,
+                    .path = data.path,
+                    .bounds = .{ .lower = Index.RangeBound.gte(data.value) },
+                    .strategy = .range,
+                };
+            },
+            else => null,
+        };
+    }
+
+    fn applyPlannedLeaf(plan: *QueryPlan, best_score: *u8, filter_index: usize, candidate: PlannedLeaf) void {
+        const matches_current = candidate.strategy == .range and planMatchesRange(plan, candidate.index, candidate.path);
+        if (candidate.score > best_score.*) {
+            best_score.* = candidate.score;
+            plan.source = .index;
+            plan.index = candidate.index;
+            plan.filter_index = filter_index;
+            plan.index_path = candidate.path;
+            plan.bounds = candidate.bounds;
+            plan.sort_covered = false;
+            plan.index_strategy = candidate.strategy;
+            plan.point_values = candidate.point_values;
+            plan.logical_branch_count = 0;
+        } else if (matches_current) {
+            if (candidate.bounds.lower) |lower| {
+                tightenLowerBound(&plan.bounds.lower, lower);
+            }
+            if (candidate.bounds.upper) |upper| {
+                tightenUpperBound(&plan.bounds.upper, upper);
+            }
+        }
+    }
+
+    fn planBestBranchFilter(self: *Bucket, group: query.FilterGroup) ?QueryPlan.BranchPlan {
+        var best_score: u8 = 0;
+        var best: ?QueryPlan.BranchPlan = null;
+
+        for (group) |filter| {
+            switch (filter) {
+                .@"and" => |groups| {
+                    for (groups) |subgroup| {
+                        if (self.planBestBranchFilter(subgroup)) |branch_plan| {
+                            const score = if (branch_plan.bounds.lower != null and branch_plan.bounds.upper != null) @as(u8, 100) else @as(u8, 80);
+                            if (score > best_score) {
+                                best_score = score;
+                                best = branch_plan;
+                            }
+                        }
+                    }
+                },
+                .@"or", .nor => {},
+                else => {
+                    const candidate = self.planLeafFilter(filter) orelse continue;
+                    if (candidate.score > best_score) {
+                        best_score = candidate.score;
+                        best = .{
+                            .index = candidate.index,
+                            .bounds = candidate.bounds,
+                        };
+                    }
+                },
+            }
+        }
+        return best;
+    }
+
+    fn considerFilterForPlan(self: *Bucket, filter: query.Filter, filter_index: usize, best_score: *u8, plan: *QueryPlan) void {
+        switch (filter) {
+            .@"and" => |groups| {
+                for (groups) |group| {
+                    for (group) |subfilter| {
+                        self.considerFilterForPlan(subfilter, filter_index, best_score, plan);
+                    }
+                }
+            },
+            .@"or" => |groups| {
+                if (groups.len == 0 or groups.len > QueryPlan.MAX_LOGICAL_BRANCHES) return;
+                var branch_plans: [QueryPlan.MAX_LOGICAL_BRANCHES]QueryPlan.BranchPlan = undefined;
+                for (groups, 0..) |group, branch_idx| {
+                    const bp = self.planBestBranchFilter(group) orelse return;
+                    branch_plans[branch_idx] = bp;
+                }
+                const score: u8 = 60;
+                if (score > best_score.*) {
+                    best_score.* = score;
+                    plan.source = .index;
+                    plan.index = null;
+                    plan.filter_index = filter_index;
+                    plan.index_path = null;
+                    plan.bounds = .{};
+                    plan.sort_covered = false;
+                    plan.index_strategy = .or_union;
+                    plan.point_values = null;
+                    plan.logical_branch_count = @intCast(groups.len);
+                    for (0..groups.len) |i| plan.logical_branches[i] = branch_plans[i];
+                }
+            },
+            .nor => |groups| {
+                if (groups.len == 0 or groups.len > QueryPlan.MAX_LOGICAL_BRANCHES) return;
+                const id_index = self.indexes.get("_id") orelse return;
+                var branch_plans: [QueryPlan.MAX_LOGICAL_BRANCHES]QueryPlan.BranchPlan = undefined;
+                for (groups, 0..) |group, branch_idx| {
+                    const bp = self.planBestBranchFilter(group) orelse return;
+                    branch_plans[branch_idx] = bp;
+                }
+                const score: u8 = 50;
+                if (score > best_score.*) {
+                    best_score.* = score;
+                    plan.source = .index;
+                    plan.index = id_index;
+                    plan.filter_index = filter_index;
+                    plan.index_path = "_id";
+                    plan.bounds = .{};
+                    plan.sort_covered = false;
+                    plan.index_strategy = .nor_exclusion;
+                    plan.point_values = null;
+                    plan.logical_branch_count = @intCast(groups.len);
+                    for (0..groups.len) |i| plan.logical_branches[i] = branch_plans[i];
+                }
+            },
+            else => {
+                const candidate = self.planLeafFilter(filter) orelse return;
+                applyPlannedLeaf(plan, best_score, filter_index, candidate);
+            },
+        }
+    }
+
     pub const ListIterator = struct {
         docList: []BSONDocument = &[_]BSONDocument{},
         arena: *std.heap.ArenaAllocator,
@@ -2566,7 +2794,7 @@ pub const Bucket = struct {
         next: *const fn (*ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument = nextUnfetched,
 
         fn ensureIndexIterator(self: *ListIterator) error{ScanError}!*Index.RangeIterator {
-            if (Bucket.planUsesPointStrategy(&self.plan, self.query.filters)) {
+            if (Bucket.planUsesPointStrategy(&self.plan)) {
                 return error.ScanError;
             }
             if (!self.index_iterator_initialized) {
@@ -2922,7 +3150,7 @@ pub const Bucket = struct {
                 return error.InvalidCursor;
             }
 
-            const use_points = Bucket.planUsesPointStrategy(&self.plan, self.query.filters);
+            const use_points = Bucket.planUsesPointStrategy(&self.plan);
             std.debug.assert(!use_points);
             while (try self.nextIndexRangeRecord()) |record| {
                 if (cursorAnchorMatchesDoc(&anchor, &record.doc)) {
@@ -2950,9 +3178,9 @@ pub const Bucket = struct {
 
             const mode_value: []const u8 = switch (self.plan.source) {
                 .full_scan => "full_scan",
-                .index => if (Bucket.planUsesPointStrategy(&self.plan, self.query.filters))
+                .index => if (Bucket.planUsesPointStrategy(&self.plan))
                     return error.UnsupportedCursorQuery
-                else if (self.plan.index_strategy == .or_union)
+                else if (self.plan.index_strategy == .or_union or self.plan.index_strategy == .nor_exclusion)
                     return error.UnsupportedCursorQuery
                 else
                     "index_range",
@@ -3002,7 +3230,7 @@ pub const Bucket = struct {
 
         fn nextIndex(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
             std.debug.assert(self.plan.source == .index);
-            const use_points = Bucket.planUsesPointStrategy(&self.plan, self.query.filters);
+            const use_points = Bucket.planUsesPointStrategy(&self.plan);
             const record = if (use_points)
                 try self.nextPointIndexRecord()
             else if (self.plan.index_strategy == .or_union)
@@ -3037,313 +3265,12 @@ pub const Bucket = struct {
         }
     };
 
-    /// Returns the best single-index plan for a filter group (one $or branch).
-    /// Returns null if no filter in the group maps to an existing index.
-    fn planBestBranchFilter(self: *Bucket, group: query.FilterGroup) ?QueryPlan.OrBranchPlan {
-        var best_score: u8 = 0;
-        var best: ?QueryPlan.OrBranchPlan = null;
-
-        for (group) |filter| {
-            const result: struct { score: u8, plan: QueryPlan.OrBranchPlan } = switch (filter) {
-                .eq => |data| blk: {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    break :blk .{
-                        .score = 100,
-                        .plan = .{ .index = index_ptr, .bounds = .{
-                            .lower = Index.RangeBound.gte(data.value),
-                            .upper = Index.RangeBound.lte(data.value),
-                        } },
-                    };
-                },
-                .between => |data| blk: {
-                    if (data.value != .array) continue;
-                    const lo = data.value.array.get("0") orelse continue;
-                    const hi = data.value.array.get("1") orelse continue;
-                    if (!isIndexableValue(lo) or !isIndexableValue(hi)) continue;
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    break :blk .{
-                        .score = 85,
-                        .plan = .{ .index = index_ptr, .bounds = .{
-                            .lower = Index.RangeBound.gt(lo),
-                            .upper = Index.RangeBound.lt(hi),
-                        } },
-                    };
-                },
-                .lt => |data| blk: {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
-                        .upper = Index.RangeBound.lt(data.value),
-                    } } };
-                },
-                .lte => |data| blk: {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
-                        .upper = Index.RangeBound.lte(data.value),
-                    } } };
-                },
-                .gt => |data| blk: {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
-                        .lower = Index.RangeBound.gt(data.value),
-                    } } };
-                },
-                .gte => |data| blk: {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
-                        .lower = Index.RangeBound.gte(data.value),
-                    } } };
-                },
-                .startsWith => |data| blk: {
-                    if (data.value != .string or !isIndexableValue(data.value)) continue;
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    break :blk .{ .score = 70, .plan = .{ .index = index_ptr, .bounds = .{
-                        .lower = Index.RangeBound.gte(data.value),
-                    } } };
-                },
-                else => continue,
-            };
-            if (result.score > best_score) {
-                best_score = result.score;
-                best = result.plan;
-            }
-        }
-        return best;
-    }
-
     fn planQuery(self: *Bucket, q: *const query.Query) QueryPlan {
         var plan = QueryPlan{};
         var best_score: u8 = 0;
 
         for (q.filters, 0..) |filter, idx| {
-            switch (filter) {
-                .eq => |data| {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const candidate_bounds = QueryPlan.IndexBounds{
-                        .lower = Index.RangeBound.gte(data.value),
-                        .upper = Index.RangeBound.lte(data.value),
-                    };
-                    const score: u8 = 100;
-                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = candidate_bounds;
-                        plan.sort_covered = false;
-                        plan.index_strategy = .range;
-                    } else if (matches_current) {
-                        if (candidate_bounds.lower) |lower| {
-                            tightenLowerBound(&plan.bounds.lower, lower);
-                        }
-                        if (candidate_bounds.upper) |upper| {
-                            tightenUpperBound(&plan.bounds.upper, upper);
-                        }
-                    }
-                },
-                .lt => |data| {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const candidate_bounds = QueryPlan.IndexBounds{
-                        .upper = Index.RangeBound.lt(data.value),
-                    };
-                    const score: u8 = 80;
-                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = candidate_bounds;
-                        plan.sort_covered = false;
-                        plan.index_strategy = .range;
-                    } else if (matches_current) {
-                        if (candidate_bounds.upper) |upper| {
-                            tightenUpperBound(&plan.bounds.upper, upper);
-                        }
-                    }
-                },
-                .lte => |data| {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const candidate_bounds = QueryPlan.IndexBounds{
-                        .upper = Index.RangeBound.lte(data.value),
-                    };
-                    const score: u8 = 80;
-                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = candidate_bounds;
-                        plan.sort_covered = false;
-                        plan.index_strategy = .range;
-                    } else if (matches_current) {
-                        if (candidate_bounds.upper) |upper| {
-                            tightenUpperBound(&plan.bounds.upper, upper);
-                        }
-                    }
-                },
-                .gt => |data| {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const candidate_bounds = QueryPlan.IndexBounds{
-                        .lower = Index.RangeBound.gt(data.value),
-                    };
-                    const score: u8 = 80;
-                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = candidate_bounds;
-                        plan.sort_covered = false;
-                        plan.index_strategy = .range;
-                    } else if (matches_current) {
-                        if (candidate_bounds.lower) |lower| {
-                            tightenLowerBound(&plan.bounds.lower, lower);
-                        }
-                    }
-                },
-                .gte => |data| {
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const candidate_bounds = QueryPlan.IndexBounds{
-                        .lower = Index.RangeBound.gte(data.value),
-                    };
-                    const score: u8 = 80;
-                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = candidate_bounds;
-                        plan.sort_covered = false;
-                        plan.index_strategy = .range;
-                    } else if (matches_current) {
-                        if (candidate_bounds.lower) |lower| {
-                            tightenLowerBound(&plan.bounds.lower, lower);
-                        }
-                    }
-                },
-                .between => |data| {
-                    const lower = data.value.array.get("0") orelse continue;
-                    const upper = data.value.array.get("1") orelse continue;
-                    if (!isIndexableValue(lower) or !isIndexableValue(upper)) continue;
-
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const candidate_bounds = QueryPlan.IndexBounds{
-                        .lower = Index.RangeBound.gt(lower),
-                        .upper = Index.RangeBound.lt(upper),
-                    };
-                    const score: u8 = 85;
-                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = candidate_bounds;
-                        plan.sort_covered = false;
-                        plan.index_strategy = .range;
-                    } else if (matches_current) {
-                        if (candidate_bounds.lower) |lower_bound| {
-                            tightenLowerBound(&plan.bounds.lower, lower_bound);
-                        }
-                        if (candidate_bounds.upper) |upper_bound| {
-                            tightenUpperBound(&plan.bounds.upper, upper_bound);
-                        }
-                    }
-                },
-                .in => |data| {
-                    if (data.value != bson.BSONValueType.array) continue;
-                    var iter = data.value.array.iter();
-                    var count: usize = 0;
-                    var all_indexable = true;
-                    while (iter.next()) |pair| {
-                        if (!isIndexableValue(pair.value)) {
-                            all_indexable = false;
-                            break;
-                        }
-                        count += 1;
-                    }
-                    if (!all_indexable or count == 0) continue;
-
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const score: u8 = 95;
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = .{};
-                        plan.sort_covered = false;
-                        plan.index_strategy = .points;
-                    }
-                },
-                .startsWith => |data| {
-                    if (data.value != bson.BSONValueType.string) continue;
-                    if (!isIndexableValue(data.value)) continue;
-
-                    const index_ptr = self.indexes.get(data.path) orelse continue;
-                    const candidate_bounds = QueryPlan.IndexBounds{
-                        .lower = Index.RangeBound.gte(data.value),
-                    };
-                    const score: u8 = 70;
-                    const matches_current = planMatchesRange(&plan, index_ptr, data.path);
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = index_ptr;
-                        plan.filter_index = idx;
-                        plan.index_path = data.path;
-                        plan.bounds = candidate_bounds;
-                        plan.sort_covered = false;
-                        plan.index_strategy = .range;
-                    } else if (matches_current) {
-                        if (candidate_bounds.lower) |lower| {
-                            tightenLowerBound(&plan.bounds.lower, lower);
-                        }
-                    }
-                },
-                .endsWith => |_| {
-                    // No indexable strategy for suffix matching.
-                },
-                .@"or" => |groups| {
-                    if (groups.len == 0 or groups.len > QueryPlan.MAX_OR_BRANCHES) continue;
-                    // All branches must have at least one filter covered by an index.
-                    var branch_plans: [QueryPlan.MAX_OR_BRANCHES]QueryPlan.OrBranchPlan = undefined;
-                    var all_indexable = true;
-                    for (groups, 0..) |group, branch_idx| {
-                        const bp = self.planBestBranchFilter(group) orelse {
-                            all_indexable = false;
-                            break;
-                        };
-                        branch_plans[branch_idx] = bp;
-                    }
-                    if (!all_indexable) continue;
-                    const score: u8 = 60;
-                    if (score > best_score) {
-                        best_score = score;
-                        plan.source = .index;
-                        plan.index = null;
-                        plan.filter_index = idx;
-                        plan.index_path = null;
-                        plan.bounds = .{};
-                        plan.sort_covered = false;
-                        plan.index_strategy = .or_union;
-                        plan.or_branch_count = @intCast(groups.len);
-                        for (0..groups.len) |i| plan.or_branches[i] = branch_plans[i];
-                    }
-                },
-                else => {},
-            }
+            self.considerFilterForPlan(filter, idx, &best_score, &plan);
         }
 
         if (q.sortConfig) |sortConfig| {
@@ -3383,6 +3310,11 @@ pub const Bucket = struct {
             plan.eager = false;
         }
 
+        if (plan.source == .index and plan.index_strategy == .nor_exclusion) {
+            plan.eager = true;
+            plan.sort_covered = false;
+        }
+
         return plan;
     }
 
@@ -3402,6 +3334,18 @@ pub const Bucket = struct {
         };
     }
 
+    fn releaseIndexedDocBuffer(self: *Bucket, ally: std.mem.Allocator, loc: DocumentLocation, doc: BSONDocument) void {
+        const page = self.loadPage(loc.page_id) catch {
+            ally.free(doc.buffer);
+            return;
+        };
+        const doc_start = @intFromPtr(doc.buffer.ptr);
+        const page_start = @intFromPtr(page.data.ptr);
+        const page_end = page_start + page.data.len;
+        if (doc_start >= page_start and doc_start < page_end) return;
+        ally.free(doc.buffer);
+    }
+
     fn validateCursorQuery(self: *Bucket, q: *const query.Query, plan: *const QueryPlan) error{ InvalidCursor, UnsupportedCursorQuery }!void {
         _ = self;
         const cursor = q.cursor orelse return;
@@ -3414,7 +3358,7 @@ pub const Bucket = struct {
             return error.UnsupportedCursorQuery;
         }
 
-        if (plan.source == .index and plan.index_strategy == .or_union) {
+        if (plan.source == .index and (plan.index_strategy == .or_union or plan.index_strategy == .nor_exclusion)) {
             return error.UnsupportedCursorQuery;
         }
 
@@ -3465,8 +3409,8 @@ pub const Bucket = struct {
                 if (plan.index_strategy == .or_union) {
                     var seen = std.AutoHashMap(u128, void).init(ally);
                     defer seen.deinit();
-                    for (0..plan.or_branch_count) |i| {
-                        const bp = &plan.or_branches[i];
+                    for (0..plan.logical_branch_count) |i| {
+                        const bp = &plan.logical_branches[i];
                         self.bindIndex(bp.index);
                         var iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
                         while (true) {
@@ -3489,8 +3433,59 @@ pub const Bucket = struct {
                             if (q.filters.len == 0 or q.match(&doc)) {
                                 try docList.append(ally, doc);
                             } else {
-                                ally.free(doc.buffer);
+                                self.releaseIndexedDocBuffer(ally, .{
+                                    .page_id = loc.pageId,
+                                    .offset = loc.offset,
+                                }, doc);
                             }
+                        }
+                    }
+                    return;
+                }
+
+                if (plan.index_strategy == .nor_exclusion) {
+                    var excluded = std.AutoHashMap(u128, void).init(ally);
+                    defer excluded.deinit();
+
+                    for (0..plan.logical_branch_count) |i| {
+                        const bp = &plan.logical_branches[i];
+                        self.bindIndex(bp.index);
+                        var branch_iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
+                        while (true) {
+                            const maybe_loc = branch_iter.next() catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.ScanError,
+                            };
+                            const loc = maybe_loc orelse break;
+                            try excluded.put(docLocationKey(loc), {});
+                        }
+                    }
+
+                    var iterator = self.initIndexIterator(plan) catch return error.ScanError;
+                    while (true) {
+                        const maybe_loc = iterator.next() catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return error.ScanError,
+                        };
+                        const loc = maybe_loc orelse break;
+                        if (excluded.contains(docLocationKey(loc))) continue;
+
+                        var doc = self.readDocAt(ally, .{
+                            .page_id = loc.pageId,
+                            .offset = loc.offset,
+                        }) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.DocumentDeleted => continue,
+                            else => return error.ScanError,
+                        };
+
+                        if (q.filters.len == 0 or q.match(&doc)) {
+                            try docList.append(ally, doc);
+                        } else {
+                            self.releaseIndexedDocBuffer(ally, .{
+                                .page_id = loc.pageId,
+                                .offset = loc.offset,
+                            }, doc);
                         }
                     }
                     return;
@@ -3499,13 +3494,8 @@ pub const Bucket = struct {
                 const index_ptr = plan.index orelse return error.ScanError;
                 self.bindIndex(index_ptr);
 
-                if (planUsesPointStrategy(plan, q.filters)) {
-                    const filter_index = plan.filter_index orelse return error.ScanError;
-                    const filter_ptr = &q.filters[filter_index];
-                    const inFilter = switch (filter_ptr.*) {
-                        .in => |*in_ref| in_ref,
-                        else => return error.ScanError,
-                    };
+                if (planUsesPointStrategy(plan)) {
+                    const in_values = plan.point_values orelse return error.ScanError;
 
                     // Pre-size the deduplication map based on expected number of documents
                     var seen = std.AutoHashMap(u128, void).init(ally);
@@ -3513,13 +3503,13 @@ pub const Bucket = struct {
 
                     // Pre-allocate capacity to reduce rehashing
                     var value_count: usize = 0;
-                    var count_iter = inFilter.value.array.iter();
+                    var count_iter = in_values.array.iter();
                     while (count_iter.next()) |pair| {
                         if (isIndexableValue(pair.value)) value_count += 1;
                     }
                     try seen.ensureTotalCapacity(@intCast(value_count * 4)); // Estimate 4 docs per value
 
-                    var value_iter = inFilter.value.array.iter();
+                    var value_iter = in_values.array.iter();
                     while (value_iter.next()) |pair| {
                         if (!isIndexableValue(pair.value)) continue;
 
@@ -3546,7 +3536,10 @@ pub const Bucket = struct {
                             if (q.filters.len == 0 or q.match(&doc)) {
                                 try docList.append(ally, doc);
                             } else {
-                                ally.free(doc.buffer);
+                                self.releaseIndexedDocBuffer(ally, .{
+                                    .page_id = loc.pageId,
+                                    .offset = loc.offset,
+                                }, doc);
                             }
                         }
                     }
@@ -3569,7 +3562,10 @@ pub const Bucket = struct {
                         if (q.filters.len == 0 or q.match(&doc)) {
                             try docList.append(ally, doc);
                         } else {
-                            ally.free(doc.buffer);
+                            self.releaseIndexedDocBuffer(ally, .{
+                                .page_id = loc.pageId,
+                                .offset = loc.offset,
+                            }, doc);
                         }
                     }
                 }
@@ -3837,40 +3833,31 @@ pub const Bucket = struct {
             .cursor_mode_enabled = q.cursor != null,
         };
 
-        if (Bucket.planUsesPointStrategy(&rc.plan, rc.query.filters)) {
-            const fi = rc.plan.filter_index.?;
-            switch (rc.query.filters[fi]) {
-                .in => |inFilter| {
-                    var iter = inFilter.value.array.iter();
-                    while (iter.next()) |pair| {
-                        if (!isIndexableValue(pair.value)) continue;
-                        try rc.point_values.append(ally, pair.value);
-                    }
-                    rc.point_value_total = rc.point_values.items.len;
-                    rc.point_values_consumed = 0;
+        if (Bucket.planUsesPointStrategy(&rc.plan)) {
+            const point_values = rc.plan.point_values orelse return error.ScanError;
+            var iter = point_values.array.iter();
+            while (iter.next()) |pair| {
+                if (!isIndexableValue(pair.value)) continue;
+                try rc.point_values.append(ally, pair.value);
+            }
+            rc.point_value_total = rc.point_values.items.len;
+            rc.point_values_consumed = 0;
 
-                    // Choose deduplication strategy based on number of point values
-                    if (rc.point_value_total == 1) {
-                        // Single point query - no deduplication needed
-                        rc.point_dedup_strategy = .none;
-                    } else if (rc.point_value_total == 2) {
-                        // Two values - just check if same as last location (common for array fields)
-                        rc.point_dedup_strategy = .check_last;
-                    } else {
-                        // Multiple values - use hashmap for full deduplication
-                        rc.point_dedup_strategy = .use_hashmap;
-                    }
-                },
-                else => {},
+            if (rc.point_value_total == 1) {
+                rc.point_dedup_strategy = .none;
+            } else if (rc.point_value_total == 2) {
+                rc.point_dedup_strategy = .check_last;
+            } else {
+                rc.point_dedup_strategy = .use_hashmap;
             }
         }
 
         if (rc.plan.index_strategy == .or_union) {
             // Allocate one range iterator per $or branch.
-            const branch_count = rc.plan.or_branch_count;
+            const branch_count = rc.plan.logical_branch_count;
             rc.or_iterators = try ally.alloc(Index.RangeIterator, branch_count);
             for (0..branch_count) |i| {
-                const bp = &rc.plan.or_branches[i];
+                const bp = &rc.plan.logical_branches[i];
                 self.bindIndex(bp.index);
                 rc.or_iterators[i] = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch
                     return error.ScanError;
@@ -3939,8 +3926,8 @@ pub const Bucket = struct {
                 if (plan.index_strategy == .or_union) {
                     var seen = std.AutoHashMap(u128, void).init(ally);
                     defer seen.deinit();
-                    for (0..plan.or_branch_count) |i| {
-                        const bp = &plan.or_branches[i];
+                    for (0..plan.logical_branch_count) |i| {
+                        const bp = &plan.logical_branches[i];
                         self.bindIndex(bp.index);
                         var iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
                         while (true) {
@@ -3971,21 +3958,62 @@ pub const Bucket = struct {
                     return;
                 }
 
+                if (plan.index_strategy == .nor_exclusion) {
+                    var excluded = std.AutoHashMap(u128, void).init(ally);
+                    defer excluded.deinit();
+
+                    for (0..plan.logical_branch_count) |i| {
+                        const bp = &plan.logical_branches[i];
+                        self.bindIndex(bp.index);
+                        var branch_iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
+                        while (true) {
+                            const maybe_loc = branch_iter.next() catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.ScanError,
+                            };
+                            const loc = maybe_loc orelse break;
+                            try excluded.put(docLocationKey(loc), {});
+                        }
+                    }
+
+                    var iterator = self.initIndexIterator(plan) catch return error.ScanError;
+                    while (true) {
+                        const maybe_loc = iterator.next() catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return error.ScanError,
+                        };
+                        const loc = maybe_loc orelse break;
+                        if (excluded.contains(docLocationKey(loc))) continue;
+
+                        const doc = self.readDocAt(ally, .{
+                            .page_id = loc.pageId,
+                            .offset = loc.offset,
+                        }) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.DocumentDeleted => continue,
+                            else => return error.ScanError,
+                        };
+
+                        if (q.filters.len == 0 or q.match(&doc)) {
+                            try targets.append(ally, .{
+                                .page_id = loc.pageId,
+                                .offset = loc.offset,
+                            });
+                        }
+                    }
+                    return;
+                }
+
                 const index_ptr = plan.index orelse return error.ScanError;
                 self.bindIndex(index_ptr);
 
-                if (Bucket.planUsesPointStrategy(plan, q.filters)) {
-                    const filter_index = plan.filter_index orelse return error.ScanError;
-                    const filter = q.filters[filter_index];
-                    const in_filter = switch (filter) {
-                        .in => |value| value,
-                        else => return error.ScanError,
-                    };
+                if (Bucket.planUsesPointStrategy(plan)) {
+                    const in_values = plan.point_values orelse return error.ScanError;
 
                     var seen = std.AutoHashMap(u128, void).init(ally);
                     defer seen.deinit();
 
-                    var value_iter = in_filter.value.array.iter();
+                    var value_iter = in_values.array.iter();
                     while (value_iter.next()) |pair| {
                         if (!isIndexableValue(pair.value)) continue;
 
@@ -5766,6 +5794,94 @@ test "Bucket.indexed query in uses points" {
     try testing.expect(seen_alice and seen_bob);
 }
 
+test "Bucket.explicit $and query uses range planning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-explicit-and-range.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-explicit-and-range.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-explicit-and-range.bucket") catch {};
+
+    var qdoc = try bson.fmt.serialize(.{
+        .query = .{
+            .@"$and" = .{
+                .{ .age = .{ .@"$gte" = 35 } },
+                .{ .age = .{ .@"$lte" = 40 } },
+            },
+        },
+    }, allocator);
+    defer qdoc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.range);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+    try testing.expect(plan.bounds.lower != null);
+    try testing.expect(plan.bounds.upper != null);
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var seen_bob = false;
+    var seen_dora = false;
+    var count: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        const name = doc.get("name").?.string.value;
+        if (std.mem.eql(u8, name, "Bob")) {
+            seen_bob = true;
+        } else if (std.mem.eql(u8, name, "Dora")) {
+            seen_dora = true;
+        } else {
+            try testing.expect(false);
+        }
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(seen_bob and seen_dora);
+}
+
+test "Bucket.explicit $and query uses points planning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-explicit-and-points.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-explicit-and-points.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-explicit-and-points.bucket") catch {};
+
+    var qdoc = try bson.fmt.serialize(.{
+        .query = .{
+            .@"$and" = .{
+                .{ .age = .{ .@"$in" = [_]i32{ 30, 40 } } },
+                .{ .name = .{ .@"$ne" = "Bob" } },
+            },
+        },
+    }, allocator);
+    defer qdoc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.points);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "age"));
+
+    var iter = try bucket.listIterate(&arena, q);
+    defer iter.deinit() catch {};
+    var count: usize = 0;
+    while (try iter.next(iter)) |doc| {
+        try testing.expectEqualStrings("Alice", doc.get("name").?.string.value);
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
 test "Bucket.indexed query between uses range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5804,6 +5920,55 @@ test "Bucket.indexed query between uses range" {
     }
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expect(seen_alice and seen_dora);
+}
+
+test "Bucket.indexed query $nor uses exclusion planning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    platform.deleteFile("index-query-nor.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "index-query-nor.bucket");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+    defer platform.deleteFile("index-query-nor.bucket") catch {};
+
+    var qdoc = try bson.fmt.serialize(.{
+        .query = .{
+            .@"$nor" = .{
+                .{ .age = 30 },
+                .{ .age = 40 },
+            },
+        },
+    }, allocator);
+    defer qdoc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.source == .index);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.nor_exclusion);
+    try testing.expect(plan.eager);
+    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "_id"));
+
+    var docs: std.ArrayList(BSONDocument) = .{};
+    defer docs.deinit(allocator);
+    try bucket.collectDocs(&docs, allocator, &q, &plan);
+
+    var seen_carol = false;
+    var seen_dora = false;
+    for (docs.items) |doc| {
+        const name = doc.get("name").?.string.value;
+        if (std.mem.eql(u8, name, "Carol")) {
+            seen_carol = true;
+        } else if (std.mem.eql(u8, name, "Dora")) {
+            seen_dora = true;
+        } else {
+            try testing.expect(false);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), docs.items.len);
+    try testing.expect(seen_carol and seen_dora);
 }
 
 test "Bucket.indexed query in scores avoids duplicates" {
