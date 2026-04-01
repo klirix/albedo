@@ -2452,12 +2452,23 @@ pub const Bucket = struct {
         const IndexStrategy = enum {
             range,
             points,
+            /// All branches of a `$or` filter are covered by indexes.
+            /// `or_branches[0..or_branch_count]` holds one index + bounds per branch.
+            or_union,
         };
 
         const IndexBounds = struct {
             lower: ?Index.RangeBound = null,
             upper: ?Index.RangeBound = null,
         };
+
+        /// Per-branch plan used by the `or_union` strategy.
+        const OrBranchPlan = struct {
+            index: *Index,
+            bounds: IndexBounds,
+        };
+
+        const MAX_OR_BRANCHES = 32;
 
         source: Source = .full_scan,
         index: ?*Index = null,
@@ -2467,6 +2478,8 @@ pub const Bucket = struct {
         eager: bool = false,
         sort_covered: bool = false,
         index_strategy: IndexStrategy = .range,
+        or_branches: [MAX_OR_BRANCHES]OrBranchPlan = undefined,
+        or_branch_count: u8 = 0,
     };
 
     inline fn planUsesPointStrategy(plan: *const QueryPlan, filters: []const query.Filter) bool {
@@ -2541,6 +2554,11 @@ pub const Bucket = struct {
         point_last_location: u128 = 0, // For check_last strategy
         point_seen_set: std.AutoHashMap(u128, void) = undefined,
         point_seen_initialized: bool = false,
+        // $or union index scan state
+        or_iterators: []Index.RangeIterator = &[_]Index.RangeIterator{},
+        or_iterator_idx: usize = 0,
+        or_seen_set: std.AutoHashMap(u128, void) = undefined,
+        or_seen_initialized: bool = false,
         limitLeft: ?u64 = null,
         offsetLeft: u64 = 0,
         last_emitted: ?query.CursorAnchor = null,
@@ -2796,6 +2814,71 @@ pub const Bucket = struct {
             return user_id.eql(&anchor.user_id);
         }
 
+        fn nextOrUnionRecord(self: *ListIterator) error{ OutOfMemory, ScanError }!?ListRecord {
+            if (self.limitLeft != null and self.limitLeft.? == 0) return null;
+            const ally = self.ally;
+
+            if (!self.or_seen_initialized) {
+                self.or_seen_set = std.AutoHashMap(u128, void).init(ally);
+                self.or_seen_initialized = true;
+            }
+
+            while (self.or_iterator_idx < self.or_iterators.len) {
+                const iter = &self.or_iterators[self.or_iterator_idx];
+                const maybe_loc = iter.next() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ScanError,
+                };
+                const loc = maybe_loc orelse {
+                    // This branch is exhausted; move to the next.
+                    self.or_iterator_idx += 1;
+                    continue;
+                };
+
+                const key = docLocationKey(loc);
+                if (self.or_seen_set.contains(key)) continue;
+                try self.or_seen_set.put(key, {});
+
+                var doc = self.bucket.readDocAt(ally, .{
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DocumentDeleted => continue,
+                    else => return error.ScanError,
+                };
+
+                if (!(self.query.filters.len == 0 or self.query.match(&doc))) continue;
+
+                if (self.offsetLeft != 0) {
+                    self.offsetLeft -= 1;
+                    continue;
+                }
+
+                if (self.limitLeft) |*limit| {
+                    if (limit.* == 0) return null;
+                    limit.* -= 1;
+                }
+
+                const header = self.bucket.readDocHeaderAt(.{
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DocumentDeleted => continue,
+                    else => return error.ScanError,
+                };
+
+                return .{
+                    .doc = doc,
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                    .doc_id = ObjectId.fromInt(header.doc_id),
+                };
+            }
+            return null;
+        }
+
         fn resumeFullScanFromPhysicalAnchor(self: *ListIterator, anchor: *const query.CursorAnchor) error{ OutOfMemory, ScanError }!bool {
             const header = self.bucket.readDocHeaderAt(.{
                 .page_id = anchor.page_id,
@@ -2869,6 +2952,8 @@ pub const Bucket = struct {
                 .full_scan => "full_scan",
                 .index => if (Bucket.planUsesPointStrategy(&self.plan, self.query.filters))
                     return error.UnsupportedCursorQuery
+                else if (self.plan.index_strategy == .or_union)
+                    return error.UnsupportedCursorQuery
                 else
                     "index_range",
             };
@@ -2920,6 +3005,8 @@ pub const Bucket = struct {
             const use_points = Bucket.planUsesPointStrategy(&self.plan, self.query.filters);
             const record = if (use_points)
                 try self.nextPointIndexRecord()
+            else if (self.plan.index_strategy == .or_union)
+                try self.nextOrUnionRecord()
             else
                 try self.nextIndexRangeRecord();
             const final_record = record orelse return null;
@@ -2944,8 +3031,84 @@ pub const Bucket = struct {
             if (self.point_value_total > 0) {
                 self.point_values.deinit(self.arena.allocator());
             }
+            if (self.or_seen_initialized) {
+                self.or_seen_set.deinit();
+            }
         }
     };
+
+    /// Returns the best single-index plan for a filter group (one $or branch).
+    /// Returns null if no filter in the group maps to an existing index.
+    fn planBestBranchFilter(self: *Bucket, group: query.FilterGroup) ?QueryPlan.OrBranchPlan {
+        var best_score: u8 = 0;
+        var best: ?QueryPlan.OrBranchPlan = null;
+
+        for (group) |filter| {
+            const result: struct { score: u8, plan: QueryPlan.OrBranchPlan } = switch (filter) {
+                .eq => |data| blk: {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    break :blk .{
+                        .score = 100,
+                        .plan = .{ .index = index_ptr, .bounds = .{
+                            .lower = Index.RangeBound.gte(data.value),
+                            .upper = Index.RangeBound.lte(data.value),
+                        } },
+                    };
+                },
+                .between => |data| blk: {
+                    if (data.value != .array) continue;
+                    const lo = data.value.array.get("0") orelse continue;
+                    const hi = data.value.array.get("1") orelse continue;
+                    if (!isIndexableValue(lo) or !isIndexableValue(hi)) continue;
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    break :blk .{
+                        .score = 85,
+                        .plan = .{ .index = index_ptr, .bounds = .{
+                            .lower = Index.RangeBound.gt(lo),
+                            .upper = Index.RangeBound.lt(hi),
+                        } },
+                    };
+                },
+                .lt => |data| blk: {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
+                        .upper = Index.RangeBound.lt(data.value),
+                    } } };
+                },
+                .lte => |data| blk: {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
+                        .upper = Index.RangeBound.lte(data.value),
+                    } } };
+                },
+                .gt => |data| blk: {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
+                        .lower = Index.RangeBound.gt(data.value),
+                    } } };
+                },
+                .gte => |data| blk: {
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    break :blk .{ .score = 80, .plan = .{ .index = index_ptr, .bounds = .{
+                        .lower = Index.RangeBound.gte(data.value),
+                    } } };
+                },
+                .startsWith => |data| blk: {
+                    if (data.value != .string or !isIndexableValue(data.value)) continue;
+                    const index_ptr = self.indexes.get(data.path) orelse continue;
+                    break :blk .{ .score = 70, .plan = .{ .index = index_ptr, .bounds = .{
+                        .lower = Index.RangeBound.gte(data.value),
+                    } } };
+                },
+                else => continue,
+            };
+            if (result.score > best_score) {
+                best_score = result.score;
+                best = result.plan;
+            }
+        }
+        return best;
+    }
 
     fn planQuery(self: *Bucket, q: *const query.Query) QueryPlan {
         var plan = QueryPlan{};
@@ -3152,6 +3315,33 @@ pub const Bucket = struct {
                 .endsWith => |_| {
                     // No indexable strategy for suffix matching.
                 },
+                .@"or" => |groups| {
+                    if (groups.len == 0 or groups.len > QueryPlan.MAX_OR_BRANCHES) continue;
+                    // All branches must have at least one filter covered by an index.
+                    var branch_plans: [QueryPlan.MAX_OR_BRANCHES]QueryPlan.OrBranchPlan = undefined;
+                    var all_indexable = true;
+                    for (groups, 0..) |group, branch_idx| {
+                        const bp = self.planBestBranchFilter(group) orelse {
+                            all_indexable = false;
+                            break;
+                        };
+                        branch_plans[branch_idx] = bp;
+                    }
+                    if (!all_indexable) continue;
+                    const score: u8 = 60;
+                    if (score > best_score) {
+                        best_score = score;
+                        plan.source = .index;
+                        plan.index = null;
+                        plan.filter_index = idx;
+                        plan.index_path = null;
+                        plan.bounds = .{};
+                        plan.sort_covered = false;
+                        plan.index_strategy = .or_union;
+                        plan.or_branch_count = @intCast(groups.len);
+                        for (0..groups.len) |i| plan.or_branches[i] = branch_plans[i];
+                    }
+                },
                 else => {},
             }
         }
@@ -3224,6 +3414,10 @@ pub const Bucket = struct {
             return error.UnsupportedCursorQuery;
         }
 
+        if (plan.source == .index and plan.index_strategy == .or_union) {
+            return error.UnsupportedCursorQuery;
+        }
+
         switch (cursor.mode) {
             .full_scan => {
                 if (plan.source != .full_scan) return error.InvalidCursor;
@@ -3268,6 +3462,40 @@ pub const Bucket = struct {
                 }
             },
             .index => {
+                if (plan.index_strategy == .or_union) {
+                    var seen = std.AutoHashMap(u128, void).init(ally);
+                    defer seen.deinit();
+                    for (0..plan.or_branch_count) |i| {
+                        const bp = &plan.or_branches[i];
+                        self.bindIndex(bp.index);
+                        var iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
+                        while (true) {
+                            const maybe_loc = iter.next() catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.ScanError,
+                            };
+                            const loc = maybe_loc orelse break;
+                            const key = docLocationKey(loc);
+                            if (seen.contains(key)) continue;
+                            try seen.put(key, {});
+                            var doc = self.readDocAt(ally, .{
+                                .page_id = loc.pageId,
+                                .offset = loc.offset,
+                            }) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                error.DocumentDeleted => continue,
+                                else => return error.ScanError,
+                            };
+                            if (q.filters.len == 0 or q.match(&doc)) {
+                                try docList.append(ally, doc);
+                            } else {
+                                ally.free(doc.buffer);
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 const index_ptr = plan.index orelse return error.ScanError;
                 self.bindIndex(index_ptr);
 
@@ -3598,6 +3826,10 @@ pub const Bucket = struct {
             .point_last_location = 0,
             .point_seen_set = undefined,
             .point_seen_initialized = false,
+            .or_iterators = &[_]Index.RangeIterator{},
+            .or_iterator_idx = 0,
+            .or_seen_set = undefined,
+            .or_seen_initialized = false,
             .limitLeft = null,
             .offsetLeft = 0,
             .index = 0,
@@ -3630,6 +3862,18 @@ pub const Bucket = struct {
                     }
                 },
                 else => {},
+            }
+        }
+
+        if (rc.plan.index_strategy == .or_union) {
+            // Allocate one range iterator per $or branch.
+            const branch_count = rc.plan.or_branch_count;
+            rc.or_iterators = try ally.alloc(Index.RangeIterator, branch_count);
+            for (0..branch_count) |i| {
+                const bp = &rc.plan.or_branches[i];
+                self.bindIndex(bp.index);
+                rc.or_iterators[i] = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch
+                    return error.ScanError;
             }
         }
 
@@ -3692,6 +3936,41 @@ pub const Bucket = struct {
                 }
             },
             .index => {
+                if (plan.index_strategy == .or_union) {
+                    var seen = std.AutoHashMap(u128, void).init(ally);
+                    defer seen.deinit();
+                    for (0..plan.or_branch_count) |i| {
+                        const bp = &plan.or_branches[i];
+                        self.bindIndex(bp.index);
+                        var iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
+                        while (true) {
+                            const maybe_loc = iter.next() catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.ScanError,
+                            };
+                            const loc = maybe_loc orelse break;
+                            const key = docLocationKey(loc);
+                            if (seen.contains(key)) continue;
+                            try seen.put(key, {});
+                            const doc = self.readDocAt(ally, .{
+                                .page_id = loc.pageId,
+                                .offset = loc.offset,
+                            }) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                error.DocumentDeleted => continue,
+                                else => return error.ScanError,
+                            };
+                            if (q.filters.len == 0 or q.match(&doc)) {
+                                try targets.append(ally, .{
+                                    .page_id = loc.pageId,
+                                    .offset = loc.offset,
+                                });
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 const index_ptr = plan.index orelse return error.ScanError;
                 self.bindIndex(index_ptr);
 
@@ -6718,4 +6997,53 @@ test "subscription: seqno is monotonically increasing" {
         try testing.expect(seqno.int64.value > prev_seqno);
         prev_seqno = seqno.int64.value;
     }
+}
+
+test "$or index union: uses index scan when all branches are covered" {
+    const allocator = testing.allocator;
+
+    var bucket = try Bucket.init(allocator, ":memory:");
+    defer bucket.deinit();
+
+    // Create indexes on "role" and "public".
+    try bucket.ensureIndex("role", .{});
+    try bucket.ensureIndex("public", .{});
+
+    // Insert four documents.
+    const doc_admin = try bson.fmt.serialize(.{ .role = "admin", .public = false }, allocator);
+    defer doc_admin.deinit(allocator);
+    _ = try bucket.insert(doc_admin);
+
+    const doc_public = try bson.fmt.serialize(.{ .role = "user", .public = true }, allocator);
+    defer doc_public.deinit(allocator);
+    _ = try bucket.insert(doc_public);
+
+    const doc_neither = try bson.fmt.serialize(.{ .role = "user", .public = false }, allocator);
+    defer doc_neither.deinit(allocator);
+    _ = try bucket.insert(doc_neither);
+
+    const doc_both = try bson.fmt.serialize(.{ .role = "admin", .public = true }, allocator);
+    defer doc_both.deinit(allocator);
+    _ = try bucket.insert(doc_both);
+
+    // Query: { "$or": [{"role": "admin"}, {"public": true}] }
+    // Should match doc_admin, doc_public, and doc_both (3 documents).
+    const filter_doc = try bson.fmt.serialize(.{
+        .query = .{
+            .@"$or" = .{ .{ .role = "admin" }, .{ .public = true } },
+        },
+    }, allocator);
+    defer filter_doc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, filter_doc);
+    defer q.deinit(allocator);
+
+    // Use an arena for list results; doc.buffer slices point into the page cache
+    // and must not be individually freed.
+    var result_arena = std.heap.ArenaAllocator.init(allocator);
+    defer result_arena.deinit();
+
+    const results = try bucket.list(result_arena.allocator(), q);
+    // Three documents match: admin-not-public, user-public, admin-public.
+    try testing.expectEqual(@as(usize, 3), results.len);
 }

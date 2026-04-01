@@ -195,6 +195,274 @@ to `albedo_open_with_options` in C).
 
 ---
 
+---
+
+## Query Language
+
+Albedo queries are BSON documents with up to four sections:
+
+1. **`query`** — filter expressions that match documents
+2. **`sort`** — order results by a single field (asc or desc)
+3. **`sector`** — pagination (offset and limit)
+4. **`cursor`** — resume a stream from a saved checkpoint (see [Streaming Cursors](#streaming-cursors))
+
+### Full query structure
+
+```bson
+{
+  "query": {
+    <filter expressions>
+  },
+  "sort": {
+    "asc": "field.path" | "desc": "field.path"
+  },
+  "sector": {
+    "offset": <int>,
+    "limit": <int>
+  },
+  "cursor": {
+    <cursor state from a previous query>
+  }
+}
+```
+
+All sections are **optional**. An empty document `{}` returns all documents.
+
+### Filter operators
+
+Filters are written in the `"query"` section as `"field.path": { "$operator": value }` or as logical operators (`$or`, `$and`, `$nor`).
+
+#### Comparison operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$eq` | equality | `{ "status": { "$eq": "active" } }` | status == "active" |
+| `$ne` | not equal | `{ "age": { "$ne": 30 } }` | age ≠ 30 |
+| `$lt` | less than | `{ "score": { "$lt": 100 } }` | score < 100 |
+| `$lte` | less than or equal | `{ "score": { "$lte": 100 } }` | score ≤ 100 |
+| `$gt` | greater than | `{ "count": { "$gt": 5 } }` | count > 5 |
+| `$gte` | greater than or equal | `{ "count": { "$gte": 5 } }` | count ≥ 5 |
+
+**Notes:**
+- Comparisons use BSON type ordering: null < numbers < strings < documents < arrays < binary < objectId < boolean < datetime < maxKey.
+- Cross-type comparisons follow this order; e.g., `{ "$lt": 100 }` will match null, other numbers, strings, etc.
+
+#### Array and range operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$in` | array contains | `{ "status": { "$in": ["active", "pending"] } }` | status ∈ {active, pending} |
+| `$between` | range | `{ "age": { "$between": [18, 65] } }` | 18 < age < 65 (exclusive) |
+
+**Notes:**
+- `$in` accepts any BSON array and performs deduplication; can match multiple values per document if the field is an array.
+- `$between` expects an array of exactly 2 elements `[lower, upper]`; the range is strictly exclusive (> lower and < upper).
+
+#### String operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$startsWith` | prefix | `{ "name": { "$startsWith": "Jo" } }` | name starts with "Jo" |
+| `$endsWith` | suffix | `{ "domain": { "$endsWith": ".com" } }` | domain ends with ".com" |
+
+**Notes:**
+- Only work on string fields; other types do not match.
+- Case-sensitive.
+
+#### Existence operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$exists` | field present | `{ "thumbnail": { "$exists": true } }` | field "thumbnail" exists (any value) |
+| `$notExists` | field absent | `{ "deleted_at": { "$notExists": true } }` | field "deleted_at" does not exist |
+
+**Notes:**
+- The value (`true` / `false`) is accepted but ignored; the meaning is determined by the operator name.
+
+### Logical operators
+
+Combine multiple filter groups with `$or`, `$and`, and `$nor`. Each group is an object with one or more field filters.
+
+#### `$or` — At least one group matches
+
+```bson
+{
+  "$or": [
+    { "role": "admin" },
+    { "public": true },
+    { "owner_id": ObjectId("...") }
+  ]
+}
+```
+
+Matches if **any** group matches (inclusive OR). Indexes are used if all branches are covered.
+
+#### `$and` — All groups must match
+
+```bson
+{
+  "$and": [
+    { "age": { "$gte": 18 } },
+    { "status": "active" },
+    { "verified": true }
+  ]
+}
+```
+
+All filters in all groups must match. Useful for explicit grouping when combining with other logical operators.
+
+#### `$nor` — No group matches
+
+```bson
+{
+  "$nor": [
+    { "spam": true },
+    { "deleted": true }
+  ]
+}
+```
+
+Matches if **no** group matches. Internally performs a full scan; no index optimization.
+
+#### Mixed logical operators
+
+You can combine logical operators:
+
+```bson
+{
+  "$or": [
+    { "role": "admin" },
+    {
+      "$and": [
+        { "status": "active" },
+        { "verified": true }
+      ]
+    }
+  ]
+}
+```
+
+This example matches: (role is "admin") OR (status is "active" AND verified is true).
+
+#### Leaf filters alongside logical operators
+
+Leaf filters (simple field filters) are AND-ed with logical operator results:
+
+```bson
+{
+  "$or": [
+    { "role": "admin" },
+    { "public": true }
+  ],
+  "deleted": false
+}
+```
+
+Matches: (role is "admin" OR public is true) AND deleted is false.
+
+### Sorting
+
+Specify a sort order with the `"sort"` section:
+
+```bson
+{
+  "query": { "status": "active" },
+  "sort": { "asc": "created_at" }
+}
+```
+
+- `"asc"` sorts ascending (lowest first).
+- `"desc"` sorts descending (highest first).
+- Only **one field** can be sorted.
+- If an index exists on the sorted field and the query fully uses that index, sorting is **covered** (no additional cost).
+
+**Example:** If you have an index on `"age"` and query `{ "query": { "age": { "$gte": 18 } }, "sort": { "asc": "age" } }`, the index provides both the query and the sort.
+
+### Pagination (sector)
+
+Use `"sector"` to paginate results:
+
+```bson
+{
+  "query": { "status": "active" },
+  "sector": { "offset": 20, "limit": 10 }
+}
+```
+
+- `offset` — number of documents to skip (default 0).
+- `limit` — maximum documents to return (default no limit).
+
+Both are optional. Without them, all matching documents are returned.
+
+**Note:** Sector is applied **after** the query and sort, so offset + limit works on the final sorted result set.
+
+### Query planning and index use
+
+Albedo's query planner automatically selects the best query strategy:
+
+1. **Full scan** — if no indexed filter applies
+2. **Index range** — if a single field is indexed and a range operator applies (`$lt`, `$lte`, `$gt`, `$gte`, `$eq`, `$between`, `$startsWith`)
+3. **Index point** — if a single field is indexed and `$in` is used (matches discrete values)
+4. **Index union** — if a `$or` query has multiple branches and **all branches are covered by indexes** (one index per branch minimum)
+
+**Score-based planning:** When multiple filters apply, the planner scores strategies and picks the highest score:
+
+- `$eq`: 100 (exact match is best)
+- `$in`: 95 (finite set of values)
+- `$between`: 85
+- `$lt`, `$lte`, `$gt`, `$gte`: 80
+- `$startsWith`: 70
+- `$or` union: 60 (multiple index lookups + dedup)
+- Full scan: 0 (fallback)
+
+If the top-scoring strategy doesn't cover the sort, the planner sets `eager = true`, materializing all results before sorting.
+
+### Example queries
+
+**Simple equality:**
+```bson
+{ "query": { "email": "alice@example.com" } }
+```
+
+**Range with sort and pagination:**
+```bson
+{
+  "query": { "age": { "$gte": 18, "$lte": 65 } },
+  "sort": { "desc": "created_at" },
+  "sector": { "offset": 0, "limit": 50 }
+}
+```
+
+**Complex filter with OR:**
+```bson
+{
+  "query": {
+    "$or": [
+      { "role": "admin" },
+      { "owner_id": ObjectId("507f1f77bcf86cd799439011") }
+    ],
+    "deleted": false
+  },
+  "sort": { "asc": "name" }
+}
+```
+
+**Nested field query:**
+```bson
+{
+  "query": { "profile.bio": { "$startsWith": "Senior" } }
+}
+```
+
+**Array field with $in:**
+```bson
+{
+  "query": { "tags": { "$in": ["urgent", "blocked"] } }
+}
+```
+
+---
+
 ## Streaming Queries
 
 `albedo_list` can be used as a document stream even without cursors. Open a

@@ -19,7 +19,10 @@ const Allocator = std.mem.Allocator;
 
 const Path = [][]const u8; // "field.subfield".split('.')
 
-pub const FilterType = enum { eq, ne, lt, lte, gt, gte, in, between, startsWith, endsWith, exists, notExists };
+pub const FilterType = enum { eq, ne, lt, lte, gt, gte, in, between, startsWith, endsWith, exists, notExists, @"or", @"and", nor };
+
+/// A group of filters that are AND-ed together (used inside logical operators).
+pub const FilterGroup = []Filter;
 
 pub const PathValuePair = struct {
     path: []const u8,
@@ -58,6 +61,12 @@ pub const Filter = union(FilterType) {
     endsWith: PathValuePair,
     exists: PathValuePair,
     notExists: PathValuePair,
+    /// At least one group must match.
+    @"or": []FilterGroup,
+    /// All groups must match (explicit AND for grouping/composability).
+    @"and": []FilterGroup,
+    /// No group must match.
+    nor: []FilterGroup,
 
     pub fn deinit(self: *Filter, ally: Allocator) void {
         switch (self.*) {
@@ -69,6 +78,13 @@ pub const Filter = union(FilterType) {
             },
             .eq, .ne, .lt, .gt, .lte, .gte, .startsWith, .endsWith, .exists, .notExists => |*filter| {
                 ally.free(filter.path);
+            },
+            .@"or", .@"and", .nor => |groups| {
+                for (groups) |group| {
+                    for (group) |*f| f.deinit(ally);
+                    ally.free(group);
+                }
+                ally.free(groups);
             },
         }
     }
@@ -100,6 +116,11 @@ pub const Filter = union(FilterType) {
             .{ "$exists", .exists },
             .{ "$notExists", .notExists },
         });
+        const logicalOpMap = comptime std.StaticStringMap(FilterType).initComptime(.{
+            .{ "$or", .@"or" },
+            .{ "$and", .@"and" },
+            .{ "$nor", .nor },
+        });
         var filters = std.ArrayListUnmanaged(Filter){};
         defer filters.deinit(ally);
 
@@ -107,6 +128,38 @@ pub const Filter = union(FilterType) {
         while (iter.next()) |pair| {
             const path = pair.key;
             if (path.len == 0) return FilterParsingErrors.InvalidQueryPath;
+
+            // Handle logical operators ($or, $and, $nor) at the top level.
+            if (logicalOpMap.get(path)) |logical_op| {
+                // Accept both BSON array and document (tuple-style) values.
+                const groups_doc: bson.BSONDocument = switch (pair.value) {
+                    .array => |arr| arr,
+                    .document => |d| d,
+                    else => return FilterParsingErrors.InvalidQueryFilter,
+                };
+                var group_list = std.ArrayListUnmanaged(FilterGroup){};
+                defer group_list.deinit(ally);
+                var arr_iter = groups_doc.iter();
+                while (arr_iter.next()) |arr_pair| {
+                    if (arr_pair.value != .document) return FilterParsingErrors.InvalidQueryFilter;
+                    const group = try parseDoc(ally, arr_pair.value.document);
+                    errdefer {
+                        const g = group;
+                        for (g) |*f| f.deinit(ally);
+                        ally.free(g);
+                    }
+                    try group_list.append(ally, group);
+                }
+                const groups = try group_list.toOwnedSlice(ally);
+                const filter = switch (logical_op) {
+                    .@"or" => Filter{ .@"or" = groups },
+                    .@"and" => Filter{ .@"and" = groups },
+                    .nor => Filter{ .nor = groups },
+                    else => unreachable,
+                };
+                try filters.append(ally, filter);
+                continue;
+            }
 
             switch (pair.value) {
                 .document => |*operatorDoc| {
@@ -130,6 +183,7 @@ pub const Filter = union(FilterType) {
                                 errdefer ally.free(path_copy);
                                 try filters.append(ally, .{ .between = .{ .path = path_copy, .value = operand } });
                             },
+                            .@"or", .@"and", .nor => return FilterParsingErrors.InvalidQueryOperator,
                         }
                         matched = true;
                     }
@@ -207,10 +261,46 @@ pub const Filter = union(FilterType) {
             .notExists => |_| {
                 return false;
             },
+            .@"or", .@"and", .nor => unreachable,
         }
     }
 
     pub fn match(self: *const Filter, doc: *const bson.BSONDocument) bool {
+        switch (self.*) {
+            .@"or" => |groups| {
+                for (groups) |group| {
+                    const group_matches = blk: {
+                        for (group) |*f| {
+                            if (!f.match(doc)) break :blk false;
+                        }
+                        break :blk true;
+                    };
+                    if (group_matches) return true;
+                }
+                return false;
+            },
+            .@"and" => |groups| {
+                for (groups) |group| {
+                    for (group) |*f| {
+                        if (!f.match(doc)) return false;
+                    }
+                }
+                return true;
+            },
+            .nor => |groups| {
+                for (groups) |group| {
+                    const group_matches = blk: {
+                        for (group) |*f| {
+                            if (!f.match(doc)) break :blk false;
+                        }
+                        break :blk true;
+                    };
+                    if (group_matches) return false;
+                }
+                return true;
+            },
+            else => {},
+        }
         const valueToMatch = switch (self.*) {
             .notExists => |e| blk: {
                 // For notExists, return true if field doesn't exist, false if it exists
@@ -219,6 +309,7 @@ pub const Filter = union(FilterType) {
             inline .eq, .ne, .lt, .lte, .gte, .gt, .in, .between, .startsWith, .endsWith, .exists => |e| blk: {
                 break :blk doc.getPath(e.path) orelse return false;
             },
+            .@"or", .@"and", .nor => unreachable,
         };
         return matchValue(self, valueToMatch);
     }
@@ -1004,4 +1095,107 @@ test "Query.match matches objectId correctly" {
     try std.testing.expect(query.match(&doc));
     try std.testing.expect(!query.match(&doc2));
     defer query.deinit(ally);
+}
+
+test "Filter.parse handles $or at top level" {
+    const ally = std.testing.allocator;
+    // { "$or": [{"role": "admin"}, {"public": true}] }
+    const filterDoc = try bson.fmt.serialize(.{
+        .@"$or" = .{ .{ .role = "admin" }, .{ .public = true } },
+    }, ally);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    switch (filters[0]) {
+        .@"or" => |groups| {
+            try std.testing.expectEqual(@as(usize, 2), groups.len);
+            try std.testing.expectEqual(@as(usize, 1), groups[0].len);
+            try std.testing.expectEqual(@as(usize, 1), groups[1].len);
+        },
+        else => return error.UnexpectedFilterType,
+    }
+}
+
+test "Filter.match $or returns true when any group matches" {
+    const ally = std.testing.allocator;
+    const filterDoc = try bson.fmt.serialize(.{
+        .@"$or" = .{ .{ .role = "admin" }, .{ .public = true } },
+    }, ally);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+
+    const adminDoc = try bson.fmt.serialize(.{ .role = "admin", .public = false }, ally);
+    defer adminDoc.deinit(ally);
+    try std.testing.expect(filters[0].match(&adminDoc));
+
+    const publicDoc = try bson.fmt.serialize(.{ .role = "user", .public = true }, ally);
+    defer publicDoc.deinit(ally);
+    try std.testing.expect(filters[0].match(&publicDoc));
+
+    const neitherDoc = try bson.fmt.serialize(.{ .role = "user", .public = false }, ally);
+    defer neitherDoc.deinit(ally);
+    try std.testing.expect(!filters[0].match(&neitherDoc));
+}
+
+test "Filter.match $nor returns true when no group matches" {
+    const ally = std.testing.allocator;
+    const filterDoc = try bson.fmt.serialize(.{
+        .@"$nor" = .{ .{ .spam = true }, .{ .deleted = true } },
+    }, ally);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+
+    const cleanDoc = try bson.fmt.serialize(.{ .spam = false, .deleted = false }, ally);
+    defer cleanDoc.deinit(ally);
+    try std.testing.expect(filters[0].match(&cleanDoc));
+
+    const spamDoc = try bson.fmt.serialize(.{ .spam = true, .deleted = false }, ally);
+    defer spamDoc.deinit(ally);
+    try std.testing.expect(!filters[0].match(&spamDoc));
+}
+
+test "Filter.match $and with combined $or and leaf filter" {
+    const ally = std.testing.allocator;
+    // { "$or": [{"role": "admin"}, {"public": true}], "deleted": false }
+    const filterDoc = try bson.fmt.serialize(.{
+        .@"$or" = .{ .{ .role = "admin" }, .{ .public = true } },
+        .deleted = false,
+    }, ally);
+    defer filterDoc.deinit(ally);
+    const filters = try Filter.parse(ally, bson.BSONValue{ .document = filterDoc });
+    defer {
+        for (filters) |*f| f.deinit(ally);
+        ally.free(filters);
+    }
+    try std.testing.expectEqual(@as(usize, 2), filters.len);
+
+    // Admin, not deleted: matches both filters
+    const doc1 = try bson.fmt.serialize(.{ .role = "admin", .public = false, .deleted = false }, ally);
+    defer doc1.deinit(ally);
+    var match1 = true;
+    for (filters) |*f| {
+        if (!f.match(&doc1)) { match1 = false; break; }
+    }
+    try std.testing.expect(match1);
+
+    // Admin but deleted: fails the leaf filter
+    const doc2 = try bson.fmt.serialize(.{ .role = "admin", .public = false, .deleted = true }, ally);
+    defer doc2.deinit(ally);
+    var match2 = true;
+    for (filters) |*f| {
+        if (!f.match(&doc2)) { match2 = false; break; }
+    }
+    try std.testing.expect(!match2);
 }
