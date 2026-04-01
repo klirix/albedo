@@ -2731,7 +2731,6 @@ pub const Bucket = struct {
             },
             .nor => |groups| {
                 if (groups.len == 0 or groups.len > QueryPlan.MAX_LOGICAL_BRANCHES) return;
-                const id_index = self.indexes.get("_id") orelse return;
                 var branch_plans: [QueryPlan.MAX_LOGICAL_BRANCHES]QueryPlan.BranchPlan = undefined;
                 for (groups, 0..) |group, branch_idx| {
                     const bp = self.planBestBranchFilter(group) orelse return;
@@ -2741,9 +2740,9 @@ pub const Bucket = struct {
                 if (score > best_score.*) {
                     best_score.* = score;
                     plan.source = .index;
-                    plan.index = id_index;
+                    plan.index = null;
                     plan.filter_index = filter_index;
-                    plan.index_path = "_id";
+                    plan.index_path = null;
                     plan.bounds = .{};
                     plan.sort_covered = false;
                     plan.index_strategy = .nor_exclusion;
@@ -3346,6 +3345,34 @@ pub const Bucket = struct {
         ally.free(doc.buffer);
     }
 
+    fn collectExcludedDocIds(
+        self: *Bucket,
+        plan: *const QueryPlan,
+        excluded: *std.AutoHashMap(u128, void),
+    ) error{ OutOfMemory, ScanError }!void {
+        for (0..plan.logical_branch_count) |i| {
+            const bp = &plan.logical_branches[i];
+            self.bindIndex(bp.index);
+            var branch_iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
+            while (true) {
+                const maybe_loc = branch_iter.next() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ScanError,
+                };
+                const loc = maybe_loc orelse break;
+                const header = self.readDocHeaderAt(.{
+                    .page_id = loc.pageId,
+                    .offset = loc.offset,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DocumentDeleted => continue,
+                    else => return error.ScanError,
+                };
+                try excluded.put(header.doc_id, {});
+            }
+        }
+    }
+
     fn validateCursorQuery(self: *Bucket, q: *const query.Query, plan: *const QueryPlan) error{ InvalidCursor, UnsupportedCursorQuery }!void {
         _ = self;
         const cursor = q.cursor orelse return;
@@ -3401,7 +3428,10 @@ pub const Bucket = struct {
                     if (q.filters.len == 0 or q.match(&doc)) {
                         try docList.append(ally, doc);
                     } else {
-                        ally.free(docRaw.data);
+                        self.releaseIndexedDocBuffer(ally, .{
+                            .page_id = docRaw.page_id,
+                            .offset = docRaw.offset,
+                        }, doc);
                     }
                 }
             },
@@ -3446,45 +3476,34 @@ pub const Bucket = struct {
                 if (plan.index_strategy == .nor_exclusion) {
                     var excluded = std.AutoHashMap(u128, void).init(ally);
                     defer excluded.deinit();
+                    try self.collectExcludedDocIds(plan, &excluded);
 
-                    for (0..plan.logical_branch_count) |i| {
-                        const bp = &plan.logical_branches[i];
-                        self.bindIndex(bp.index);
-                        var branch_iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
-                        while (true) {
-                            const maybe_loc = branch_iter.next() catch |err| switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => return error.ScanError,
-                            };
-                            const loc = maybe_loc orelse break;
-                            try excluded.put(docLocationKey(loc), {});
-                        }
-                    }
-
-                    var iterator = self.initIndexIterator(plan) catch return error.ScanError;
+                    var iterator = ScanIterator.init(self, ally) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.ScanError,
+                    };
+                    defer iterator.deinit();
                     while (true) {
-                        const maybe_loc = iterator.next() catch |err| switch (err) {
+                        const next_doc = iterator.next() catch |err| switch (err) {
                             error.OutOfMemory => return error.OutOfMemory,
                             else => return error.ScanError,
                         };
-                        const loc = maybe_loc orelse break;
-                        if (excluded.contains(docLocationKey(loc))) continue;
-
-                        var doc = self.readDocAt(ally, .{
-                            .page_id = loc.pageId,
-                            .offset = loc.offset,
-                        }) catch |err| switch (err) {
-                            error.OutOfMemory => return error.OutOfMemory,
-                            error.DocumentDeleted => continue,
-                            else => return error.ScanError,
-                        };
+                        const doc_raw = next_doc orelse break;
+                        if (excluded.contains(doc_raw.header.doc_id)) {
+                            self.releaseIndexedDocBuffer(ally, .{
+                                .page_id = doc_raw.page_id,
+                                .offset = doc_raw.offset,
+                            }, .{ .buffer = doc_raw.data });
+                            continue;
+                        }
+                        const doc: BSONDocument = .{ .buffer = doc_raw.data };
 
                         if (q.filters.len == 0 or q.match(&doc)) {
                             try docList.append(ally, doc);
                         } else {
                             self.releaseIndexedDocBuffer(ally, .{
-                                .page_id = loc.pageId,
-                                .offset = loc.offset,
+                                .page_id = doc_raw.page_id,
+                                .offset = doc_raw.offset,
                             }, doc);
                         }
                     }
@@ -3961,43 +3980,26 @@ pub const Bucket = struct {
                 if (plan.index_strategy == .nor_exclusion) {
                     var excluded = std.AutoHashMap(u128, void).init(ally);
                     defer excluded.deinit();
+                    try self.collectExcludedDocIds(plan, &excluded);
 
-                    for (0..plan.logical_branch_count) |i| {
-                        const bp = &plan.logical_branches[i];
-                        self.bindIndex(bp.index);
-                        var branch_iter = bp.index.range(bp.bounds.lower, bp.bounds.upper) catch return error.ScanError;
-                        while (true) {
-                            const maybe_loc = branch_iter.next() catch |err| switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => return error.ScanError,
-                            };
-                            const loc = maybe_loc orelse break;
-                            try excluded.put(docLocationKey(loc), {});
-                        }
-                    }
-
-                    var iterator = self.initIndexIterator(plan) catch return error.ScanError;
+                    var iterator = Bucket.ScanIterator.init(self, ally) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.ScanError,
+                    };
+                    defer iterator.deinit();
                     while (true) {
-                        const maybe_loc = iterator.next() catch |err| switch (err) {
+                        const maybe_doc = iterator.next() catch |err| switch (err) {
                             error.OutOfMemory => return error.OutOfMemory,
                             else => return error.ScanError,
                         };
-                        const loc = maybe_loc orelse break;
-                        if (excluded.contains(docLocationKey(loc))) continue;
-
-                        const doc = self.readDocAt(ally, .{
-                            .page_id = loc.pageId,
-                            .offset = loc.offset,
-                        }) catch |err| switch (err) {
-                            error.OutOfMemory => return error.OutOfMemory,
-                            error.DocumentDeleted => continue,
-                            else => return error.ScanError,
-                        };
+                        const doc_raw = maybe_doc orelse break;
+                        if (excluded.contains(doc_raw.header.doc_id)) continue;
+                        const doc = BSONDocument{ .buffer = doc_raw.data };
 
                         if (q.filters.len == 0 or q.match(&doc)) {
                             try targets.append(ally, .{
-                                .page_id = loc.pageId,
-                                .offset = loc.offset,
+                                .page_id = doc_raw.page_id,
+                                .offset = doc_raw.offset,
                             });
                         }
                     }
@@ -5949,7 +5951,54 @@ test "Bucket.indexed query $nor uses exclusion planning" {
     try testing.expect(plan.source == .index);
     try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.nor_exclusion);
     try testing.expect(plan.eager);
-    try testing.expect(plan.index_path != null and std.mem.eql(u8, plan.index_path.?, "_id"));
+    try testing.expect(plan.index_path == null);
+
+    var docs: std.ArrayList(BSONDocument) = .{};
+    defer docs.deinit(allocator);
+    try bucket.collectDocs(&docs, allocator, &q, &plan);
+
+    var seen_carol = false;
+    var seen_dora = false;
+    for (docs.items) |doc| {
+        const name = doc.get("name").?.string.value;
+        if (std.mem.eql(u8, name, "Carol")) {
+            seen_carol = true;
+        } else if (std.mem.eql(u8, name, "Dora")) {
+            seen_dora = true;
+        } else {
+            try testing.expect(false);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), docs.items.len);
+    try testing.expect(seen_carol and seen_dora);
+}
+
+test "Bucket.indexed query $nor still uses exclusion without _id index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    var bucket = try Bucket.init(allocator, ":memory:");
+    try setupIndexQueryBucket(&bucket, allocator);
+    defer bucket.deinit();
+
+    try bucket.dropIndex("_id");
+    try testing.expect(!bucket.indexes.contains("_id"));
+
+    var qdoc = try bson.fmt.serialize(.{
+        .query = .{
+            .@"$nor" = .{
+                .{ .age = 30 },
+                .{ .age = 40 },
+            },
+        },
+    }, allocator);
+    defer qdoc.deinit(allocator);
+
+    var q = try query.Query.parse(allocator, qdoc);
+    defer q.deinit(allocator);
+
+    const plan = bucket.planQuery(&q);
+    try testing.expect(plan.index_strategy == Bucket.QueryPlan.IndexStrategy.nor_exclusion);
 
     var docs: std.ArrayList(BSONDocument) = .{};
     defer docs.deinit(allocator);

@@ -333,10 +333,11 @@ Matches if **no** group matches.
 When **every** `$nor` branch is index-covered, Albedo uses an exclusion plan:
 
 1. scan each branch index to collect documents that must be rejected
-2. scan the canonical `_id` index
-3. return only documents not present in the exclusion set
+2. scan the bucket's data pages
+3. compare each candidate against the document header `doc_id`
+4. return only documents not present in the exclusion set
 
-This keeps `$nor` semantics correct, including sparse / missing-field cases, but it is currently **eager** (materialized before streaming) and does **not** support cursors.
+This is currently **eager** (materialized before streaming) and does **not** support cursors.
 
 #### Mixed logical operators
 
