@@ -1217,7 +1217,10 @@ test "Filter.match $and with combined $or and leaf filter" {
     defer doc1.deinit(ally);
     var match1 = true;
     for (filters) |*f| {
-        if (!f.match(&doc1)) { match1 = false; break; }
+        if (!f.match(&doc1)) {
+            match1 = false;
+            break;
+        }
     }
     try std.testing.expect(match1);
 
@@ -1226,7 +1229,10 @@ test "Filter.match $and with combined $or and leaf filter" {
     defer doc2.deinit(ally);
     var match2 = true;
     for (filters) |*f| {
-        if (!f.match(&doc2)) { match2 = false; break; }
+        if (!f.match(&doc2)) {
+            match2 = false;
+            break;
+        }
     }
     try std.testing.expect(!match2);
 }
