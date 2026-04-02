@@ -119,47 +119,18 @@ platform-specific notes and Android cross-compilation.
 
 ## Write-Ahead Log (WAL)
 
-On Linux and macOS, Albedo opens databases in WAL mode by default. Every page
-write is appended to a `<name>-wal` file instead of modifying the main DB file
-directly. A memory-mapped shared-memory index (`<name>-wal-shm`) lets multiple
-processes read the latest page versions without blocking each other.
+On Linux and macOS, Albedo opens databases in WAL mode by default. This provides:
 
-**What WAL gives you:**
+- **Crash recovery** — uncommitted data is replayed on the next open.
+- **MVCC reads** — readers see a consistent snapshot; writers never block readers.
+- **Live-tail streaming** — keep an iterator open to observe new documents as they are written, even across multiple processes.
+- **Better throughput** — writes don't require disk synchronization on every operation.
 
-- **Crash recovery** — uncommitted data in the WAL is replayed on the next open.
-- **MVCC reads** — readers always see a consistent snapshot; writers never block readers.
-- **Live-tail / document streaming** — a reader can keep a `listIterate` iterator open and call `next()` in a poll loop. When the iterator is exhausted it automatically refreshes from the WAL and picks up documents added by another connection.
-- **Throughput** — page writes bypass `fsync` by default (`.manual` write-durability mode), matching SQLite's `synchronous=NORMAL` in WAL mode.
+You can manually checkpoint the WAL (apply it to the main DB file and clear it) with `albedo_checkpoint` / `Bucket.checkpoint()`. This is useful to:
 
-The WAL is checkpointed (applied to the main DB file and deleted) automatically
-when the last connection closes. While any connection is open the WAL is kept
-alive so other readers can continue using it.
-
-### WAL checkpointing
-
-A checkpoint copies all committed WAL frames back into the main `.bucket` file,
-syncs the result, truncates the WAL back to its header, and bumps the shared
-checkpoint generation so other readers know to invalidate stale cached pages.
-
-You can trigger that explicitly with `albedo_checkpoint` / `Bucket.checkpoint()`.
-This is useful when you want to:
-
-- bound WAL file growth during a long-running process
-- force recent committed changes into the main DB file before handing the file
-  to another tool
-- leave the database in a compact, checkpointed state without waiting for the
-  last connection to close
-
-`albedo_flush` and `albedo_checkpoint` are different operations:
-
-- `albedo_flush` makes committed WAL writes durable on disk, but leaves them in
-  the WAL
-- `albedo_checkpoint` flushes pending WAL writes, applies them to the main DB
-  file, and clears the WAL
-
-Checkpointing is safe while readers are still open. Existing readers will
-notice the checkpoint generation change through the shared WAL index and refresh
-their cached pages as needed.
+- Bound WAL file growth during long-running processes
+- Compact the database before handing it to another tool
+- Leave the database in a clean state without waiting for all connections to close
 
 ---
 
@@ -170,28 +141,301 @@ to `albedo_open_with_options` in C).
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `wal` | `bool` | `true` | Enable the Write-Ahead Log. Disable only for read-heavy single-process workloads that do not need crash recovery or MVCC. |
-| `oplog_size` | `u32` | `4 MiB` | Size of the oplog circular ring buffer in bytes. `0` disables the oplog entirely (change-stream subscriptions will not work). Must match the value used when the SHM file was first created; a mismatch returns an error. Older SHM files (reserved bytes were zero) are seamlessly re-initialized. |
-| `write_durability` | see below | `.{ .periodic = 100 }` | Controls when `fsync` is called. |
-| `read_durability` | see below | `.shared` | Controls how page reads interact with the WAL. |
-| `auto_vaccuum` | `bool` | `true` | Automatically compact the database when deleted pages exceed live pages. |
-| `page_cache_capacity` | `usize` | `256` | Maximum number of pages held in the in-process LRU page cache. |
-| `mode` | `ReadOnly` / `ReadWrite` | `ReadWrite` | Open the file read-only or read-write. |
+| `wal` | `bool` | `true` | Enable the Write-Ahead Log. Disable only for single-process read-only workloads. |
+| `oplog_size` | `u32` | `4 MiB` | Size of the change-stream oplog buffer. Set to `0` to disable subscriptions. |
+| `write_durability` | see below | `.{ .periodic = 100 }` | Durability level for writes. |
+| `read_durability` | see below | `.shared` | Consistency level for reads. |
+| `auto_vaccuum` | `bool` | `true` | Automatically compact the database after deletions. |
+| `page_cache_capacity` | `usize` | `256` | Maximum cached pages in memory. |
+| `mode` | `ReadOnly` / `ReadWrite` | `ReadWrite` | Open read-only or read-write. |
 
 **Write-durability modes** (`write_durability`):
 
 | Mode | Behaviour |
 |------|-----------|
-| `.all` | `fsync` after every page write — safest, slowest |
-| `.{ .periodic = N }` | `fsync` every N page writes (default: 100) |
-| `.manual` | Never auto-`fsync`; call `albedo_flush` / `flush()` when you need a durability guarantee |
+| `.all` | Guarantee durability after every write (slowest) |
+| `.{ .periodic = N }` | Guarantee durability every N writes (default: 100) |
+| `.manual` | No automatic durability; call `albedo_flush()` when you need it (fastest) |
 
 **Read-durability modes** (`read_durability`):
 
 | Mode | Behaviour |
-|------|-----------|
-| `.shared` | Always consult the WAL before returning a cached page — safe for multi-process readers |
-| `.process` | Trust the local in-process cache; fall back to the WAL only on a cache miss — best performance for single-process workloads |
+|------|----------|
+| `.shared` | Always see the latest writes from other processes (safe for multi-process) |
+| `.process` | See local process writes immediately; other processes' writes may lag (faster for single-process) |
+
+---
+
+---
+
+## Query Language
+
+Albedo queries are BSON documents with up to four sections:
+
+1. **`query`** — filter expressions that match documents
+2. **`sort`** — order results by a single field (asc or desc)
+3. **`sector`** — pagination (offset and limit)
+4. **`cursor`** — resume a stream from a saved checkpoint (see [Streaming Cursors](#streaming-cursors))
+
+### Full query structure
+
+```bson
+{
+  "query": {
+    <filter expressions>
+  },
+  "sort": {
+    "asc": "field.path" | "desc": "field.path"
+  },
+  "sector": {
+    "offset": <int>,
+    "limit": <int>
+  },
+  "cursor": {
+    <cursor state from a previous query>
+  }
+}
+```
+
+All sections are **optional**. An empty document `{}` returns all documents.
+
+### Filter operators
+
+Filters are written in the `"query"` section as `"field.path": { "$operator": value }` or as logical operators (`$or`, `$and`, `$nor`).
+
+#### Comparison operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$eq` | equality | `{ "status": { "$eq": "active" } }` | status == "active" |
+| `$ne` | not equal | `{ "age": { "$ne": 30 } }` | age ≠ 30 |
+| `$lt` | less than | `{ "score": { "$lt": 100 } }` | score < 100 |
+| `$lte` | less than or equal | `{ "score": { "$lte": 100 } }` | score ≤ 100 |
+| `$gt` | greater than | `{ "count": { "$gt": 5 } }` | count > 5 |
+| `$gte` | greater than or equal | `{ "count": { "$gte": 5 } }` | count ≥ 5 |
+
+**Notes:**
+- Comparisons use BSON type ordering: null < numbers < strings < documents < arrays < binary < objectId < boolean < datetime < maxKey.
+- Cross-type comparisons follow this order; e.g., `{ "$lt": 100 }` will match null, other numbers, strings, etc.
+
+#### Array and range operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$in` | array contains | `{ "status": { "$in": ["active", "pending"] } }` | status ∈ {active, pending} |
+| `$between` | range | `{ "age": { "$between": [18, 65] } }` | 18 < age < 65 (exclusive) |
+
+**Notes:**
+- `$in` accepts any BSON array and performs deduplication; can match multiple values per document if the field is an array.
+- `$between` expects an array of exactly 2 elements `[lower, upper]`; the range is strictly exclusive (> lower and < upper).
+
+#### String operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$startsWith` | prefix | `{ "name": { "$startsWith": "Jo" } }` | name starts with "Jo" |
+| `$endsWith` | suffix | `{ "domain": { "$endsWith": ".com" } }` | domain ends with ".com" |
+
+**Notes:**
+- Only work on string fields; other types do not match.
+- Case-sensitive.
+
+#### Existence operators
+
+| Operator | Type | Example | Matches |
+|----------|------|---------|---------|
+| `$exists` | field present | `{ "thumbnail": { "$exists": true } }` | field "thumbnail" exists (any value) |
+| `$notExists` | field absent | `{ "deleted_at": { "$notExists": true } }` | field "deleted_at" does not exist |
+
+**Notes:**
+- The value (`true` / `false`) is accepted but ignored; the meaning is determined by the operator name.
+
+### Logical operators
+
+Combine multiple filter groups with `$or`, `$and`, and `$nor`. Each group is an object with one or more field filters.
+
+#### `$or` — At least one group matches
+
+```bson
+{
+  "$or": [
+    { "role": "admin" },
+    { "public": true },
+    { "owner_id": ObjectId("...") }
+  ]
+}
+```
+
+Matches if **any** group matches (inclusive OR). If every branch has at least one indexable predicate, Albedo uses an index-union plan and deduplicates overlapping matches.
+
+#### `$and` — All groups must match
+
+```bson
+{
+  "$and": [
+    { "age": { "$gte": 18 } },
+    { "status": "active" },
+    { "verified": true }
+  ]
+}
+```
+
+All filters in all groups must match. Useful for explicit grouping when combining with other logical operators.
+
+Explicit `$and` participates in planning just like top-level implicit AND:
+
+- inner indexed predicates can drive the scan
+- multiple range predicates on the same indexed field can tighten bounds
+- inner `$in` predicates can use the point strategy
+
+#### `$nor` — No group matches
+
+```bson
+{
+  "$nor": [
+    { "spam": true },
+    { "deleted": true }
+  ]
+}
+```
+
+Matches if **no** group matches.
+
+When **every** `$nor` branch is index-covered, Albedo uses an exclusion plan:
+
+1. scan each branch index to collect documents that must be rejected
+2. scan the bucket's data pages
+3. compare each candidate against the document header `doc_id`
+4. return only documents not present in the exclusion set
+
+This is currently **eager** (materialized before streaming) and does **not** support cursors.
+
+#### Mixed logical operators
+
+You can combine logical operators:
+
+```bson
+{
+  "$or": [
+    { "role": "admin" },
+    {
+      "$and": [
+        { "status": "active" },
+        { "verified": true }
+      ]
+    }
+  ]
+}
+```
+
+This example matches: (role is "admin") OR (status is "active" AND verified is true).
+
+#### Leaf filters alongside logical operators
+
+Leaf filters (simple field filters) are AND-ed with logical operator results:
+
+```bson
+{
+  "$or": [
+    { "role": "admin" },
+    { "public": true }
+  ],
+  "deleted": false
+}
+```
+
+Matches: (role is "admin" OR public is true) AND deleted is false.
+
+### Sorting
+
+Specify a sort order with the `"sort"` section:
+
+```bson
+{
+  "query": { "status": "active" },
+  "sort": { "asc": "created_at" }
+}
+```
+
+- `"asc"` sorts ascending (lowest first).
+- `"desc"` sorts descending (highest first).
+- Only **one field** can be sorted.
+- If an index exists on the sorted field and the query fully uses that index, sorting is **covered** (no additional cost).
+
+**Example:** If you have an index on `"age"` and query `{ "query": { "age": { "$gte": 18 } }, "sort": { "asc": "age" } }`, the index provides both the query and the sort.
+
+### Pagination (sector)
+
+Use `"sector"` to paginate results:
+
+```bson
+{
+  "query": { "status": "active" },
+  "sector": { "offset": 20, "limit": 10 }
+}
+```
+
+- `offset` — number of documents to skip (default 0).
+- `limit` — maximum documents to return (default no limit).
+
+Both are optional. Without them, all matching documents are returned.
+
+**Note:** Sector is applied **after** the query and sort, so offset + limit works on the final sorted result set.
+
+### Query planning and index use
+
+Albedo's query planner automatically chooses the best execution strategy, including:
+
+- **Index range scan** — when filtering on an indexed field with comparison operators
+- **Index point scan** — when using `$in` on an indexed field
+- **Index union** — when a `$or` query can use multiple indexes
+- **Full scan** — when no index can help
+
+The planner prioritizes exact matches (`$eq`) and narrow ranges over broader filters. For sorted queries, if the sort field is indexed and matches the query strategy, sorting is covered (no additional cost). Otherwise results are materialized before sorting.
+
+### Example queries
+
+**Simple equality:**
+```bson
+{ "query": { "email": "alice@example.com" } }
+```
+
+**Range with sort and pagination:**
+```bson
+{
+  "query": { "age": { "$gte": 18, "$lte": 65 } },
+  "sort": { "desc": "created_at" },
+  "sector": { "offset": 0, "limit": 50 }
+}
+```
+
+**Complex filter with OR:**
+```bson
+{
+  "query": {
+    "$or": [
+      { "role": "admin" },
+      { "owner_id": ObjectId("507f1f77bcf86cd799439011") }
+    ],
+    "deleted": false
+  },
+  "sort": { "asc": "name" }
+}
+```
+
+**Nested field query:**
+```bson
+{
+  "query": { "profile.bio": { "$startsWith": "Senior" } }
+}
+```
+
+**Array field with $in:**
+```bson
+{
+  "query": { "tags": { "$in": ["urgent", "blocked"] } }
+}
+```
 
 ---
 
