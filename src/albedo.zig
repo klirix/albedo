@@ -9,6 +9,8 @@ const ObjectId = @import("object_id.zig").ObjectId;
 const ObjectIdGenerator = @import("object_id.zig").ObjectIdGenerator;
 const query = @import("query.zig");
 pub const Query = query.Query;
+const update_program = @import("update_program.zig");
+pub const UpdateProgram = update_program.UpdateProgram;
 const bindex = @import("bplusindex.zig");
 const Index = bindex.Index;
 const IndexOptions = bindex.IndexOptions;
@@ -534,6 +536,26 @@ pub const Bucket = struct {
         pub fn transformIterate(self: *Transaction, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
             try self.ensureActive();
             return self.bucket.transformIterateInternal(arena, q, self);
+        }
+
+        pub fn transfigurate(self: *Transaction, q: query.Query, program: UpdateProgram) !usize {
+            try self.ensureActive();
+
+            var arena = std.heap.ArenaAllocator.init(self.bucket.allocator);
+            defer arena.deinit();
+
+            var iter = try self.transformIterate(&arena, q);
+            var closed = false;
+            defer {
+                if (!closed) {
+                    iter.close() catch {};
+                }
+            }
+
+            const updated = try iter.transfigurateAll(program);
+            try iter.close();
+            closed = true;
+            return updated;
         }
 
         pub fn commit(self: *Transaction) !void {
@@ -4094,6 +4116,7 @@ pub const Bucket = struct {
             ScanError,
             IteratorDrained,
             DuplicateKey,
+            InvalidTransform,
         };
 
         pub fn init(bucket: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
@@ -4275,6 +4298,32 @@ pub const Bucket = struct {
             self.index += 1;
         }
 
+        pub fn transfigurate(self: *TransformIterator, program: UpdateProgram) IteratorError!void {
+            if (self.index >= self.targets.len) {
+                return error.IteratorDrained;
+            }
+
+            const current = try self.ensureDoc();
+            var updated = program.apply(self.bucket.allocator, current) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidTransform,
+            };
+            defer updated.deinit(self.bucket.allocator);
+
+            try self.transform(&updated);
+        }
+
+        pub fn transfigurateAll(self: *TransformIterator, program: UpdateProgram) IteratorError!usize {
+            var updated: usize = 0;
+            while (true) {
+                const current = try self.data();
+                if (current == null) break;
+                try self.transfigurate(program);
+                updated += 1;
+            }
+            return updated;
+        }
+
         pub fn close(self: *TransformIterator) !void {
             const allocator = self.bucket.allocator;
 
@@ -4301,6 +4350,37 @@ pub const Bucket = struct {
     pub fn transformIterate(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query) !*TransformIterator {
         try self.ensureNoActiveTransaction();
         return self.transformIterateInternal(arena, q, null);
+    }
+
+    pub fn transfigurate(self: *Bucket, q: query.Query, program: UpdateProgram) !usize {
+        var tx = try self.beginTransaction();
+        var tx_closed = false;
+        defer {
+            if (!tx_closed) {
+                tx.close() catch {};
+            }
+        }
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        var iter = try tx.transformIterate(&arena, q);
+        var iter_closed = false;
+        defer {
+            if (!iter_closed) {
+                iter.close() catch {};
+            }
+        }
+
+        const updated = try iter.transfigurateAll(program);
+        try iter.close();
+        iter_closed = true;
+
+        try tx.commit();
+        try tx.close();
+        tx_closed = true;
+
+        return updated;
     }
 
     fn transformIterateInternal(self: *Bucket, arena: *std.heap.ArenaAllocator, q: query.Query, tx: ?*Transaction) !*TransformIterator {
@@ -4884,6 +4964,61 @@ test "Bucket.TransformIterator deletes document when null transform" {
     try testing.expect(remaining == null);
 }
 
+test "Bucket.transfigurate updates matching documents without manual iteration" {
+    const allocator = std.testing.allocator;
+
+    _ = platform.deleteFile("bucket-transfigurate.bucket") catch {};
+    var bucket = try Bucket.init(allocator, "bucket-transfigurate.bucket");
+    defer {
+        bucket.deinit();
+        platform.deleteFile("bucket-transfigurate.bucket") catch {};
+    }
+
+    const insert_doc = try bson.fmt.serialize(.{
+        .name = "stark",
+        .age = 40,
+        .marriage = "pepper",
+    }, allocator);
+    defer insert_doc.deinit(allocator);
+    _ = try bucket.insert(insert_doc);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ally = arena.allocator();
+
+    var query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "stark" } }, ally);
+    defer query_doc.deinit(ally);
+    var q = try query.Query.parse(ally, query_doc);
+    defer q.deinit(ally);
+
+    var raw_program = try bson.fmt.serialize(.{
+        .@"0" = .{
+            .@"$set" = .{
+                .age = .{ .@"$plus" = .{ "$.age", 1 } },
+            },
+            .state = "dead",
+        },
+        .@"1" = .{
+            .@"$unset" = "marriage",
+        },
+    }, ally);
+    defer raw_program.deinit(ally);
+    var program = try UpdateProgram.parse(ally, raw_program);
+    defer program.deinit(ally);
+
+    try testing.expectEqual(@as(usize, 1), try bucket.transfigurate(q, program));
+
+    var list_arena = std.heap.ArenaAllocator.init(allocator);
+    defer list_arena.deinit();
+    var list_iter = try bucket.listIterate(&list_arena, q);
+
+    const updated = (try list_iter.next(list_iter)).?;
+    try testing.expectEqual(@as(i32, 41), updated.get("age").?.int32.value);
+    try testing.expectEqualStrings("dead", updated.get("state").?.string.value);
+    try testing.expect(updated.get("marriage") == null);
+    try testing.expect((try list_iter.next(list_iter)) == null);
+}
+
 test "Bucket.Transaction commit keeps writes hidden until commit" {
     const allocator = std.testing.allocator;
     const db_path = "transaction_commit_visibility.bucket";
@@ -4983,6 +5118,58 @@ test "Bucket.Transaction rollback restores state" {
     try testing.expectEqual(@as(usize, 1), try testListCount(&bucket, ally, "{\"query\":{\"name\":\"Alice\"}}"));
     try testing.expectEqual(@as(usize, 0), try testListCount(&bucket, ally, "{\"query\":{\"name\":\"Alicia\"}}"));
     try testing.expectEqual(@as(usize, 0), try testListCount(&bucket, ally, "{\"query\":{\"name\":\"Bob\"}}"));
+}
+
+test "Bucket.Transaction transfigurate rolls back with the transaction" {
+    const allocator = std.testing.allocator;
+    const db_path = "transaction_transfigurate_rollback.bucket";
+    const wal_path = "transaction_transfigurate_rollback.bucket-wal";
+    const shm_path = "transaction_transfigurate_rollback.bucket-wal-shm";
+
+    platform.deleteFile(db_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(shm_path) catch {};
+    defer platform.deleteFile(db_path) catch {};
+    defer std.fs.cwd().deleteFile(wal_path) catch {};
+    defer std.fs.cwd().deleteFile(shm_path) catch {};
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ally = arena.allocator();
+
+    var bucket = try Bucket.openFileWithOptions(ally, db_path, .{ .wal = true });
+    defer bucket.deinit();
+
+    const original = try bson.fmt.serialize(.{ .name = "Alice", .age = 30 }, ally);
+    _ = try bucket.insert(original);
+
+    var tx = try bucket.beginTransaction();
+    defer tx.close() catch unreachable;
+
+    var query_doc = try bson.fmt.serialize(.{ .query = .{ .name = "Alice" } }, ally);
+    defer query_doc.deinit(ally);
+    var q = try query.Query.parse(ally, query_doc);
+    defer q.deinit(ally);
+
+    var raw_program = try bson.fmt.serialize(.{
+        .@"$set" = .{
+            .age = .{ .@"$plus" = .{ "$.age", 2 } },
+        },
+    }, ally);
+    defer raw_program.deinit(ally);
+    var program = try UpdateProgram.parse(ally, raw_program);
+    defer program.deinit(ally);
+
+    try testing.expectEqual(@as(usize, 1), try tx.transfigurate(q, program));
+    try tx.rollback();
+
+    try testing.expectEqual(@as(usize, 1), try testListCount(&bucket, ally, "{\"query\":{\"name\":\"Alice\"}}"));
+
+    var check_arena = std.heap.ArenaAllocator.init(allocator);
+    defer check_arena.deinit();
+    var list_iter = try bucket.listIterate(&check_arena, q);
+    const doc = (try list_iter.next(list_iter)).?;
+    try testing.expectEqual(@as(i32, 30), doc.get("age").?.int32.value);
 }
 
 test "Bucket.Transaction delays oplog until commit" {

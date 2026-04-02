@@ -1072,6 +1072,12 @@ pub const BSONDocument = struct {
         return self.getPathRecursive(path);
     }
 
+    pub fn clone(self: BSONDocument, allocator: mem.Allocator) !BSONDocument {
+        const buffer = try allocator.alloc(u8, self.buffer.len);
+        @memcpy(buffer, self.buffer);
+        return BSONDocument.init(buffer);
+    }
+
     pub fn format(
         self: BSONDocument,
         writer: *std.Io.Writer,
@@ -1122,11 +1128,66 @@ pub const BSONDocument = struct {
         return try editor.finish();
     }
 
+    pub fn unsetPath(self: BSONDocument, allocator: mem.Allocator, path: []const u8) !BSONDocument {
+        const dot_idx = mem.indexOfScalar(u8, path, '.') orelse return self.unset(allocator, path);
+        if (dot_idx == 0 or dot_idx + 1 >= path.len) return error.InvalidPath;
+
+        const head = path[0..dot_idx];
+        const tail = path[dot_idx + 1 ..];
+        const child = self.get(head) orelse return self.clone(allocator);
+
+        const child_doc: BSONDocument, const child_is_array = switch (child) {
+            .document => .{ child.document, false },
+            .array => .{ child.array, true },
+            else => return self.clone(allocator),
+        };
+
+        const next_child = try child_doc.unsetPath(allocator, tail);
+        defer next_child.deinit(allocator);
+
+        return self.set(allocator, head, if (child_is_array)
+            BSONValue{ .array = next_child }
+        else
+            BSONValue{ .document = next_child });
+    }
+
     pub fn set(self: BSONDocument, allocator: mem.Allocator, key: []const u8, value: BSONValue) !BSONDocument {
         var editor = Editor.init(allocator, self);
         defer editor.deinit();
         try editor.setValue(key, value);
         return try editor.finish();
+    }
+
+    pub fn setPath(self: BSONDocument, allocator: mem.Allocator, path: []const u8, value: BSONValue) !BSONDocument {
+        const dot_idx = mem.indexOfScalar(u8, path, '.') orelse return self.set(allocator, path, value);
+        if (dot_idx == 0 or dot_idx + 1 >= path.len) return error.InvalidPath;
+
+        const head = path[0..dot_idx];
+        const tail = path[dot_idx + 1 ..];
+
+        const existing = self.get(head);
+        const child_kind: ContainerKind = if (existing) |child| switch (child) {
+            .document => .document,
+            .array => .array,
+            else => if (pathSegmentLooksNumeric(tail)) .array else .document,
+        } else if (pathSegmentLooksNumeric(tail))
+            .array
+        else
+            .document;
+
+        const child_doc = if (existing) |child| switch (child) {
+            .document => child.document,
+            .array => child.array,
+            else => BSONDocument.initEmpty(),
+        } else BSONDocument.initEmpty();
+
+        const next_child = try child_doc.setPath(allocator, tail, value);
+        defer next_child.deinit(allocator);
+
+        return self.set(allocator, head, switch (child_kind) {
+            .document => BSONValue{ .document = next_child },
+            .array => BSONValue{ .array = next_child },
+        });
     }
 
     pub fn deinit(self: *const BSONDocument, allocator: mem.Allocator) void {
@@ -1397,9 +1458,21 @@ pub const Editor = struct {
         self.replaceCurrent(next);
     }
 
+    pub fn setPathValue(self: *Editor, path: []const u8, value: BSONValue) !void {
+        std.debug.assert(!self.finished);
+        const next = try self.current.setPath(self.allocator, path, value);
+        self.replaceCurrent(next);
+    }
+
     pub fn unset(self: *Editor, key: []const u8) !void {
         std.debug.assert(!self.finished);
         const next = try rewriteDocumentUnset(self.current, self.allocator, key);
+        self.replaceCurrent(next);
+    }
+
+    pub fn unsetPath(self: *Editor, path: []const u8) !void {
+        std.debug.assert(!self.finished);
+        const next = try self.current.unsetPath(self.allocator, path);
         self.replaceCurrent(next);
     }
 
@@ -1440,10 +1513,15 @@ fn kindValueType(kind: ContainerKind) BSONValueType {
     };
 }
 
+fn pathSegmentLooksNumeric(path: []const u8) bool {
+    const dot_idx = mem.indexOfScalar(u8, path, '.') orelse path.len;
+    if (dot_idx == 0) return false;
+    _ = std.fmt.parseUnsigned(u32, path[0..dot_idx], 10) catch return false;
+    return true;
+}
+
 fn cloneDocument(allocator: mem.Allocator, doc: BSONDocument) !BSONDocument {
-    const buffer = try allocator.alloc(u8, doc.buffer.len);
-    @memcpy(buffer, doc.buffer);
-    return BSONDocument.init(buffer);
+    return doc.clone(allocator);
 }
 
 fn appendExistingElement(
@@ -1602,6 +1680,31 @@ test "Editor updates and unsets top-level fields" {
     try std.testing.expectEqualStrings("nested", iter.next().?.key);
     try std.testing.expectEqualStrings("b", iter.next().?.key);
     try std.testing.expect(iter.next() == null);
+}
+
+test "BSONDocument setPath and unsetPath update nested documents" {
+    const allocator = std.testing.allocator;
+    var base = try fmt.serialize(.{
+        .profile = .{
+            .name = "Arya",
+            .stats = .{ .age = 16 },
+        },
+    }, allocator);
+    defer base.deinit(allocator);
+
+    var updated = try base.setPath(allocator, "profile.stats.age", .{ .int32 = .{ .value = 17 } });
+    const retitled = try updated.setPath(allocator, "profile.title", .{ .string = .{ .value = "No One" } });
+    updated.deinit(allocator);
+    updated = retitled;
+    defer updated.deinit(allocator);
+
+    try std.testing.expectEqual(@as(i32, 17), updated.getPath("profile.stats.age").?.int32.value);
+    try std.testing.expectEqualStrings("No One", updated.getPath("profile.title").?.string.value);
+
+    var removed = try updated.unsetPath(allocator, "profile.name");
+    defer removed.deinit(allocator);
+    try std.testing.expect(removed.getPath("profile.name") == null);
+    try std.testing.expectEqual(@as(i32, 17), removed.getPath("profile.stats.age").?.int32.value);
 }
 
 test "format" {

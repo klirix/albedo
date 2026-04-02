@@ -4,6 +4,7 @@ const sqlite = @import("sqlite");
 const bson = albedo.bson;
 const Bucket = albedo.Bucket;
 const Query = albedo.Query;
+const UpdateProgram = albedo.UpdateProgram;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -372,50 +373,33 @@ fn benchSqliteUpdate(db: *sqlite.Db, samples: []u64) !void {
 fn benchAlbedoBatchUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64) !void {
     const emails = [2][]const u8{ "batch_a@example.com", "batch_b@example.com" };
 
+    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+    defer arena_alloc.deinit();
+    // const tx = try bucket.beginTransaction();
+
+    // defer tx.commit() catch {
+    //     std.debug.print("Albedo batch update error: \n", .{});
+    // };
+
+    const qdoc = try bson.fmt.serialize(.{
+        .query = .{},
+    }, arena_alloc.allocator());
+    var q = try Query.parse(arena_alloc.allocator(), qdoc);
+
+    const email = emails[1];
+    const raw_program = try bson.fmt.serialize(.{
+        .@"$set" = .{
+            .email = email,
+        },
+    }, arena_alloc.allocator());
+    const program = try UpdateProgram.parse(arena_alloc.allocator(), raw_program);
+
     for (samples, 0..) |*sample, i| {
-        // Cycle through non-overlapping batches of BATCH_UPDATE_SIZE docs by age range.
-        const batch_start: i32 = @intCast((i * @as(usize, @intCast(BATCH_UPDATE_SIZE))) % NUM_RECORDS);
-        const batch_end: i32 = batch_start + BATCH_UPDATE_SIZE;
-
-        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
-        defer arena_alloc.deinit();
-
-        const qdoc = try bson.fmt.serialize(.{
-            .query = .{ .age = .{ .@"$gte" = batch_start, .@"$lt" = batch_end } },
-        }, arena_alloc.allocator());
-        const q = try Query.parse(arena_alloc.allocator(), qdoc);
-
         var timer = try std.time.Timer.start();
 
-        var iter = try bucket.transformIterate(&arena_alloc, q);
-        defer iter.close() catch {};
+        q.sector = .{ .limit = BATCH_UPDATE_SIZE, .offset = @intCast((i * @as(usize, @intCast(BATCH_UPDATE_SIZE))) % NUM_RECORDS) };
 
-        const email = emails[i % 2];
-        while (true) {
-            // Read current doc's age to preserve it in the replacement.
-            const maybe_doc = try iter.data();
-            if (maybe_doc == null) break;
-            const orig = maybe_doc.?;
-
-            const age = orig.get("age").?.int32.value;
-
-            // Reconstruct name deterministically from age (avoids holding a
-            // slice into the iter's arena past the transform() arena-reset).
-            var name_buf: [16]u8 = undefined;
-            const name = std.fmt.bufPrint(&name_buf, "record_{d:0>6}", .{@as(usize, @intCast(age))}) catch unreachable;
-
-            var replacement = try bson.fmt.serialize(.{
-                .name   = name,
-                .age    = age,
-                .email  = email,
-                .active = true,
-            }, arena_alloc.allocator());
-
-            iter.transform(&replacement) catch |err| {
-                if (err == error.IteratorDrained) break;
-                return err;
-            };
-        }
+        _ = try bucket.transfigurate(q, program);
 
         sample.* = timer.read();
     }
@@ -472,6 +456,7 @@ pub fn main() !void {
         .write_durability = .{
             .periodic = 2048,
         },
+        .wal_auto_checkpoint = 10000,
     });
     defer std.fs.cwd().deleteFile("file.bucket") catch {};
     defer bucket.deinit();
