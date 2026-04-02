@@ -27,6 +27,28 @@ pub const FilterGroup = []Filter;
 pub const PathValuePair = struct {
     path: []const u8,
     value: bson.BSONValue,
+
+    /// Duplicate the slice data inside a BSONValue so the filter owns it.
+    pub fn dupeValue(ally: Allocator, v: bson.BSONValue) Allocator.Error!bson.BSONValue {
+        return switch (v) {
+            .string => |s| bson.BSONValue{ .string = .{ .value = try ally.dupe(u8, s.value) } },
+            .binary => |b| bson.BSONValue{ .binary = .{ .value = try ally.dupe(u8, b.value), .subtype = b.subtype } },
+            .array => |a| bson.BSONValue{ .array = bson.BSONDocument{ .buffer = try ally.dupe(u8, a.buffer) } },
+            .document => |d| bson.BSONValue{ .document = bson.BSONDocument{ .buffer = try ally.dupe(u8, d.buffer) } },
+            else => v, // scalar types (int32, int64, double, bool, null, objectId, datetime, minKey, maxKey) are self-contained
+        };
+    }
+
+    /// Free any heap-owned slice data previously created by dupeValue.
+    pub fn freeValue(ally: Allocator, v: bson.BSONValue) void {
+        switch (v) {
+            .string => |s| ally.free(s.value),
+            .binary => |b| ally.free(b.value),
+            .array => |a| ally.free(a.buffer),
+            .document => |d| ally.free(d.buffer),
+            else => {},
+        }
+    }
 };
 
 pub fn parsePath(ally: Allocator, pathSrc: []const u8) ![][]const u8 {
@@ -71,12 +93,15 @@ pub const Filter = union(FilterType) {
     pub fn deinit(self: *Filter, ally: Allocator) void {
         switch (self.*) {
             .in => |*inFilter| {
+                PathValuePair.freeValue(ally, inFilter.value);
                 ally.free(inFilter.path);
             },
             .between => |*betweenFilter| {
+                PathValuePair.freeValue(ally, betweenFilter.value);
                 ally.free(betweenFilter.path);
             },
             .eq, .ne, .lt, .gt, .lte, .gte, .startsWith, .endsWith, .exists, .notExists => |*filter| {
+                PathValuePair.freeValue(ally, filter.value);
                 ally.free(filter.path);
             },
             .@"or", .@"and", .nor => |groups| {
@@ -172,7 +197,9 @@ pub const Filter = union(FilterType) {
                             inline .eq, .in, .ne, .lt, .lte, .gt, .gte, .startsWith, .endsWith, .exists, .notExists => |op| {
                                 const path_copy = try ally.dupe(u8, path);
                                 errdefer ally.free(path_copy);
-                                const filter = @unionInit(Filter, @tagName(op), PathValuePair{ .path = path_copy, .value = operand });
+                                const owned_value = PathValuePair.dupeValue(ally, operand) catch return FilterParsingErrors.OutOfMemory;
+                                errdefer PathValuePair.freeValue(ally, owned_value);
+                                const filter = @unionInit(Filter, @tagName(op), PathValuePair{ .path = path_copy, .value = owned_value });
 
                                 try filters.append(ally, filter);
                             },
@@ -181,7 +208,9 @@ pub const Filter = union(FilterType) {
                                 if (operand.array.keyNumber() != 2) return FilterParsingErrors.InvalidQueryOperatorBetweenSize;
                                 const path_copy = try ally.dupe(u8, path);
                                 errdefer ally.free(path_copy);
-                                try filters.append(ally, .{ .between = .{ .path = path_copy, .value = operand } });
+                                const owned_value = PathValuePair.dupeValue(ally, operand) catch return FilterParsingErrors.OutOfMemory;
+                                errdefer PathValuePair.freeValue(ally, owned_value);
+                                try filters.append(ally, .{ .between = .{ .path = path_copy, .value = owned_value } });
                             },
                             .@"or", .@"and", .nor => return FilterParsingErrors.InvalidQueryOperator,
                         }
@@ -193,7 +222,9 @@ pub const Filter = union(FilterType) {
                 .string, .int32, .int64, .objectId, .datetime, .boolean, .null, .double => {
                     const path_copy = try ally.dupe(u8, path);
                     errdefer ally.free(path_copy);
-                    try filters.append(ally, .{ .eq = .{ .path = path_copy, .value = pair.value } });
+                    const owned_value = PathValuePair.dupeValue(ally, pair.value) catch return FilterParsingErrors.OutOfMemory;
+                    errdefer PathValuePair.freeValue(ally, owned_value);
+                    try filters.append(ally, .{ .eq = .{ .path = path_copy, .value = owned_value } });
                 },
 
                 else => return FilterParsingErrors.InvalidQueryFilter,
