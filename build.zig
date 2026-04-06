@@ -132,7 +132,9 @@ fn buildStaticLibrary(b: *std.Build, libModule: *std.Build.Module, outputName: ?
         .root_module = libModule,
     });
 
-    static.bundle_compiler_rt = true;
+    libModule.strip = true;
+    libModule.unwind_tables = .none;
+    libModule.omit_frame_pointer = true;
 
     b.installArtifact(static);
 }
