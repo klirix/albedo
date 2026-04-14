@@ -5,3 +5,4 @@ zig-out
 *.bucket-wal
 *.bucket-wal-shm
 .vscode
+**/zig-pkg
