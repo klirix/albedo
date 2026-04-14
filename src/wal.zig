@@ -1,5 +1,39 @@
 const std = @import("std");
 const builtin = @import("builtin");
+fn cwdDeleteFile(io: std.Io, path: []const u8) void {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+fn cwdStatFile(io: std.Io, path: []const u8) !std.Io.File.Stat {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
+    return std.Io.Dir.cwd().statFile(io, path, .{});
+}
+
+fn cwdOpenFile(io: std.Io, path: []const u8, flags: std.Io.File.OpenFlags) !std.Io.File {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
+    return std.Io.Dir.cwd().openFile(io, path, flags);
+}
+
+fn cwdCreateFile(io: std.Io, path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
+        unreachable;
+    }
+    return std.Io.Dir.cwd().createFile(io, path, flags);
+}
+
+fn fdFile(fd: NativeFd) std.Io.File {
+    return .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+}
 
 /// Must match `DEFAULT_PAGE_SIZE` in albedo.zig.
 pub const DEFAULT_PAGE_SIZE: u16 = 8192;
@@ -7,45 +41,7 @@ pub const DEFAULT_PAGE_SIZE: u16 = 8192;
 /// Native file-descriptor / handle type, selected at compile time:
 ///   - POSIX (Linux / macOS): `std.posix.fd_t`  (i32)
 ///   - Windows:               `std.os.windows.HANDLE`
-const NativeFd = std.fs.File.Handle;
-
-/// OS handles stored by WalIndex for the mmap'd SHM file.
-/// On POSIX only the fd is required; on Windows a separate mapping
-/// handle created by CreateFileMappingW must also be kept alive.
-const WalIndexHandles = if (builtin.os.tag == .windows) struct {
-    file: NativeFd,
-    mapping: std.os.windows.HANDLE,
-} else NativeFd;
-
-/// Windows-only shims for file-backed virtual memory.
-/// The entire namespace is compiled away on non-Windows targets.
-const win_mmap = if (builtin.os.tag == .windows) struct {
-    const w = std.os.windows;
-
-    pub const PAGE_READWRITE: w.DWORD = 0x04;
-    pub const FILE_MAP_ALL_ACCESS: w.DWORD = 0x000F_001F;
-
-    pub extern "kernel32" fn CreateFileMappingW(
-        hFile: w.HANDLE,
-        lpFileMappingAttributes: ?*anyopaque,
-        flProtect: w.DWORD,
-        dwMaximumSizeHigh: w.DWORD,
-        dwMaximumSizeLow: w.DWORD,
-        lpName: ?[*:0]const u16,
-    ) callconv(.winapi) ?w.HANDLE;
-
-    pub extern "kernel32" fn MapViewOfFile(
-        hFileMappingObject: w.HANDLE,
-        dwDesiredAccess: w.DWORD,
-        dwFileOffsetHigh: w.DWORD,
-        dwFileOffsetLow: w.DWORD,
-        dwNumberOfBytesToMap: w.SIZE_T,
-    ) callconv(.winapi) ?*anyopaque;
-
-    pub extern "kernel32" fn UnmapViewOfFile(
-        lpBaseAddress: *const anyopaque,
-    ) callconv(.winapi) w.BOOL;
-} else struct {};
+pub const NativeFd = std.Io.File.Handle;
 
 /// Write-Ahead Log for crash recovery and MVCC snapshot reads.
 ///
@@ -313,11 +309,11 @@ pub const WAL = struct {
     // ── WalIndex (mmap'd shared-memory skip list) ─────────────────────
 
     pub const WalIndex = struct {
-        fd: WalIndexHandles,
-        map: [*]align(std.heap.page_size_min) u8,
-        map_len: usize,
+        file: std.Io.File,
+        memory_map: std.Io.File.MemoryMap,
         path: []const u8,
         allocator: std.mem.Allocator,
+        io: std.Io,
         /// Configured oplog ring size in bytes (0 = disabled).
         oplog_size: u32,
 
@@ -330,7 +326,7 @@ pub const WAL = struct {
             return ShmHeader.byte_size + self.oplog_size;
         }
 
-        pub fn init(allocator: std.mem.Allocator, path: []const u8, capacity: u32, oplog_size: u32) Error!WalIndex {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8, capacity: u32, oplog_size: u32) Error!WalIndex {
             const stored_path = allocator.dupe(u8, path) catch return Error.WalIndexFailed;
             errdefer allocator.free(stored_path);
 
@@ -339,68 +335,26 @@ pub const WAL = struct {
 
             // ── Open the SHM file and map it into memory ──────────────────────
 
-            const fd: WalIndexHandles = if (builtin.os.tag == .windows) blk: {
-                // Open (or create) the SHM file for read + write.
-                const file_handle = openShmFd(path) catch return Error.WalIndexFailed;
-                errdefer closeFd(file_handle);
+            const file = openShmFile(io, path) catch return Error.WalIndexFailed;
+            errdefer file.close(io);
 
-                // Ensure the file is at least map_len bytes.
-                ftruncateFile(file_handle, map_len) catch return Error.WalIndexFailed;
+            file.setLength(io, map_len) catch return Error.WalIndexFailed;
 
-                // Create a named-less file-mapping object backed by the file.
-                const high: std.os.windows.DWORD = @truncate(map_len >> 32);
-                const low: std.os.windows.DWORD = @truncate(map_len);
-                const mapping = win_mmap.CreateFileMappingW(
-                    file_handle,
-                    null,
-                    win_mmap.PAGE_READWRITE,
-                    high,
-                    low,
-                    null,
-                ) orelse return Error.WalIndexFailed;
-                errdefer std.os.windows.CloseHandle(mapping);
-
-                break :blk .{ .file = file_handle, .mapping = mapping };
-            } else blk: {
-                // POSIX: open for read+write, create if absent.
-                const raw_fd = openShmFd(path) catch return Error.WalIndexFailed;
-                errdefer std.posix.close(raw_fd);
-
-                // Ensure the file is at least the required size.
-                std.posix.ftruncate(raw_fd, @intCast(map_len)) catch return Error.WalIndexFailed;
-
-                break :blk raw_fd;
-            };
-
-            // ── Map the file into the process address space ────────────────────
-
-            const map: [*]align(std.heap.page_size_min) u8 = if (builtin.os.tag == .windows) blk: {
-                const ptr = win_mmap.MapViewOfFile(
-                    fd.mapping,
-                    win_mmap.FILE_MAP_ALL_ACCESS,
-                    0,
-                    0,
-                    map_len,
-                ) orelse return Error.WalIndexFailed;
-                break :blk @ptrCast(@alignCast(ptr));
-            } else blk: {
-                const map_slice = std.posix.mmap(
-                    null,
-                    map_len,
-                    std.posix.PROT.READ | std.posix.PROT.WRITE,
-                    .{ .TYPE = .SHARED },
-                    fd,
-                    0,
-                ) catch return Error.WalIndexFailed;
-                break :blk map_slice.ptr;
-            };
+            const memory_map = file.createMemoryMap(io, .{
+                .len = map_len,
+                .protection = .{ .read = true, .write = true },
+            }) catch return Error.WalIndexFailed;
+            errdefer {
+                var mm = memory_map;
+                mm.destroy(io);
+            }
 
             var idx = WalIndex{
-                .fd = fd,
-                .map = map,
-                .map_len = map_len,
+                .file = file,
+                .memory_map = memory_map,
                 .path = stored_path,
                 .allocator = allocator,
+                .io = io,
                 .oplog_size = oplog_size,
             };
 
@@ -466,15 +420,9 @@ pub const WAL = struct {
 
         pub fn deinit(self: *WalIndex) void {
             self.disconnect();
-            if (builtin.os.tag == .windows) {
-                _ = win_mmap.UnmapViewOfFile(@ptrCast(self.map));
-                std.os.windows.CloseHandle(self.fd.mapping);
-                closeFd(self.fd.file);
-            } else {
-                const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
-                std.posix.munmap(slice);
-                std.posix.close(self.fd);
-            }
+            self.memory_map.write(self.io) catch {};
+            self.memory_map.destroy(self.io);
+            self.file.close(self.io);
             self.allocator.free(self.path);
         }
 
@@ -500,19 +448,12 @@ pub const WAL = struct {
             const path_copy = self.path;
             const ally = self.allocator;
 
-            // Unmap and close the fd(s) first.
-            if (builtin.os.tag == .windows) {
-                _ = win_mmap.UnmapViewOfFile(@ptrCast(self.map));
-                std.os.windows.CloseHandle(self.fd.mapping);
-                closeFd(self.fd.file);
-            } else {
-                const slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.map[0..self.map_len]);
-                std.posix.munmap(slice);
-                std.posix.close(self.fd);
-            }
+            self.memory_map.write(self.io) catch {};
+            self.memory_map.destroy(self.io);
+            self.file.close(self.io);
 
             if (remaining == 0) {
-                std.fs.cwd().deleteFile(path_copy) catch {};
+                cwdDeleteFile(self.io, path_copy);
                 ally.free(path_copy);
                 return true;
             }
@@ -521,11 +462,11 @@ pub const WAL = struct {
         }
 
         pub fn shmHeader(self: *WalIndex) *ShmHeader {
-            return @ptrCast(@alignCast(self.map));
+            return @ptrCast(@alignCast(self.memory_map.memory.ptr));
         }
 
         fn nodePtr(self: *WalIndex, idx: u32) *ShmNode {
-            const base: [*]u8 = @ptrCast(self.map);
+            const base: [*]u8 = @ptrCast(self.memory_map.memory.ptr);
             const offset = self.nodesOffset() + @as(usize, idx) * ShmNode.byte_size;
             return @ptrCast(@alignCast(base + offset));
         }
@@ -534,7 +475,7 @@ pub const WAL = struct {
 
         /// Returns a pointer to the start of the oplog ring region.
         fn oplogBase(self: *WalIndex) [*]u8 {
-            const base: [*]u8 = @ptrCast(self.map);
+            const base: [*]u8 = @ptrCast(self.memory_map.memory.ptr);
             return base + oplog_offset;
         }
 
@@ -730,10 +671,10 @@ pub const WAL = struct {
             return a_tx <= b_tx;
         }
 
-        fn randomLevel() u8 {
+        fn randomLevel(self: *WalIndex) u8 {
             var level: u8 = 1;
             var buf: [2]u8 = undefined;
-            std.crypto.random.bytes(&buf);
+            self.io.random(&buf);
             var bits: u16 = std.mem.readInt(u16, &buf, .little);
             while (level < MAX_LEVEL) {
                 if ((bits & 1) == 0) break;
@@ -768,7 +709,7 @@ pub const WAL = struct {
                 update[lvl] = current;
             }
 
-            const new_lvl = randomLevel();
+            const new_lvl = self.randomLevel();
             if (new_lvl > shm.current_level) {
                 var i: u8 = shm.current_level;
                 while (i < new_lvl) : (i += 1) {
@@ -862,6 +803,7 @@ pub const WAL = struct {
 
     write_fd: NativeFd,
     read_fd: NativeFd,
+    io: std.Io,
     header: Header,
     /// Total number of frames physically appended to the WAL file.
     live_frame_count: u64,
@@ -889,28 +831,28 @@ pub const WAL = struct {
     /// was created with a different non-zero size the call returns
     /// `Error.WalOplogSizeMismatch`.
     /// Supported on POSIX (Linux / macOS) and Windows.
-    pub fn init(allocator: std.mem.Allocator, path: []const u8, oplog_size: u32, generation: u64) Error!WAL {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8, oplog_size: u32, generation: u64) Error!WAL {
         const stored_path = allocator.dupe(u8, path) catch return Error.WalOpenFailed;
         errdefer allocator.free(stored_path);
 
         // Open the write fd for append-only writes; create if absent.
-        const write_fd = openWriteFd(path) catch return Error.WalOpenFailed;
-        errdefer closeFd(write_fd);
+        const write_fd = openWriteFd(io, path) catch return Error.WalOpenFailed;
+        errdefer closeFd(io, write_fd);
 
         // Open a separate read-only fd.
-        const read_fd = openReadFd(path) catch return Error.WalOpenFailed;
-        errdefer closeFd(read_fd);
+        const read_fd = openReadFd(io, path) catch return Error.WalOpenFailed;
+        errdefer closeFd(io, read_fd);
 
         // Try to read an existing header; if the file is empty, write a fresh one.
         var wal_header: Header = .{};
         var next_seq: u64 = 1;
         var data_start: u64 = Header.byte_size; // default for new v3 WALs
 
-        const file_size_val = fileSize(read_fd) catch return Error.WalReadFailed;
+        const file_size_val = fileSize(io, read_fd) catch return Error.WalReadFailed;
         if (file_size_val >= Header.v2_byte_size) {
             // Read the common v2 prefix to determine the version.
             var hdr_buf: [Header.byte_size]u8 = [_]u8{0} ** Header.byte_size;
-            preadAll(read_fd, hdr_buf[0..Header.v2_byte_size], 0) catch return Error.WalReadFailed;
+            preadAll(io, read_fd, hdr_buf[0..Header.v2_byte_size], 0) catch return Error.WalReadFailed;
 
             if (!std.mem.eql(u8, hdr_buf[0..4], &.{ 'W', 'A', 'L', 0 })) {
                 return Error.WalCorrupted;
@@ -919,7 +861,7 @@ pub const WAL = struct {
 
             if (version == 3) {
                 if (file_size_val < Header.byte_size) return Error.WalCorrupted;
-                preadAll(read_fd, hdr_buf[Header.v2_byte_size..], Header.v2_byte_size) catch return Error.WalReadFailed;
+                preadAll(io, read_fd, hdr_buf[Header.v2_byte_size..], Header.v2_byte_size) catch return Error.WalReadFailed;
                 data_start = Header.byte_size; // 112
             } else if (version == 2) {
                 data_start = Header.v2_byte_size; // 48
@@ -937,28 +879,28 @@ pub const WAL = struct {
                 return Error.WalCorrupted;
             }
             if (file_size_val > committed_size) {
-                ftruncateFile(write_fd, committed_size) catch return Error.WalWriteFailed;
+                ftruncateFile(io, write_fd, committed_size) catch return Error.WalWriteFailed;
             }
 
             if (wal_header.frame_count > 0) {
                 const last_offset = data_start + (wal_header.frame_count - 1) * frame_size;
                 var last_hdr_buf: [FrameHeader.byte_size]u8 = undefined;
-                preadAll(read_fd, &last_hdr_buf, last_offset) catch return Error.WalReadFailed;
+                preadAll(io, read_fd, &last_hdr_buf, last_offset) catch return Error.WalReadFailed;
                 const last_hdr = FrameHeader.fromBytes(&last_hdr_buf);
                 next_seq = last_hdr.commit_seq + 1;
             }
         } else {
             // Seed the salt from OS randomness.
             var salt_bytes: [8]u8 = undefined;
-            std.crypto.random.bytes(&salt_bytes);
+            io.random(&salt_bytes);
             wal_header.salt = std.mem.readInt(u64, &salt_bytes, .little);
             wal_header.generation = generation;
 
             // Write the initial header. Because the write fd is append-only and
             // the file is empty, this lands at offset 0.
             const hdr_bytes = wal_header.toBytes();
-            writeAll(write_fd, &hdr_bytes) catch return Error.WalWriteFailed;
-            fsync(write_fd) catch return Error.WalSyncFailed;
+            writeAll(io, write_fd, &hdr_bytes) catch return Error.WalWriteFailed;
+            fsync(io, write_fd) catch return Error.WalSyncFailed;
         }
 
         // Build the SHM index path: "<wal_path>-shm"
@@ -967,12 +909,13 @@ pub const WAL = struct {
         @memcpy(shm_path[0..path.len], path);
         @memcpy(shm_path[path.len..], "-shm");
 
-        var wal_index = try WalIndex.init(allocator, shm_path, DEFAULT_INDEX_CAPACITY, oplog_size);
+        var wal_index = try WalIndex.init(allocator, io, shm_path, DEFAULT_INDEX_CAPACITY, oplog_size);
         errdefer wal_index.deinit();
 
         var wal = WAL{
             .write_fd = write_fd,
             .read_fd = read_fd,
+            .io = io,
             .header = wal_header,
             .live_frame_count = wal_header.frame_count,
             .next_seq = next_seq,
@@ -992,8 +935,8 @@ pub const WAL = struct {
 
     pub fn deinit(self: *WAL) void {
         self.index.deinit();
-        closeFd(self.write_fd);
-        closeFd(self.read_fd);
+        closeFd(self.io, self.write_fd);
+        closeFd(self.io, self.read_fd);
         self.allocator.free(self.path);
     }
 
@@ -1013,12 +956,12 @@ pub const WAL = struct {
         const last_connection = self.index.deleteFile();
 
         // 4. Close WAL file descriptors.
-        closeFd(self.write_fd);
-        closeFd(self.read_fd);
+        closeFd(self.io, self.write_fd);
+        closeFd(self.io, self.read_fd);
 
         // 5. Only delete the WAL file if no other connections remain.
         if (last_connection) {
-            std.fs.cwd().deleteFile(self.path) catch {};
+            cwdDeleteFile(self.io, self.path);
         }
 
         // 6. Free the path allocation.
@@ -1048,7 +991,7 @@ pub const WAL = struct {
         @memcpy(buf[0..FrameHeader.byte_size], &hdr_bytes);
         @memcpy(buf[FrameHeader.byte_size..], page_data_buf);
 
-        writeAll(self.write_fd, &buf) catch return Error.WalWriteFailed;
+        writeAll(self.io, self.write_fd, &buf) catch return Error.WalWriteFailed;
 
         self.next_seq += 1;
         self.live_frame_count += 1;
@@ -1066,7 +1009,7 @@ pub const WAL = struct {
     /// Persist all buffered WAL writes to stable storage, update the header
     /// on disk, and advance `latest_committed_tx`.
     pub fn sync(self: *WAL) Error!void {
-        fsync(self.write_fd) catch return Error.WalSyncFailed;
+        fsync(self.io, self.write_fd) catch return Error.WalSyncFailed;
         self.latest_committed_tx = self.pending_max_tx;
         self.header.frame_count = self.live_frame_count;
         self.header.tx_timestamp = self.latest_committed_tx;
@@ -1084,7 +1027,7 @@ pub const WAL = struct {
         pub fn next(self: *FrameIterator) Error!?struct { header: FrameHeader, data: []const u8 } {
             if (self.remaining == 0) return null;
 
-            preadAll(self.wal.read_fd, &self.buf, self.offset) catch return Error.WalReadFailed;
+            preadAll(self.wal.io, self.wal.read_fd, &self.buf, self.offset) catch return Error.WalReadFailed;
 
             const fh = FrameHeader.fromBytes(self.buf[0..FrameHeader.byte_size]);
             const data = self.buf[FrameHeader.byte_size..];
@@ -1121,7 +1064,7 @@ pub const WAL = struct {
         const wal_offset = maybe_offset orelse return Error.WalPageNotFound;
 
         var buf: [frame_size]u8 = undefined;
-        preadAll(self.read_fd, &buf, wal_offset) catch return Error.WalReadFailed;
+        preadAll(self.io, self.read_fd, &buf, wal_offset) catch return Error.WalReadFailed;
 
         const fh = FrameHeader.fromBytes(buf[0..FrameHeader.byte_size]);
         const data = buf[FrameHeader.byte_size..];
@@ -1143,7 +1086,7 @@ pub const WAL = struct {
     pub fn readBucketHeader(self: *WAL) Error!?[64]u8 {
         if (self.data_offset < Header.byte_size) return null; // v2
         var buf: [64]u8 = undefined;
-        preadAll(self.read_fd, &buf, 48) catch return Error.WalReadFailed;
+        preadAll(self.io, self.read_fd, &buf, 48) catch return Error.WalReadFailed;
         const zero: [64]u8 = [_]u8{0} ** 64;
         if (std.mem.eql(u8, &buf, &zero)) return null;
         return buf;
@@ -1160,7 +1103,7 @@ pub const WAL = struct {
         self.data_offset = Header.byte_size;
 
         // Truncate the file to header-only.
-        ftruncateFile(self.write_fd, self.data_offset) catch return Error.WalWriteFailed;
+        ftruncateFile(self.io, self.write_fd, self.data_offset) catch return Error.WalWriteFailed;
 
         self.header.frame_count = 0;
         self.live_frame_count = 0;
@@ -1172,7 +1115,7 @@ pub const WAL = struct {
         self.header.bucket_header = [_]u8{0} ** 64;
 
         try self.writeHeader();
-        fsync(self.write_fd) catch return Error.WalSyncFailed;
+        fsync(self.io, self.write_fd) catch return Error.WalSyncFailed;
 
         // Clear the SHM index and bump checkpoint generation so that
         // readers know their page cache is stale and must be invalidated.
@@ -1180,7 +1123,11 @@ pub const WAL = struct {
         defer self.index.releaseWrite();
         self.index.clear();
         const gen_ptr = &self.index.shmHeader().checkpoint_generation;
-        _ = @atomicRmw(u64, gen_ptr, .Add, 1, .release);
+        if (builtin.single_threaded) {
+            gen_ptr.* += 1;
+        } else {
+            _ = @atomicRmw(u64, gen_ptr, .Add, 1, .release);
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────
@@ -1197,7 +1144,7 @@ pub const WAL = struct {
         while (i < self.header.frame_count) : (i += 1) {
             const offset = self.data_offset + i * frame_size;
             var hdr_buf: [FrameHeader.byte_size]u8 = undefined;
-            preadAll(self.read_fd, &hdr_buf, offset) catch return Error.WalReadFailed;
+            preadAll(self.io, self.read_fd, &hdr_buf, offset) catch return Error.WalReadFailed;
             const fh = FrameHeader.fromBytes(&hdr_buf);
             try self.index.insert(fh.page_id, fh.tx_timestamp, offset);
         }
@@ -1206,15 +1153,15 @@ pub const WAL = struct {
     fn writeHeader(self: *WAL) Error!void {
         // The write fd is append-only, so we open a transient fd without
         // append semantics to pwrite the header at offset 0.
-        const fd = openRwFd(self.path) catch return Error.WalWriteFailed;
-        defer closeFd(fd);
+        const fd = openRwFd(self.io, self.path) catch return Error.WalWriteFailed;
+        defer closeFd(self.io, fd);
 
         const hdr_bytes = self.header.toBytes();
         // Write only data_offset bytes so a v2 WAL header doesn't
         // overwrite the first frame's data with bucket_header bytes.
         const write_len = @as(usize, @intCast(self.data_offset));
-        pwriteAll(fd, hdr_bytes[0..write_len], 0) catch return Error.WalWriteFailed;
-        fsync(fd) catch return Error.WalSyncFailed;
+        pwriteAll(self.io, fd, hdr_bytes[0..write_len], 0) catch return Error.WalWriteFailed;
+        fsync(self.io, fd) catch return Error.WalSyncFailed;
     }
 
     pub fn setGeneration(self: *WAL, generation: u64) Error!void {
@@ -1242,8 +1189,8 @@ pub const WAL = struct {
         const old_header_tx = self.header.tx_timestamp;
         const frame_count: u64 = @intCast(raw_frames.len / frame_size);
 
-        writeAll(self.write_fd, raw_frames) catch return Error.WalWriteFailed;
-        fsync(self.write_fd) catch return Error.WalSyncFailed;
+        writeAll(self.io, self.write_fd, raw_frames) catch return Error.WalWriteFailed;
+        fsync(self.io, self.write_fd) catch return Error.WalSyncFailed;
 
         var last_commit_seq = old_next_seq - 1;
         self.index.acquireWrite();
@@ -1256,7 +1203,7 @@ pub const WAL = struct {
             const hdr = FrameHeader.fromBytes(hdr_bytes);
             const wal_offset = self.data_offset + (old_live + i) * frame_size;
             self.index.insert(hdr.page_id, hdr.tx_timestamp, wal_offset) catch {
-                ftruncateFile(self.write_fd, self.data_offset + old_live * frame_size) catch {};
+                ftruncateFile(self.io, self.write_fd, self.data_offset + old_live * frame_size) catch {};
                 self.live_frame_count = old_live;
                 self.header.frame_count = old_committed;
                 self.next_seq = old_next_seq;
@@ -1281,83 +1228,70 @@ pub const WAL = struct {
 
     // ── Cross-platform file helpers ───────────────────────────────────
 
-    /// Open or create a file for append-only sequential writes.
-    /// On POSIX the O_APPEND flag delegates positioning to the kernel;
-    /// on Windows the file is opened for writing and each `writeAll` call
-    /// seeks to the end before writing (single-writer WAL, so this is safe).
-    fn openWriteFd(path: []const u8) !NativeFd {
-        if (builtin.os.tag == .windows) {
-            // createFile with truncate=false: opens existing or creates new,
-            // positioned at the beginning. writeAll will seek to end each time.
-            const f = std.fs.cwd().createFile(path, .{ .truncate = false }) catch return error.OpenFailed;
-            return f.handle;
-        } else {
-            const path_z = std.posix.toPosixPath(path) catch return error.NameTooLong;
-            return std.posix.openZ(&path_z, .{
-                .ACCMODE = .WRONLY,
-                .CREAT = true,
-                .APPEND = true,
-            }, 0o644) catch return error.OpenFailed;
-        }
+    /// Open or create a file for sequential writes.
+    /// `writeAll` seeks to the end before each append, which is sufficient
+    /// for this single-writer WAL implementation.
+    fn openWriteFd(io: std.Io, path: []const u8) !NativeFd {
+        const f = cwdCreateFile(io, path, .{ .truncate = false }) catch return error.OpenFailed;
+        return f.handle;
     }
 
     /// Open an existing file read-only.
-    fn openReadFd(path: []const u8) !NativeFd {
-        const f = std.fs.cwd().openFile(path, .{}) catch return error.OpenFailed;
+    fn openReadFd(io: std.Io, path: []const u8) !NativeFd {
+        const f = cwdOpenFile(io, path, .{}) catch return error.OpenFailed;
         return f.handle;
     }
 
     /// Open an existing file for random reads and writes (no append, no create).
     /// Used to pwrite the WAL header at offset 0.
-    fn openRwFd(path: []const u8) !NativeFd {
-        const f = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch return error.OpenFailed;
+    fn openRwFd(io: std.Io, path: []const u8) !NativeFd {
+        const f = cwdOpenFile(io, path, .{ .mode = .read_write }) catch return error.OpenFailed;
         return f.handle;
     }
 
     /// Open (or create) a file for read + write without truncation.
     /// Used for the SHM index file.
-    fn openShmFd(path: []const u8) !NativeFd {
-        const f = std.fs.cwd().createFile(path, .{
+    fn openShmFile(io: std.Io, path: []const u8) !std.Io.File {
+        return cwdCreateFile(io, path, .{
             .read = true,
             .truncate = false,
         }) catch return error.OpenFailed;
-        return f.handle;
     }
 
-    fn closeFd(fd: NativeFd) void {
-        (std.fs.File{ .handle = fd }).close();
+    fn closeFd(io: std.Io, fd: NativeFd) void {
+        fdFile(fd).close(io);
     }
 
-    fn preadAll(fd: NativeFd, buf: []u8, offset: u64) !void {
-        const n = (std.fs.File{ .handle = fd }).preadAll(buf, offset) catch return error.ReadFailed;
-        if (n != buf.len) return error.ReadFailed; // unexpected EOF
+    fn preadAll(io: std.Io, fd: NativeFd, buf: []u8, offset: u64) !void {
+        var reader = std.Io.File.Reader.init(fdFile(fd), io, &.{});
+        reader.seekTo(offset) catch return error.ReadFailed;
+        reader.interface.readSliceAll(buf) catch return error.ReadFailed;
     }
 
-    fn pwriteAll(fd: NativeFd, buf: []const u8, offset: u64) !void {
-        (std.fs.File{ .handle = fd }).pwriteAll(buf, offset) catch return error.WriteFailed;
+    fn pwriteAll(io: std.Io, fd: NativeFd, buf: []const u8, offset: u64) !void {
+        var writer = std.Io.File.Writer.init(fdFile(fd), io, &.{});
+        writer.seekTo(offset) catch return error.WriteFailed;
+        writer.interface.writeAll(buf) catch return error.WriteFailed;
     }
 
-    /// Append `buf` to the file.  On POSIX the fd is O_APPEND so the
-    /// kernel handles positioning atomically.  On Windows we seek to the
-    /// end first (the WAL is single-writer so no race exists).
-    fn writeAll(fd: NativeFd, buf: []const u8) !void {
-        const file = std.fs.File{ .handle = fd };
-        if (builtin.os.tag == .windows) {
-            file.seekFromEnd(0) catch return error.WriteFailed;
-        }
-        file.writeAll(buf) catch return error.WriteFailed;
+    /// Append `buf` to the file by seeking to the current end first.
+    fn writeAll(io: std.Io, fd: NativeFd, buf: []const u8) !void {
+        const file = fdFile(fd);
+        var writer = std.Io.File.Writer.initStreaming(file, io, &.{});
+        writer.seekTo(file.length(io) catch return error.WriteFailed) catch return error.WriteFailed;
+        writer.interface.writeAll(buf) catch return error.WriteFailed;
     }
 
-    fn fsync(fd: NativeFd) !void {
-        (std.fs.File{ .handle = fd }).sync() catch return error.SyncFailed;
+    fn fsync(io: std.Io, fd: NativeFd) !void {
+        fdFile(fd).sync(io) catch return error.SyncFailed;
     }
 
-    fn fileSize(fd: NativeFd) !u64 {
-        return (std.fs.File{ .handle = fd }).getEndPos() catch return error.StatFailed;
+    fn fileSize(io: std.Io, fd: NativeFd) !u64 {
+        return fdFile(fd).length(io) catch return error.StatFailed;
     }
 
-    fn ftruncateFile(fd: NativeFd, size: u64) !void {
-        (std.fs.File{ .handle = fd }).setEndPos(size) catch return error.WriteFailed;
+    fn ftruncateFile(io: std.Io, fd: NativeFd, size: u64) !void {
+        fdFile(fd).setLength(io, size) catch return error.WriteFailed;
     }
 };
 
@@ -1366,8 +1300,8 @@ pub const WAL = struct {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn cleanupTestFiles(path: []const u8, shm_path: []const u8) void {
-    std.fs.cwd().deleteFile(path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
+    cwdDeleteFile(std.testing.io, path);
+    cwdDeleteFile(std.testing.io, shm_path);
 }
 
 // ── Header serialization tests ────────────────────────────────────────
@@ -1522,7 +1456,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- create & write two frames --
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1539,7 +1473,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- reopen and verify frames survive --
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         try std.testing.expectEqual(wal.header.frame_count, 2);
@@ -1564,7 +1498,7 @@ test "WAL open, append, iterate, checkpoint" {
 
     // -- after checkpoint the WAL is empty --
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
         try std.testing.expectEqual(wal.header.frame_count, 0);
     }
@@ -1578,15 +1512,15 @@ test "WAL corrupted magic is rejected on open" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const file = try cwdCreateFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
         var hdr = WAL.Header{};
         hdr.magic = .{ 'B', 'A', 'D', '!' };
         const bytes = hdr.toBytes();
-        try file.writeAll(&bytes);
+        try file.writeStreamingAll(std.testing.io, &bytes);
     }
 
-    const result = WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    const result = WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     try std.testing.expectError(error.WalCorrupted, result);
 }
 
@@ -1597,7 +1531,7 @@ test "WAL sequence numbers increment correctly" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     try std.testing.expectEqual(wal.next_seq, 1);
@@ -1630,7 +1564,7 @@ test "WAL same page can be written multiple times" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1649,7 +1583,7 @@ test "WAL same page can be written multiple times" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1677,7 +1611,7 @@ test "WAL checkpoint then append starts fresh sequence" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1713,7 +1647,7 @@ test "WAL checksum validates page data integrity" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1724,14 +1658,16 @@ test "WAL checksum validates page data integrity" {
 
     // Corrupt a byte in the page data portion.
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer file.close();
+        const file = try cwdOpenFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
         const corrupt_offset = WAL.Header.byte_size + WAL.FrameHeader.byte_size + 100;
-        try file.pwriteAll(&[_]u8{0x00}, corrupt_offset);
+        var writer = std.Io.File.Writer.init(file, std.testing.io, &.{});
+        try writer.seekTo(corrupt_offset);
+        try writer.interface.writeAll(&[_]u8{0x00});
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1750,7 +1686,7 @@ test "WAL many frames stress test" {
     const num_frames: u64 = 64;
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1763,7 +1699,7 @@ test "WAL many frames stress test" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         try std.testing.expectEqual(wal.header.frame_count, num_frames);
@@ -1787,7 +1723,7 @@ test "WAL empty iterator returns null immediately" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var it = wal.frames();
@@ -1802,7 +1738,7 @@ test "WAL file size matches expected layout" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1815,9 +1751,9 @@ test "WAL file size matches expected layout" {
         try wal.sync();
     }
 
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const stat = try file.stat();
+    const file = try cwdOpenFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
     const expected_size = WAL.Header.byte_size + 2 * WAL.frame_size;
     try std.testing.expectEqual(stat.size, expected_size);
 }
@@ -1835,14 +1771,14 @@ test "WAL page data is preserved byte-for-byte" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
         try wal.appendPage(42, &original, 1000);
         try wal.sync();
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var it = wal.frames();
@@ -1861,7 +1797,7 @@ test "WAL latest_committed_tx updates on sync" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     try std.testing.expectEqual(wal.latest_committed_tx, 0);
@@ -1892,7 +1828,7 @@ test "WAL latest_committed_tx persists across reopen" {
     defer cleanupTestFiles(path, shm_path);
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
 
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1902,7 +1838,7 @@ test "WAL latest_committed_tx persists across reopen" {
     }
 
     {
-        var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         defer wal.deinit();
         try std.testing.expectEqual(wal.latest_committed_tx, 500);
     }
@@ -1917,7 +1853,7 @@ test "WAL page_data returns correct data" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1937,7 +1873,7 @@ test "WAL page_data returns WalPageNotFound for missing page" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     const result = wal.page_data(99, 1000);
@@ -1951,7 +1887,7 @@ test "WAL page_data MVCC returns latest version <= max_tx" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -1998,7 +1934,7 @@ test "WAL page_data with multiple pages and MVCC" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -2042,7 +1978,7 @@ test "WAL page_data after checkpoint returns not found" {
     cleanupTestFiles(path, shm_path);
     defer cleanupTestFiles(path, shm_path);
 
-    var wal = try WAL.init(allocator, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var wal = try WAL.init(allocator, std.testing.io, path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     defer wal.deinit();
 
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
@@ -2066,10 +2002,10 @@ test "WAL page_data after checkpoint returns not found" {
 test "WalIndex insert and lookup" {
     const allocator = std.testing.allocator;
     const path = "albedo_test_walindex.shm";
-    std.fs.cwd().deleteFile(path) catch {};
-    defer std.fs.cwd().deleteFile(path) catch {};
+    cwdDeleteFile(std.testing.io, path);
+    defer cwdDeleteFile(std.testing.io, path);
 
-    var idx = try WAL.WalIndex.init(allocator, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var idx = try WAL.WalIndex.init(allocator, std.testing.io, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer idx.deinit();
 
     idx.acquireWrite();
@@ -2098,10 +2034,10 @@ test "WalIndex insert and lookup" {
 test "WalIndex clear resets state" {
     const allocator = std.testing.allocator;
     const path = "albedo_test_walindex_clear.shm";
-    std.fs.cwd().deleteFile(path) catch {};
-    defer std.fs.cwd().deleteFile(path) catch {};
+    cwdDeleteFile(std.testing.io, path);
+    defer cwdDeleteFile(std.testing.io, path);
 
-    var idx = try WAL.WalIndex.init(allocator, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var idx = try WAL.WalIndex.init(allocator, std.testing.io, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer idx.deinit();
 
     idx.acquireWrite();
@@ -2124,10 +2060,10 @@ test "WalIndex clear resets state" {
 test "WalIndex many entries" {
     const allocator = std.testing.allocator;
     const path = "albedo_test_walindex_many.shm";
-    std.fs.cwd().deleteFile(path) catch {};
-    defer std.fs.cwd().deleteFile(path) catch {};
+    cwdDeleteFile(std.testing.io, path);
+    defer cwdDeleteFile(std.testing.io, path);
 
-    var idx = try WAL.WalIndex.init(allocator, path, 4096, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var idx = try WAL.WalIndex.init(allocator, std.testing.io, path, 4096, WAL.DEFAULT_OPLOG_REGION_SIZE);
     defer idx.deinit();
 
     idx.acquireWrite();
@@ -2157,25 +2093,25 @@ test "consumeAndClose deletes WAL and SHM files" {
 
     // Create a WAL, write a frame, then consume and close.
     {
-        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var w = try WAL.init(allocator, std.testing.io, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         @memset(&page_buf, 0xAB);
         try w.appendPage(1, &page_buf, 100);
         try w.sync();
 
         // Both files must exist before consume.
-        _ = std.fs.cwd().statFile(wal_path) catch unreachable;
-        _ = std.fs.cwd().statFile(shm_path) catch unreachable;
+        _ = cwdStatFile(std.testing.io, wal_path) catch unreachable;
+        _ = cwdStatFile(std.testing.io, shm_path) catch unreachable;
 
         w.consumeAndClose();
     }
 
     // After consume, both files should be gone.
-    if (std.fs.cwd().statFile(wal_path)) |_| {
+    if (cwdStatFile(std.testing.io, wal_path)) |_| {
         return error.TestUnexpectedResult; // WAL file should have been deleted
     } else |_| {}
 
-    if (std.fs.cwd().statFile(shm_path)) |_| {
+    if (cwdStatFile(std.testing.io, shm_path)) |_| {
         return error.TestUnexpectedResult; // SHM file should have been deleted
     } else |_| {}
 }
@@ -2183,18 +2119,18 @@ test "consumeAndClose deletes WAL and SHM files" {
 test "WalIndex.deleteFile removes file when no readers" {
     const allocator = std.testing.allocator;
     const path = "albedo_test_walindex_delete.shm";
-    std.fs.cwd().deleteFile(path) catch {};
+    cwdDeleteFile(std.testing.io, path);
 
-    var idx = try WAL.WalIndex.init(allocator, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
+    var idx = try WAL.WalIndex.init(allocator, std.testing.io, path, 256, WAL.DEFAULT_OPLOG_REGION_SIZE);
 
     // File must exist.
-    _ = std.fs.cwd().statFile(path) catch unreachable;
+    _ = cwdStatFile(std.testing.io, path) catch unreachable;
 
     const deleted = idx.deleteFile();
     try std.testing.expect(deleted);
 
     // File should be gone.
-    if (std.fs.cwd().statFile(path)) |_| {
+    if (cwdStatFile(std.testing.io, path)) |_| {
         return error.TestUnexpectedResult;
     } else |_| {}
 }
@@ -2207,7 +2143,7 @@ test "deinit does not delete WAL files" {
     defer cleanupTestFiles(wal_path, shm_path);
 
     {
-        var w = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+        var w = try WAL.init(allocator, std.testing.io, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
         var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
         @memset(&page_buf, 0xCD);
         try w.appendPage(1, &page_buf, 200);
@@ -2216,8 +2152,8 @@ test "deinit does not delete WAL files" {
     }
 
     // After plain deinit, files should still exist.
-    _ = std.fs.cwd().statFile(wal_path) catch unreachable;
-    _ = std.fs.cwd().statFile(shm_path) catch unreachable;
+    _ = cwdStatFile(std.testing.io, wal_path) catch unreachable;
+    _ = cwdStatFile(std.testing.io, shm_path) catch unreachable;
 }
 
 test "consumeAndClose preserves files when another connection is active" {
@@ -2228,14 +2164,14 @@ test "consumeAndClose preserves files when another connection is active" {
     defer cleanupTestFiles(wal_path, shm_path);
 
     // Open first WAL and write a frame.
-    var w1 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var w1 = try WAL.init(allocator, std.testing.io, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
     var page_buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
     @memset(&page_buf, 0xAB);
     try w1.appendPage(1, &page_buf, 100);
     try w1.sync();
 
     // Open a second connection to the same WAL.
-    var w2 = try WAL.init(allocator, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
+    var w2 = try WAL.init(allocator, std.testing.io, wal_path, WAL.DEFAULT_OPLOG_REGION_SIZE, 0);
 
     // Two connections should be registered.
     try std.testing.expectEqual(@as(u32, 2), w1.index.activeConnections());
@@ -2244,10 +2180,10 @@ test "consumeAndClose preserves files when another connection is active" {
     w1.consumeAndClose();
 
     // Both files should still exist because w2 is still alive.
-    _ = std.fs.cwd().statFile(wal_path) catch {
+    _ = cwdStatFile(std.testing.io, wal_path) catch {
         return error.TestUnexpectedResult; // WAL file should still exist
     };
-    _ = std.fs.cwd().statFile(shm_path) catch {
+    _ = cwdStatFile(std.testing.io, shm_path) catch {
         return error.TestUnexpectedResult; // SHM file should still exist
     };
 
@@ -2257,10 +2193,10 @@ test "consumeAndClose preserves files when another connection is active" {
     // Closing the last connection should remove the files.
     w2.consumeAndClose();
 
-    if (std.fs.cwd().statFile(wal_path)) |_| {
+    if (cwdStatFile(std.testing.io, wal_path)) |_| {
         return error.TestUnexpectedResult; // WAL file should be gone
     } else |_| {}
-    if (std.fs.cwd().statFile(shm_path)) |_| {
+    if (cwdStatFile(std.testing.io, shm_path)) |_| {
         return error.TestUnexpectedResult; // SHM file should be gone
     } else |_| {}
 }

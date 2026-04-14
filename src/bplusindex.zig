@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const albedo = @import("albedo.zig");
 const bson = @import("bson.zig");
@@ -6,7 +7,6 @@ const query = @import("query.zig");
 const BSONValue = bson.BSONValue;
 const Bucket = albedo.Bucket;
 const Page = albedo.Page;
-const platform = @import("platform.zig");
 
 pub const IndexOptions = packed struct {
     unique: u1 = 0,
@@ -399,8 +399,9 @@ pub const Index = struct {
             }
 
             self.page.data[insert_offset_u] = @intFromEnum(value.valueType());
-            var stream = std.io.fixedBufferStream(self.page.data[insert_offset_u + 1 .. insert_offset_u + 1 + value_size]);
-            try value.write(stream.writer());
+            var stream = std.Io.Writer.fixed(self.page.data[insert_offset_u + 1 .. insert_offset_u + 1 + value_size]);
+
+            try value.write(&stream);
 
             const loc_pos = insert_offset_u + 1 + value_size;
             const page_bytes_ptr = @as(*[8]u8, @ptrCast(self.page.data[loc_pos .. loc_pos + 8].ptr));
@@ -506,19 +507,19 @@ pub const Index = struct {
 
             const total = self.leafEntryCount();
             if (total == 0) return error.CorruptedNode;
-            
+
             var mid = @divFloor(total, 2);
             if (insert_value) |iv| {
                 const rightmost_entry = self.leafEntryAt(total - 1).?;
                 const leftmost_entry = self.leafEntryAt(0).?;
-                
+
                 if (self.index.compare(iv, rightmost_entry.value()) == .gt) {
                     mid = total - 1;
                 } else if (self.index.compare(iv, leftmost_entry.value()) == .lt) {
                     mid = 1;
                 }
             }
-            
+
             const first_right = self.leafEntryAt(mid) orelse return error.CorruptedNode;
 
             const move_start = first_right.offset;
@@ -920,15 +921,20 @@ pub const Index = struct {
 
 const testing = std.testing;
 
+fn tryCwdDeleteFile(path: []const u8) !void {
+    if (!builtin.is_test) unreachable;
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+}
+
 test "Index inserts" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_test.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_test.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_test.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_test.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
     var seed: u64 = undefined;
-    try platform.randomBytes(std.mem.asBytes(&seed));
+    std.testing.io.random(std.mem.asBytes(&seed));
     var prng = std.Random.DefaultPrng.init(blk: {
         break :blk seed;
     });
@@ -944,9 +950,9 @@ test "Index inserts" {
 }
 
 test "leaf split updates parent links" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_split.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_split.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_split.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_split.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -988,9 +994,9 @@ test "leaf split updates parent links" {
 }
 
 test "Index range" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_test1.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_test1.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_test1.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_test1.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1007,9 +1013,9 @@ test "Index range" {
 }
 
 test "range handles duplicates" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_range_dupes.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_range_dupes.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_range_dupes.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_range_dupes.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1027,7 +1033,7 @@ test "range handles duplicates" {
     try index.insert(BSONValue{ .int32 = .{ .value = 11 } }, .{ .pageId = 111, .offset = 1110 });
 
     var iter = try index.point(key);
-    var results = std.ArrayList(u16){};
+    var results = std.ArrayList(u16).empty;
     defer results.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1038,9 +1044,9 @@ test "range handles duplicates" {
 }
 
 test "unique index rejects duplicates" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_unique.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_unique.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_unique.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_unique.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1054,9 +1060,9 @@ test "unique index rejects duplicates" {
 }
 
 test "range respects bounds" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_range_bounds.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_range_bounds.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_range_bounds.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_range_bounds.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1081,7 +1087,7 @@ test "range respects bounds" {
     const lower = BSONValue{ .int32 = .{ .value = 10 } };
     const upper = BSONValue{ .int32 = .{ .value = 20 } };
     var iter = try index.range(Index.RangeBound.gte(lower), Index.RangeBound.lte(upper));
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1093,9 +1099,9 @@ test "range respects bounds" {
 }
 
 test "range supports exclusive bounds" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_range_exclusive.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_range_exclusive.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_range_exclusive.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_range_exclusive.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1120,7 +1126,7 @@ test "range supports exclusive bounds" {
     const lower = BSONValue{ .int32 = .{ .value = 10 } };
     const upper = BSONValue{ .int32 = .{ .value = 20 } };
     var iter = try index.range(.gt(lower), .lt(upper));
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1132,9 +1138,9 @@ test "range supports exclusive bounds" {
 }
 
 test "Index orders strings lexicographically" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_strings.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_strings.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_strings.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_strings.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1158,7 +1164,7 @@ test "Index orders strings lexicographically" {
     }
 
     var iter = try index.range(null, null);
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1170,9 +1176,9 @@ test "Index orders strings lexicographically" {
 }
 
 test "Index orders ObjectIds lexicographically" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_objectids.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_objectids.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_objectids.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_objectids.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1198,7 +1204,7 @@ test "Index orders ObjectIds lexicographically" {
     }
 
     var iter = try index.range(null, null);
-    var offsets = std.ArrayList(u16){};
+    var offsets: std.ArrayList(u16) = .empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1210,9 +1216,9 @@ test "Index orders ObjectIds lexicographically" {
 }
 
 test "Index delete" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_test2.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_test2.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_test2.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_test2.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1229,9 +1235,9 @@ test "Index delete" {
 }
 
 test "Index load from root and query" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_load.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_load.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_load.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_load.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1279,9 +1285,9 @@ test "Index load from root and query" {
 }
 
 test "reverse index orders descending" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_reverse.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_reverse.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_reverse.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_reverse.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1308,7 +1314,7 @@ test "reverse index orders descending" {
 
     // Range scan should return entries in descending order (25, 20, 15, 10, 5)
     var iter = try index.range(null, null);
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
@@ -1321,9 +1327,9 @@ test "reverse index orders descending" {
 }
 
 test "reverse index with range bounds" {
-    var bucket = try Bucket.openFile(testing.allocator, "bplus_reverse_range.bucket");
+    var bucket = try Bucket.openFile(testing.allocator, std.testing.io, "bplus_reverse_range.bucket");
     defer bucket.deinit();
-    defer platform.deleteFile("bplus_reverse_range.bucket") catch |err| {
+    defer tryCwdDeleteFile("bplus_reverse_range.bucket") catch |err| {
         std.debug.print("Error deleting file: {}\n", .{err});
     };
 
@@ -1345,7 +1351,7 @@ test "reverse index with range bounds" {
 
     // First verify full scan works
     var full_iter = try index.range(null, null);
-    var full_offsets = std.ArrayList(u16){};
+    var full_offsets = std.ArrayList(u16).empty;
     defer full_offsets.deinit(testing.allocator);
     while (try full_iter.next()) |loc| {
         try full_offsets.append(testing.allocator, loc.offset);
@@ -1357,7 +1363,7 @@ test "reverse index with range bounds" {
     const upper = BSONValue{ .int32 = .{ .value = 20 } };
 
     var iter = try index.range(Index.RangeBound.gte(lower), Index.RangeBound.lte(upper));
-    var offsets = std.ArrayList(u16){};
+    var offsets = std.ArrayList(u16).empty;
     defer offsets.deinit(testing.allocator);
 
     while (try iter.next()) |loc| {
