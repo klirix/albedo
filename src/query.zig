@@ -146,7 +146,7 @@ pub const Filter = union(FilterType) {
             .{ "$and", .@"and" },
             .{ "$nor", .nor },
         });
-        var filters = std.ArrayListUnmanaged(Filter){};
+        var filters: std.ArrayList(Filter) = .empty;
         defer filters.deinit(ally);
 
         var iter = doc.iter();
@@ -162,7 +162,7 @@ pub const Filter = union(FilterType) {
                     .document => |d| d,
                     else => return FilterParsingErrors.InvalidQueryFilter,
                 };
-                var group_list = std.ArrayListUnmanaged(FilterGroup){};
+                var group_list: std.ArrayList(FilterGroup) = .empty;
                 defer group_list.deinit(ally);
                 var arr_iter = groups_doc.iter();
                 while (arr_iter.next()) |arr_pair| {
@@ -286,10 +286,10 @@ pub const Filter = union(FilterType) {
                 if (strValue.len < suffix.len) return false;
                 return std.mem.eql(u8, strValue[strValue.len - suffix.len ..], suffix);
             },
-            .exists => |_| {
+            .exists => {
                 return true;
             },
-            .notExists => |_| {
+            .notExists => {
                 return false;
             },
             .@"or", .@"and", .nor => unreachable,
@@ -1099,7 +1099,7 @@ test "Query.match matches objectId correctly" {
     const ally = arena.allocator();
     defer arena.deinit();
 
-    const objId = try bson.ObjectId.init();
+    const objId = bson.ObjectId.init(std.testing.io);
 
     var doc_builder = try bson.Builder.init(ally);
     defer doc_builder.deinit();
@@ -1107,7 +1107,7 @@ test "Query.match matches objectId correctly" {
     const doc = try doc_builder.finish();
     defer doc.deinit(ally);
 
-    const objId2 = try bson.ObjectId.init();
+    const objId2 = bson.ObjectId.init(std.testing.io);
     var doc2_builder = try bson.Builder.init(ally);
     defer doc2_builder.deinit();
     try doc2_builder.put("_id", objId2);

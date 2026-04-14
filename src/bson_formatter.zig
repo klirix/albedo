@@ -3,6 +3,7 @@ const bson = @import("./bson.zig");
 const ObjectId = @import("./object_id.zig").ObjectId;
 
 pub const Error = error{
+    WriteFailed,
     UnsupportedType,
     MissingField,
     TypeMismatch,

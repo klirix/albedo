@@ -50,7 +50,6 @@ fn buildWasmTarget(b: *std.Build, libModule: *std.Build.Module) void {
         "albedo_delete",
         "albedo_list",
         "albedo_data",
-        "albedo_next",
         "albedo_close_iterator",
         "albedo_vacuum",
         "albedo_version",
@@ -75,7 +74,7 @@ fn buildWasmTarget(b: *std.Build, libModule: *std.Build.Module) void {
     b.installArtifact(wasm_module);
 }
 
-fn configureAndroidDynamic(b: *std.Build, dynamic: *std.Build.Step.Compile, arch: []const u8) void {
+fn configureAndroidDynamic(b: *std.Build, libModule: *std.Build.Module, dynamic: *std.Build.Step.Compile, arch: []const u8) void {
     dynamic.root_module.link_libc = true;
     dynamic.link_z_max_page_size = 16 << 10;
     dynamic.link_z_common_page_size = 16 << 10;
@@ -86,13 +85,14 @@ fn configureAndroidDynamic(b: *std.Build, dynamic: *std.Build.Step.Compile, arch
 
     const libs = [_][]const u8{ "GLESv2", "EGL", "android", "log", "aaudio" };
     for (libs) |lib| {
-        dynamic.linkSystemLibrary2(lib, .{ .weak = true });
+        libModule.linkSystemLibrary(lib, .{ .weak = true });
     }
 
-    dynamic.addIncludePath(.{ .cwd_relative = b.fmt("{s}", .{include_dir}) });
-    dynamic.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}/35", .{ lib_dir, arch }) });
+    libModule.addIncludePath(.{ .cwd_relative = b.fmt("{s}", .{include_dir}) });
+    libModule.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}/35", .{ lib_dir, arch }) });
+    // libModule.export_table = true;
     dynamic.export_table = true;
-    dynamic.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}", .{ lib_dir, arch }) });
+    libModule.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}", .{ lib_dir, arch }) });
     dynamic.setLibCFile(.{ .cwd_relative = b.fmt("android-confs/{s}.conf", .{arch}) });
 
     dynamic.libc_file.?.addStepDependencies(&dynamic.step);
@@ -119,7 +119,7 @@ fn buildSharedLibrary(b: *std.Build, libModule: *std.Build.Module, target: std.B
     };
 
     if (isAndroid) {
-        configureAndroidDynamic(b, dynamic, arch);
+        configureAndroidDynamic(b, libModule, dynamic, arch);
     }
 
     b.installArtifact(dynamic);
@@ -132,7 +132,9 @@ fn buildStaticLibrary(b: *std.Build, libModule: *std.Build.Module, outputName: ?
         .root_module = libModule,
     });
 
-    static.bundle_compiler_rt = true;
+    libModule.strip = true;
+    libModule.unwind_tables = .none;
+    libModule.omit_frame_pointer = true;
 
     b.installArtifact(static);
 }
