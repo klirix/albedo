@@ -610,7 +610,8 @@ pub const BSONValue = union(BSONValueType) {
             .double => self.double.value == other.double.value,
             .document => false,
             .datetime => self.datetime.value == other.datetime.value,
-            .binary => std.mem.eql(u8, self.binary.value, other.binary.value),
+            .binary => self.binary.subtype == other.binary.subtype and
+                std.mem.eql(u8, self.binary.value, other.binary.value),
             .boolean => self.boolean.value == other.boolean.value,
             .null => true,
             .minKey => true,
@@ -633,8 +634,31 @@ pub const BSONValue = union(BSONValueType) {
             .document => .eq,
             .array => .eq,
             .datetime => std.math.order(self.datetime.value, other.datetime.value),
-            .binary => .eq,
-            .boolean => std.math.order(@intFromBool(self.boolean.value), @intFromBool(other.boolean.value)),
+            .binary => blk: {
+                const length_order = std.math.order(
+                    self.binary.value.len,
+                    other.binary.value.len,
+                );
+                if (length_order != .eq) break :blk length_order;
+
+                const subtype_order = std.math.order(
+                    self.binary.subtype,
+                    other.binary.subtype,
+                );
+                if (subtype_order != .eq) break :blk subtype_order;
+
+                break :blk std.mem.order(
+                    u8,
+                    self.binary.value,
+                    other.binary.value,
+                );
+            },
+            .boolean => if (self.boolean.value == other.boolean.value)
+                .eq
+            else if (self.boolean.value)
+                .gt
+            else
+                .lt,
             .null => .eq,
             .minKey => .eq,
             .maxKey => .eq,
@@ -772,6 +796,35 @@ test "BSONValue.order min/max key" {
     const another_max = BSONValue{ .maxKey = BSONMaxKey{} };
     try std.testing.expect(min_val.eql(&another_min));
     try std.testing.expect(max_val.eql(&another_max));
+}
+
+test "BSONValue.order boolean" {
+    const false_val = BSONValue{ .boolean = .{ .value = false } };
+    const true_val = BSONValue{ .boolean = .{ .value = true } };
+
+    try std.testing.expectEqual(std.math.Order.lt, false_val.order(true_val));
+    try std.testing.expectEqual(std.math.Order.gt, true_val.order(false_val));
+    try std.testing.expectEqual(std.math.Order.eq, false_val.order(false_val));
+}
+
+test "BSONValue.order binary compares length first" {
+    const short = BSONValue{ .binary = .{ .value = &.{0xff}, .subtype = 0x00 } };
+    const long = BSONValue{ .binary = .{ .value = &.{ 0x00, 0x00 }, .subtype = 0x00 } };
+
+    try std.testing.expectEqual(std.math.Order.lt, short.order(long));
+    try std.testing.expectEqual(std.math.Order.gt, long.order(short));
+}
+
+test "BSONValue binary equality agrees with ordering" {
+    const payload = [_]u8{ 0x01, 0x02, 0x03 };
+    const generic = BSONValue{ .binary = .{ .value = &payload, .subtype = 0x00 } };
+    const same_generic = BSONValue{ .binary = .{ .value = &payload, .subtype = 0x00 } };
+    const user_defined = BSONValue{ .binary = .{ .value = &payload, .subtype = 0x80 } };
+
+    try std.testing.expect(generic.eql(&same_generic));
+    try std.testing.expectEqual(std.math.Order.eq, generic.order(same_generic));
+    try std.testing.expect(!generic.eql(&user_defined));
+    try std.testing.expect(generic.order(user_defined) != .eq);
 }
 
 pub const BSONValueType = enum(u8) {

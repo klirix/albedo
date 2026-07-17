@@ -442,7 +442,7 @@ pub export fn albedo_close_iterator(iterator: *ListHandle) Result {
 }
 
 pub export fn albedo_checkpoint(bucket: *Bucket) Result {
-    bucket.checkpoint();
+    bucket.checkpoint() catch |err| return mapTransactionError(err);
     return Result.OK;
 }
 

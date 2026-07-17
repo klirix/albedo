@@ -944,13 +944,13 @@ pub const WAL = struct {
     /// delete the WAL/SHM files when this is the last connection.
     /// Checkpointing is always safe because readers detect the bumped
     /// checkpoint_generation in SHM and invalidate their page caches.
-    pub fn consumeAndClose(self: *WAL) void {
+    pub fn consumeAndClose(self: *WAL) Error!void {
         // 1. Sync any pending writes.
-        self.sync() catch {};
+        try self.sync();
 
         // 2. Truncate the WAL.  Other connections will see the bumped
         //    checkpoint_generation and invalidate their caches.
-        self.checkpoint() catch {};
+        try self.checkpoint();
 
         // 3. Disconnect from SHM and delete the file if we were the last user.
         const last_connection = self.index.deleteFile();
@@ -2103,7 +2103,7 @@ test "consumeAndClose deletes WAL and SHM files" {
         _ = cwdStatFile(std.testing.io, wal_path) catch unreachable;
         _ = cwdStatFile(std.testing.io, shm_path) catch unreachable;
 
-        w.consumeAndClose();
+        try w.consumeAndClose();
     }
 
     // After consume, both files should be gone.
@@ -2177,7 +2177,7 @@ test "consumeAndClose preserves files when another connection is active" {
     try std.testing.expectEqual(@as(u32, 2), w1.index.activeConnections());
 
     // First connection consumes and closes — files must survive.
-    w1.consumeAndClose();
+    try w1.consumeAndClose();
 
     // Both files should still exist because w2 is still alive.
     _ = cwdStatFile(std.testing.io, wal_path) catch {
@@ -2191,7 +2191,7 @@ test "consumeAndClose preserves files when another connection is active" {
     try std.testing.expectEqual(@as(u32, 1), w2.index.activeConnections());
 
     // Closing the last connection should remove the files.
-    w2.consumeAndClose();
+    try w2.consumeAndClose();
 
     if (cwdStatFile(std.testing.io, wal_path)) |_| {
         return error.TestUnexpectedResult; // WAL file should be gone
