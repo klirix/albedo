@@ -7,7 +7,7 @@ const Query = albedo.Query;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-const NUM_RECORDS: usize = 100_000;
+const NUM_RECORDS: usize = 10_000;
 const SEARCH_ITERATIONS: usize = 1000;
 const SEARCH_TARGET_NAME = std.fmt.comptimePrint("record_{}", .{NUM_RECORDS - 2});
 const SEARCH_TARGET_AGE: i32 = 42;
@@ -103,11 +103,12 @@ fn fmtTimeF(ns: f64) [10]u8 {
 
 fn printTableHeader() void {
     print("\n  {s}{s}{s:<22} {s:>5}  {s:>23}  {s:>23}  {s:>10} {s:>10} {s:>10}{s}\n", .{
-        C.bold,             C.cyan,
-        "benchmark",        "runs",
-        "time (avg ± σ)", "(min … max)",
-        "p75",              "p99",
-        "p995",             C.reset,
+        C.bold,      C.cyan,
+        "benchmark", "runs",
+        "time (avg ± σ)",
+        "(min … max)",
+        "p75",       "p99",
+        "p995",      C.reset,
     });
     write("  ");
     for (0..112) |_| write("\xe2\x94\x80"); // ─
@@ -405,9 +406,9 @@ fn benchAlbedoBatchUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples
             const name = std.fmt.bufPrint(&name_buf, "record_{d:0>6}", .{@as(usize, @intCast(age))}) catch unreachable;
 
             var replacement = try bson.fmt.serialize(.{
-                .name   = name,
-                .age    = age,
-                .email  = email,
+                .name = name,
+                .age = age,
+                .email = email,
                 .active = true,
             }, arena_alloc.allocator());
 

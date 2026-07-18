@@ -72,6 +72,12 @@ fn mapQueryParseError(err: anyerror) Result {
         Query.QueryParsingErrors.InvalidCursorOffset,
         => Result.InvalidCursor,
         Query.QueryParsingErrors.OutOfMemory => Result.OutOfMemory,
+        error.InvalidLength,
+        error.InvalidType,
+        error.MissingTerminator,
+        error.InvalidBoolean,
+        error.NestingTooDeep,
+        => Result.InvalidFormat,
         else => Result.Error,
     };
 }
@@ -103,6 +109,13 @@ fn mapWriteError(err: anyerror) Result {
         error.TransactionActive => Result.TransactionActive,
         error.InvalidTransaction => Result.InvalidTransaction,
         error.TransactionBusy => Result.TransactionBusy,
+        error.InvalidLength,
+        error.InvalidType,
+        error.MissingTerminator,
+        error.InvalidBoolean,
+        error.NestingTooDeep,
+        error.InvalidFormat,
+        => Result.InvalidFormat,
         else => Result.Error,
     };
 }
@@ -207,10 +220,7 @@ pub export fn albedo_transaction_delete(tx: *Bucket.Transaction, queryBuffer: [*
         return Result.OutOfMemory;
     };
 
-    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => return Result.OutOfMemory,
-        else => return Result.Error,
-    };
+    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| return mapQueryParseError(err);
     defer query.deinit(local_ally);
 
     tx.delete(query) catch |err| return mapWriteError(err);
@@ -238,10 +248,7 @@ pub export fn albedo_transaction_transform(
     const query = Query.parseRaw(
         arena_ptr.allocator(),
         arena_ptr.allocator().dupe(u8, queryBufProper) catch return Result.OutOfMemory,
-    ) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => return Result.OutOfMemory,
-        else => return Result.Error,
-    };
+    ) catch |err| return mapQueryParseError(err);
 
     const iter = tx.transformIterate(arena_ptr, query) catch |err| return mapWriteError(err);
     iter.owns_arena = true;
@@ -356,14 +363,7 @@ pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen
         return Result.OutOfMemory;
     };
 
-    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => {
-            return Result.OutOfMemory;
-        },
-        else => {
-            return Result.Error;
-        },
-    };
+    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| return mapQueryParseError(err);
     defer query.deinit(local_ally);
 
     bucket.delete(query) catch |err| return mapWriteError(err);
@@ -481,14 +481,7 @@ pub export fn albedo_transform(
         arena_ptr.allocator().dupe(u8, queryBufProper) catch {
             return Result.OutOfMemory;
         },
-    ) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => {
-            return Result.OutOfMemory;
-        },
-        else => {
-            return Result.Error;
-        },
-    };
+    ) catch |err| return mapQueryParseError(err);
 
     // Create an arena for the iterator and mark it as owned
 

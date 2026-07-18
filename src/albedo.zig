@@ -657,6 +657,7 @@ pub const Bucket = struct {
 
         pub fn insert(self: *Transaction, insertable: bson.BSONDocument) !DocInsertResult {
             try self.ensureActive();
+            try insertable.validate();
             return self.bucket.insertLocked(insertable, false);
         }
 
@@ -2091,6 +2092,7 @@ pub const Bucket = struct {
 
     pub fn insert(self: *Bucket, insertable: bson.BSONDocument) !DocInsertResult {
         try self.ensureNoActiveTransaction();
+        try insertable.validate();
         try self.lock();
         defer self.unlock();
         return self.insertLocked(insertable, true);
@@ -4231,6 +4233,7 @@ pub const Bucket = struct {
         pub const IteratorError = error{
             OutOfMemory,
             ScanError,
+            InvalidFormat,
             IteratorDrained,
             DuplicateKey,
         };
@@ -4274,6 +4277,7 @@ pub const Bucket = struct {
             if (self.index >= self.targets.len) {
                 return error.IteratorDrained;
             }
+            if (updated) |new_doc| new_doc.validate() catch return error.InvalidFormat;
 
             var doc = try self.ensureDoc();
 

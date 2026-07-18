@@ -985,9 +985,11 @@ pub const Query = struct {
         Sector.SectorParsingErrors ||
         Projection.ProjectionParsingErrors ||
         Cursor.CursorParsingErrors ||
+        bson.ValidationError ||
         Allocator.Error);
 
     pub fn parse(ally: Allocator, queryDoc: bson.BSONDocument) QueryParsingErrors!Query {
+        try queryDoc.validate();
         const projectionValue = queryDoc.get("projection");
         const projection = if (projectionValue) |value| try Projection.parse(ally, value) else null;
         errdefer if (projection) |value| value.deinit(ally);
