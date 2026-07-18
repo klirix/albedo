@@ -983,6 +983,85 @@ test "BSONDocument supports empty keys and rejects embedded null keys" {
     }}));
 }
 
+test "fuzz BSON validation and accessors" {
+    try std.testing.fuzz({}, fuzzBSONValidation, .{ .corpus = &.{
+        "\x05\x00\x00\x00\x05\x00\x00\x00\x00",
+        "\x0c\x00\x00\x00\x0c\x00\x00\x00\x10a\x00\x01\x00\x00\x00\x00",
+        "\x0e\x00\x00\x00\x0e\x00\x00\x00\x02s\x00\x02\x00\x00\x00x\x00\x00",
+        "\x0d\x00\x00\x00\x0d\x00\x00\x00\x03d\x00\x05\x00\x00\x00\x00\x00",
+    } });
+}
+
+fn fuzzBSONValidation(_: void, smith: *std.testing.Smith) anyerror!void {
+    var storage: [4096]u8 = undefined;
+    const bytes = storage[0..smith.slice(&storage)];
+    const doc = BSONDocument.init(bytes);
+    doc.validate() catch {
+        try fuzzBSONEncoding({}, smith);
+        return;
+    };
+
+    try exerciseValidatedDocument(doc);
+
+    var parse_buffer: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&parse_buffer);
+    var parsed = fmt.parse(BSONDocument, doc, fba.allocator()) catch |err| switch (err) {
+        error.OutOfMemory => return,
+        else => return err,
+    };
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try fuzzBSONEncoding({}, smith);
+}
+
+fn exerciseValidatedDocument(doc: BSONDocument) anyerror!void {
+    var count: u32 = 0;
+    var iter = doc.iter();
+    while (iter.next()) |pair| {
+        try std.testing.expect(doc.get(pair.key) != null);
+        switch (pair.value) {
+            .document, .array => |child| try exerciseValidatedDocument(child),
+            else => {},
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(count, doc.keyNumber());
+}
+
+test "fuzz BSON encoding" {
+    try std.testing.fuzz({}, fuzzBSONEncoding, .{ .corpus = &.{
+        "\x03\x00\x00\x00key\x05\x00\x00\x00hello\x02\x00\x00\x00\x00\xff",
+    } });
+}
+
+fn fuzzBSONEncoding(_: void, smith: *std.testing.Smith) anyerror!void {
+    var key_buffer: [64]u8 = undefined;
+    var string_buffer: [512]u8 = undefined;
+    var binary_buffer: [512]u8 = undefined;
+    const key = key_buffer[0..smith.slice(&key_buffer)];
+    const string = string_buffer[0..smith.slice(&string_buffer)];
+    const binary = binary_buffer[0..smith.slice(&binary_buffer)];
+
+    var allocation_buffer: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocation_buffer);
+    const allocator = fba.allocator();
+    var builder = try Builder.init(allocator);
+    defer builder.deinit();
+    builder.putValue(key, .{ .string = .{ .value = string } }) catch |err| switch (err) {
+        error.InvalidKey => return,
+        else => return err,
+    };
+    builder.putValue(key, .{ .binary = .{ .value = binary, .subtype = 0 } }) catch |err| switch (err) {
+        error.InvalidKey => return,
+        else => return err,
+    };
+
+    const doc = try builder.finish();
+    defer doc.deinit(allocator);
+    try doc.validate();
+    try exerciseValidatedDocument(doc);
+}
+
 pub const BSONDocument = struct {
     // values: []BSONKeyValuePair,
     buffer: []const u8,
