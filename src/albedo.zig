@@ -2966,7 +2966,11 @@ pub const Bucket = struct {
             }
             const doc = self.docList[self.index];
             self.index += 1;
-            return doc;
+            return try self.project(doc);
+        }
+
+        fn project(self: *ListIterator, doc: BSONDocument) error{OutOfMemory}!BSONDocument {
+            return self.query.project(self.ally, doc) catch return error.OutOfMemory;
         }
 
         fn rememberRecord(self: *ListIterator, record: *const ListRecord) void {
@@ -3012,7 +3016,7 @@ pub const Bucket = struct {
         pub fn nextUnfetched(self: *ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument {
             const record = try self.nextFullScanRecord() orelse return null;
             self.rememberRecord(&record);
-            return record.doc;
+            return try self.project(record.doc);
         }
 
         fn nextIndexRangeRecord(self: *ListIterator) error{ OutOfMemory, ScanError }!?ListRecord {
@@ -3373,7 +3377,7 @@ pub const Bucket = struct {
                 try self.nextIndexRangeRecord();
             const final_record = record orelse return null;
             self.rememberRecord(&final_record);
-            return final_record.doc;
+            return try self.project(final_record.doc);
         }
 
         fn nextPointFilterValue(self: *ListIterator) ?bson.BSONValue {
@@ -4520,7 +4524,11 @@ pub const Bucket = struct {
         const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
         const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
-        return resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
+        const selected = resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
+        if (q.projection != null) {
+            for (selected) |*doc| doc.* = try q.project(allocator, doc.*);
+        }
+        return selected;
     }
 
     fn readDocAt(
@@ -4918,6 +4926,46 @@ fn testListCount(bucket: *Bucket, allocator: std.mem.Allocator, json: []const u8
         count += 1;
     }
     return count;
+}
+
+test "Bucket projections pick or omit fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
+    defer bucket.deinit();
+
+    var doc = try bson.BSONDocument.fromJSON(allocator, "{\"data\":\"kept\",\"data2\":\"hidden\"}");
+    defer doc.deinit(allocator);
+    _ = try bucket.insert(doc);
+
+    var pick_doc = try bson.BSONDocument.fromJSON(allocator, "{\"projection\":{\"pick\":[\"data\"]}}");
+    defer pick_doc.deinit(allocator);
+    var pick_query = try query.Query.parse(allocator, pick_doc);
+    defer pick_query.deinit(allocator);
+
+    var pick_arena = std.heap.ArenaAllocator.init(allocator);
+    defer pick_arena.deinit();
+    var iter = try bucket.listIterate(&pick_arena, pick_query);
+    defer iter.deinit() catch {};
+    const picked = (try iter.next(iter)).?;
+    try testing.expectEqual(@as(u32, 1), picked.keyNumber());
+    try testing.expectEqualStrings("kept", picked.get("data").?.string.value);
+    try testing.expect(picked.get("data2") == null);
+
+    var omit_doc = try bson.BSONDocument.fromJSON(allocator, "{\"projection\":{\"omit\":[\"data\"]}}");
+    defer omit_doc.deinit(allocator);
+    var omit_query = try query.Query.parse(allocator, omit_doc);
+    defer omit_query.deinit(allocator);
+    const omitted = try bucket.list(allocator, omit_query);
+    try testing.expectEqual(@as(usize, 1), omitted.len);
+    try testing.expect(omitted[0].get("data") == null);
+    try testing.expectEqualStrings("hidden", omitted[0].get("data2").?.string.value);
+
+    var numeric_doc = try bson.BSONDocument.fromJSON(allocator, "{\"projection\":{\"data\":1}}");
+    defer numeric_doc.deinit(allocator);
+    try testing.expectError(error.InvalidQueryProjection, query.Query.parse(allocator, numeric_doc));
 }
 
 test "Bucket.TransformIterator updates document" {

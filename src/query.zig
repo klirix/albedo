@@ -10,7 +10,7 @@
 ///  "query": {"field.path": {"$eq": "value"}}, // Flat field.path -> filter
 ///  "sort": {"asc": "field"} | {"desc": "field"}, // Sort by field, only one field allowed
 ///  "sector": {"offset": 0, "limit": 10},  // Offset and limit for pagination
-///  "projection": {"omit": ["path"] } | {"pick": ["path"]} // Projection of fields wither
+///  "projection": {"pick": ["path"]} | {"omit": ["path"]} // Pick or omit top-level fields
 /// }
 const std = @import("std");
 const bson = @import("bson.zig");
@@ -800,6 +800,69 @@ test "Sector.parse" {
     try std.testing.expectEqual(sector.limit, 10);
 }
 
+pub const Projection = struct {
+    const Mode = enum { pick, omit };
+
+    mode: Mode,
+    fields: BSONDoc,
+
+    pub const ProjectionParsingErrors = error{
+        InvalidQueryProjection,
+        InvalidQueryProjectionPath,
+        InvalidQueryProjectionValue,
+    };
+
+    pub fn parse(ally: Allocator, value: bson.BSONValue) (ProjectionParsingErrors || Allocator.Error)!?Projection {
+        if (value != .document) return error.InvalidQueryProjection;
+
+        var iter = value.document.iter();
+        const pair = iter.next() orelse return null;
+        if (iter.next() != null) return error.InvalidQueryProjection;
+
+        const mode: Mode = if (std.mem.eql(u8, pair.key, "pick"))
+            .pick
+        else if (std.mem.eql(u8, pair.key, "omit"))
+            .omit
+        else
+            return error.InvalidQueryProjection;
+        if (pair.value != .array) return error.InvalidQueryProjectionValue;
+
+        var fields = pair.value.array.iter();
+        while (fields.next()) |field| {
+            if (field.value != .string) return error.InvalidQueryProjectionValue;
+            if (field.value.string.value.len == 0) return error.InvalidQueryProjectionPath;
+        }
+
+        return .{
+            .mode = mode,
+            .fields = BSONDoc.init(try ally.dupe(u8, pair.value.array.buffer)),
+        };
+    }
+
+    pub fn deinit(self: Projection, ally: Allocator) void {
+        self.fields.deinit(ally);
+    }
+
+    pub fn apply(self: Projection, ally: Allocator, doc: BSONDoc) !BSONDoc {
+        var pairs: std.ArrayList(bson.BSONKeyValuePair) = .empty;
+        defer pairs.deinit(ally);
+
+        var iter = doc.iter();
+        while (iter.next()) |pair| {
+            var selected = false;
+            var fields = self.fields.iter();
+            while (fields.next()) |field| {
+                if (std.mem.eql(u8, field.value.string.value, pair.key)) {
+                    selected = true;
+                    break;
+                }
+            }
+            if (selected == (self.mode == .pick)) try pairs.append(ally, pair);
+        }
+        return BSONDoc.fromPairs(ally, pairs.items);
+    }
+};
+
 pub const CursorMode = enum {
     full_scan,
     index_range,
@@ -909,7 +972,7 @@ pub const Query = struct {
     sortConfig: ?SortConfig,
     sector: ?Sector,
     cursor: ?Cursor,
-    // projection: bson.Document,
+    projection: ?Projection,
 
     pub fn parseRaw(ally: Allocator, rawQuery: []const u8) QueryParsingErrors!Query {
         const queryDoc = bson.BSONDocument.init(rawQuery);
@@ -920,10 +983,15 @@ pub const Query = struct {
     pub const QueryParsingErrors = (SortConfig.SortParsingErrors ||
         Filter.FilterParsingErrors ||
         Sector.SectorParsingErrors ||
+        Projection.ProjectionParsingErrors ||
         Cursor.CursorParsingErrors ||
         Allocator.Error);
 
     pub fn parse(ally: Allocator, queryDoc: bson.BSONDocument) QueryParsingErrors!Query {
+        const projectionValue = queryDoc.get("projection");
+        const projection = if (projectionValue) |value| try Projection.parse(ally, value) else null;
+        errdefer if (projection) |value| value.deinit(ally);
+
         const filterDoc = queryDoc.get("query");
         const filters = if (filterDoc) |doc| try Filter.parse(ally, doc) else try ally.alloc(Filter, 0);
         const sortDoc = queryDoc.get("sort");
@@ -938,7 +1006,7 @@ pub const Query = struct {
             .sortConfig = sortConfig,
             .sector = sector,
             .cursor = cursor,
-            // .projection = queryDoc.get("projection") catch bson.Document{},
+            .projection = projection,
         };
 
         return query;
@@ -953,6 +1021,7 @@ pub const Query = struct {
                 .desc => |descSort| ally.free(descSort),
             }
         }
+        if (self.projection) |projection| projection.deinit(ally);
     }
 
     pub fn match(self: Query, doc: *const bson.BSONDocument) bool {
@@ -960,6 +1029,10 @@ pub const Query = struct {
             if (!filter.match(doc)) return false;
         }
         return true;
+    }
+
+    pub fn project(self: Query, ally: Allocator, doc: BSONDoc) !BSONDoc {
+        return if (self.projection) |projection| projection.apply(ally, doc) else doc;
     }
 
     pub fn sort(sortConfig: SortConfig, a: bson.BSONDocument, b: bson.BSONDocument) bool {
