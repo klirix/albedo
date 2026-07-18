@@ -577,6 +577,7 @@ pub const Index = struct {
 
             const key_len = promoted_entry.value_bytes.len;
             const buf = try ally.alloc(u8, key_len);
+            errdefer ally.free(buf);
             std.mem.copyForwards(u8, buf, promoted_entry.value_bytes);
 
             const new_page = try self.index.bucket.createNewPage(.Index);
@@ -723,6 +724,9 @@ pub const Index = struct {
     }
 
     pub fn create(bucket: *Bucket) !*Index {
+        const index = try bucket.allocator.create(Index);
+        errdefer bucket.allocator.destroy(index);
+
         const page = try bucket.createNewPage(.Index);
         page.data[0] = 1;
         const prev_bytes = page.data[1..9];
@@ -732,7 +736,6 @@ pub const Index = struct {
         page.header.used_size = Node.leafDataStart();
         try bucket.writePage(page);
 
-        const index = try bucket.allocator.create(Index);
         index.* = .{
             .bucket = bucket,
             .allocator = bucket.allocator,

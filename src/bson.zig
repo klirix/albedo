@@ -940,6 +940,19 @@ test "from json" {
     try std.testing.expectEqualStrings("val", doc.getPath("key.key2").?.string.value);
 }
 
+test "from json supports nested arrays" {
+    const json = "{\"items\":[\"x\",2,true,null,{\"name\":\"n\"},[3]]}";
+    const doc = try BSONDocument.fromJSON(std.testing.allocator, json);
+    defer doc.deinit(std.testing.allocator);
+
+    try doc.validate();
+    try std.testing.expectEqualStrings("x", doc.getPath("items.0").?.string.value);
+    try std.testing.expectEqual(@as(i32, 2), doc.getPath("items.1").?.int32.value);
+    try std.testing.expect(doc.getPath("items.2").?.boolean.value);
+    try std.testing.expectEqualStrings("n", doc.getPath("items.4.name").?.string.value);
+    try std.testing.expectEqual(@as(i32, 3), doc.getPath("items.5.0").?.int32.value);
+}
+
 test "BSONDocument validates malformed data and nesting depth" {
     const truncated = [_]u8{ 5, 0, 0, 0 };
     try std.testing.expectError(error.InvalidLength, BSONDocument.init(&truncated).validate());
@@ -1166,7 +1179,7 @@ pub const BSONDocument = struct {
 
     pub const fromJSON = if (builtin.is_test) fromJSONInternal else {};
 
-    fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
+    fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) anyerror![]u8 {
         var pairs = std.Io.Writer.Allocating.init(allocator);
         errdefer pairs.deinit();
         const writer = &pairs.writer;
@@ -1180,76 +1193,98 @@ pub const BSONDocument = struct {
                 return error.InvalidJSON;
             }
             const key = token.allocated_string;
+            defer allocator.free(key);
             if (mem.indexOfScalar(u8, key, 0) != null) return error.InvalidKey;
             const nextType = try json.peekNextTokenType();
-            if (nextType == .object_end) {
-                break;
-            }
-
-            switch (nextType) {
-                .number => {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-                    if (std.mem.indexOf(u8, token.allocated_number, ".") != null) {
-                        const value = try std.fmt.parseFloat(f64, token.allocated_number);
-                        try writer.writeByte(@intFromEnum(BSONValueType.double));
-                        try writer.writeAll(key);
-                        try writer.writeByte(0);
-                        try writer.writeAll(&mem.toBytes(value));
-                        allocator.free(token.allocated_number);
-                    } else {
-                        const value = try std.fmt.parseInt(i32, token.allocated_number, 10);
-                        try writer.writeByte(@intFromEnum(BSONValueType.int32));
-                        try writer.writeAll(key);
-                        try writer.writeByte(0);
-                        try writer.writeInt(i32, value, .little);
-                        allocator.free(token.allocated_number);
-                    }
-                },
-                .string => {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-                    if (token.allocated_string.len >= std.math.maxInt(i32)) return error.ValueTooLarge;
-
-                    try writer.writeByte(@intFromEnum(BSONValueType.string));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                    try writer.writeInt(u32, @intCast(token.allocated_string.len + 1), .little);
-                    try writer.writeAll(token.allocated_string);
-                    try writer.writeByte(0);
-                    allocator.free(token.allocated_string);
-                },
-                .true, .false => |tok| {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-                    try writer.writeByte(@intFromEnum(BSONValueType.boolean));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                    try writer.writeByte(if (tok == .true) 0x01 else 0x00);
-                },
-                .null => {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-                    try writer.writeByte(@intFromEnum(BSONValueType.null));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                },
-                .object_begin => {
-                    // token = try json.nextAlloc(allocator, .alloc_always);
-                    const value = try jsonToDoc(json, allocator);
-                    try writer.writeByte(@intFromEnum(BSONValueType.document));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                    try writer.writeAll(value);
-                    allocator.free(value);
-                },
-                else => {
-                    return error.InvalidJSON;
-                },
-            }
-            allocator.free(key);
+            try writeJsonValue(json, allocator, writer, key, nextType);
             token = try json.nextAlloc(allocator, .alloc_always);
         }
         if (pairs.written().len >= std.math.maxInt(i32)) return error.ValueTooLarge;
         std.mem.writeInt(u32, pairs.written()[0..4], @intCast(pairs.written().len + 1), .little);
         try writer.writeByte(0); // Null terminator for the document
         return pairs.toOwnedSlice();
+    }
+
+    fn jsonToArray(json: *std.json.Scanner, allocator: mem.Allocator) anyerror![]u8 {
+        var pairs = std.Io.Writer.Allocating.init(allocator);
+        errdefer pairs.deinit();
+        const writer = &pairs.writer;
+        try writer.writeInt(u32, 0, .little);
+        if (try json.next() != .array_begin) return error.InvalidJSON;
+
+        var index: usize = 0;
+        while (true) : (index += 1) {
+            const next_type = try json.peekNextTokenType();
+            if (next_type == .array_end) {
+                _ = try json.next();
+                break;
+            }
+
+            var key_buffer: [20]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buffer, "{d}", .{index}) catch unreachable;
+            try writeJsonValue(json, allocator, writer, key, next_type);
+        }
+
+        if (pairs.written().len >= std.math.maxInt(i32)) return error.ValueTooLarge;
+        std.mem.writeInt(u32, pairs.written()[0..4], @intCast(pairs.written().len + 1), .little);
+        try writer.writeByte(0);
+        return pairs.toOwnedSlice();
+    }
+
+    fn writeJsonValue(
+        json: *std.json.Scanner,
+        allocator: mem.Allocator,
+        writer: *std.Io.Writer,
+        key: []const u8,
+        value_type: std.json.TokenType,
+    ) anyerror!void {
+        switch (value_type) {
+            .number => {
+                const token = try json.nextAlloc(allocator, .alloc_always);
+                defer allocator.free(token.allocated_number);
+                if (std.mem.indexOfAny(u8, token.allocated_number, ".eE") != null) {
+                    try writeJsonElementHeader(writer, .double, key);
+                    try writer.writeAll(&mem.toBytes(try std.fmt.parseFloat(f64, token.allocated_number)));
+                } else {
+                    try writeJsonElementHeader(writer, .int32, key);
+                    try writer.writeInt(i32, try std.fmt.parseInt(i32, token.allocated_number, 10), .little);
+                }
+            },
+            .string => {
+                const token = try json.nextAlloc(allocator, .alloc_always);
+                defer allocator.free(token.allocated_string);
+                if (token.allocated_string.len >= std.math.maxInt(i32)) return error.ValueTooLarge;
+                try writeJsonElementHeader(writer, .string, key);
+                try writer.writeInt(u32, @intCast(token.allocated_string.len + 1), .little);
+                try writer.writeAll(token.allocated_string);
+                try writer.writeByte(0);
+            },
+            .true, .false => |token_type| {
+                _ = try json.next();
+                try writeJsonElementHeader(writer, .boolean, key);
+                try writer.writeByte(if (token_type == .true) 1 else 0);
+            },
+            .null => {
+                _ = try json.next();
+                try writeJsonElementHeader(writer, .null, key);
+            },
+            .object_begin, .array_begin => |token_type| {
+                const value = if (token_type == .object_begin)
+                    try jsonToDoc(json, allocator)
+                else
+                    try jsonToArray(json, allocator);
+                defer allocator.free(value);
+                try writeJsonElementHeader(writer, if (token_type == .object_begin) .document else .array, key);
+                try writer.writeAll(value);
+            },
+            else => return error.InvalidJSON,
+        }
+    }
+
+    fn writeJsonElementHeader(writer: *std.Io.Writer, value_type: BSONValueType, key: []const u8) !void {
+        try writer.writeByte(@intFromEnum(value_type));
+        try writer.writeAll(key);
+        try writer.writeByte(0);
     }
 
     const PairIterator = struct {

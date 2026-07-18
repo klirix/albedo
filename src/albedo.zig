@@ -824,6 +824,7 @@ pub const Bucket = struct {
                 // std.debug.print("Failed to load index at page {d} for path {s}\n", .{ page_id, key });
                 return BucketInitErrors.LoadIndexError;
             };
+            errdefer idx.deinit();
 
             // Insert the index into the hash map
             try self.indexes.put(key, idx);
@@ -1022,10 +1023,11 @@ pub const Bucket = struct {
         };
 
         const generator = ObjectIdGenerator.init(io);
-        errdefer {
+        var raw_resources_owned = true;
+        errdefer if (raw_resources_owned) {
             closeFsFile(io, new_file);
             ally.free(stored_path);
-        }
+        };
 
         // Bootstrap the file WITHOUT the WAL so that the header and meta
         // page are written directly to the main file.  This ensures the
@@ -1047,6 +1049,8 @@ pub const Bucket = struct {
             .wal_auto_checkpoint = options.wal_auto_checkpoint,
             .wal = null,
         };
+        raw_resources_owned = false;
+        errdefer bucket.deinitPartial();
         bucket.flushHeader() catch return BucketInitErrors.FileWriteError;
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
@@ -1085,6 +1089,7 @@ pub const Bucket = struct {
             .oplog_size = options.oplog_size,
             .wal_auto_checkpoint = options.wal_auto_checkpoint,
         };
+        errdefer bucket.deinitPartial();
 
         const meta = bucket.createNewPage(.Meta) catch return BucketInitErrors.InitializationError;
         bucket.ensureIndex("_id", .{ .unique = 1 }) catch return BucketInitErrors.InitializationError;
@@ -1127,10 +1132,11 @@ pub const Bucket = struct {
         };
 
         const generator = ObjectIdGenerator.init(io);
-        errdefer {
+        var raw_resources_owned = true;
+        errdefer if (raw_resources_owned) {
             closeFsFile(io, file);
             ally.free(stored_path);
-        }
+        };
 
         const existing_header = BucketHeader.read(header_bytes[0..BucketHeader.byteSize]);
         const wal_instance: ?WAL = if (effective_wal) try initWal(ally, io, path, options.oplog_size, existing_header.replication_generation) else null;
@@ -1152,13 +1158,8 @@ pub const Bucket = struct {
             .wal_auto_checkpoint = options.wal_auto_checkpoint,
             .wal = wal_instance,
         };
-        errdefer {
-            if (bucket.file) |fh| closeFsFile(io, fh);
-            bucket.pageCache.deinit();
-            bucket.indexes.deinit();
-            ally.free(bucket.path);
-            if (bucket.wal) |*w| w.deinit();
-        }
+        raw_resources_owned = false;
+        errdefer bucket.deinitPartial();
 
         // In WAL mode the SHM index (rebuilt inside WAL.init) already
         // makes un-checkpointed frames visible to loadPage.  We only
@@ -1511,17 +1512,15 @@ pub const Bucket = struct {
         const header = PageHeader.read(header_bytes[0..]);
 
         const page = try self.allocator.create(Page);
+        errdefer self.allocator.destroy(page);
         page.* = try Page.init(self.allocator, self, header);
+        errdefer page.deinit(self.allocator);
 
         if (page.header.page_id != page_id) {
-            Page.deinit(page, self.allocator);
-            self.allocator.destroy(page);
             return PageError.InvalidPageId;
         }
 
         fileReadAllAt(self.io, file, page.data, offset + PageHeader.byteSize) catch |err| {
-            Page.deinit(page, self.allocator);
-            self.allocator.destroy(page);
             return switch (err) {
                 else => PageError.PageNotFound,
             };
@@ -1536,7 +1535,9 @@ pub const Bucket = struct {
     fn cachePageFromWal(self: *Bucket, page_id: u64, data: [wal_mod.DEFAULT_PAGE_SIZE]u8) !*Page {
         const header = PageHeader.read(data[0..PageHeader.byteSize]);
         const page = try self.allocator.create(Page);
+        errdefer self.allocator.destroy(page);
         page.* = try Page.init(self.allocator, self, header);
+        errdefer page.deinit(self.allocator);
         @memcpy(page.data, data[PageHeader.byteSize..]);
         try self.pageCache.put(page_id, page);
         return page;
@@ -1992,10 +1993,17 @@ pub const Bucket = struct {
         // For now, we'll just use the page_id as a sequential number
         // In a real implementation, you'd want to track available page IDs
         const new_page_id = self.header.page_count;
-        self.header.page_count += 1;
-        try self.flushHeader(); // Ensure the header is flushed to disk
         const page = try self.allocator.create(Page);
+        errdefer self.allocator.destroy(page);
         page.* = try Page.init(self.allocator, self, PageHeader.init(page_type, new_page_id));
+        errdefer page.deinit(self.allocator);
+
+        self.header.page_count += 1;
+        errdefer {
+            self.header.page_count = new_page_id;
+            self.flushHeader() catch {};
+        }
+        try self.flushHeader(); // Ensure the header is flushed to disk
         if (self.active_tx) |tx| {
             try tx.pending_pages.put(new_page_id, page);
             return page;
@@ -4811,6 +4819,24 @@ pub const Bucket = struct {
         new_bucket_owned = false;
 
         if (reopen_error) |err| return err;
+    }
+
+    fn deinitPartial(self: *Bucket) void {
+        if (self.wal) |*w| w.deinit();
+
+        var idx_iter = self.indexes.iterator();
+        while (idx_iter.next()) |pair| {
+            pair.value_ptr.*.deinit();
+            self.allocator.free(@constCast(pair.key_ptr.*));
+        }
+        self.indexes.deinit();
+
+        self.pageCache.clear(self.allocator);
+        self.pageCache.deinit();
+        self.wal_pending_pages.deinit();
+        self.allocator.free(self.path);
+
+        if (self.file) |file| closeFsFile(self.io, file);
     }
 
     pub fn deinit(self: *Bucket) void {
