@@ -1370,7 +1370,7 @@ pub const Bucket = struct {
             var values: std.ArrayList(BSONValue) = .empty;
             defer values.deinit(temp_allocator);
 
-            const has_values = try self.gatherIndexValuesForPath(&doc, path, options, &values);
+            const has_values = try self.gatherIndexValuesForPath(&doc, path, options, &values, temp_allocator);
             if (!has_values) continue;
 
             // No need to clone values since they're in the arena and will be used immediately
@@ -1872,7 +1872,7 @@ pub const Bucket = struct {
         @memcpy(batch[0..ReplicationBatchHeader.byte_size], &header_bytes);
 
         const wal_offset = w.data_offset + from.next_frame_index * @as(u64, WAL.frame_size);
-        walReadAllAt(w.read_fd, batch[ReplicationBatchHeader.byte_size..], wal_offset) catch return error.WalReadFailed;
+        walReadAllAt(w.io, w.read_fd, batch[ReplicationBatchHeader.byte_size..], wal_offset) catch return error.WalReadFailed;
 
         return batch;
     }
@@ -1909,7 +1909,7 @@ pub const Bucket = struct {
             const existing = try self.allocator.alloc(u8, frame_bytes.len);
             defer self.allocator.free(existing);
             const wal_offset = w.data_offset + batch_header.start_frame_index * @as(u64, WAL.frame_size);
-            walReadAllAt(w.read_fd, existing, wal_offset) catch return error.WalReadFailed;
+            walReadAllAt(w.io, w.read_fd, existing, wal_offset) catch return error.WalReadFailed;
             if (!std.mem.eql(u8, existing, frame_bytes)) return error.ReplicationGap;
             return self.replicationCursor();
         }
@@ -2139,7 +2139,7 @@ pub const Bucket = struct {
             const path = entry.key_ptr.*;
             self.bindIndex(index_ptr);
 
-            const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values);
+            const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values, self.allocator);
             if (!has_values) {
                 continue;
             }
@@ -2372,15 +2372,16 @@ pub const Bucket = struct {
     }
 
     fn gatherIndexValuesForPath(
-        self: *Bucket,
+        _: *Bucket,
         doc: *const bson.BSONDocument,
         path: []const u8,
         options: IndexOptions,
         values: *std.ArrayListUnmanaged(BSONValue),
+        allocator: mem.Allocator,
     ) (IndexValueError || mem.Allocator.Error)!bool {
         var appended: usize = 0;
         if (doc.getPath(path)) |value| {
-            appended = try collectIndexableValue(values, self.allocator, value);
+            appended = try collectIndexableValue(values, allocator, value);
             if (appended > 0) {
                 return true;
             }
@@ -2390,7 +2391,7 @@ pub const Bucket = struct {
             return false;
         }
 
-        try values.append(self.allocator, BSONValue{ .null = bson.BSONNull{} });
+        try values.append(allocator, BSONValue{ .null = bson.BSONNull{} });
         return true;
     }
 
@@ -4323,7 +4324,7 @@ pub const Bucket = struct {
                 }
 
                 self.bucket.bindIndex(index_ptr);
-                const has_values = self.bucket.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values) catch |err| switch (err) {
+                const has_values = self.bucket.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values, self.bucket.allocator) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.IndexedStringTooLong => return error.ScanError,
                 };
@@ -4667,7 +4668,7 @@ pub const Bucket = struct {
                 }
 
                 self.bindIndex(index_ptr);
-                const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values);
+                const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values, self.allocator);
                 if (!has_values) continue; // sparse index missing field => nothing was inserted
 
                 try planned_index_deletes.append(self.allocator, PlannedIndexInsert{
@@ -4901,13 +4902,12 @@ fn cwdAccess(path: []const u8) !void {
     return std.Io.Dir.cwd().access(std.testing.io, path, .{});
 }
 
-fn walReadAllAt(fd: wal_mod.NativeFd, dest: []u8, offset: u64) !void {
-    if (!builtin.is_test) unreachable;
+fn walReadAllAt(io: std.Io, fd: wal_mod.NativeFd, dest: []u8, offset: u64) !void {
     const file: std.Io.File = .{
         .handle = fd,
         .flags = .{ .nonblocking = false },
     };
-    var reader = std.Io.File.Reader.init(file, std.testing.io, &.{});
+    var reader = std.Io.File.Reader.init(file, io, &.{});
     try reader.seekTo(offset);
     try reader.interface.readSliceAll(dest);
 }
