@@ -20,6 +20,14 @@ pub const Index = struct {
     allocator: mem.Allocator,
     options: IndexOptions = .{},
     root_page_id: u64,
+    relocate_hint: ?RelocateHint = null,
+
+    const RelocateHint = struct {
+        page_id: u64,
+        offset: u16,
+        page: *Page,
+        transaction_sequence: u64,
+    };
 
     /// Compare two BSON values respecting the reverse flag.
     /// When reverse=1, inverts the comparison order.
@@ -620,7 +628,7 @@ pub const Index = struct {
     };
 
     fn loadNode(self: *Index, page_id: u64) !Node {
-        const page = try self.bucket.loadPage(page_id);
+        const page = try self.bucket.loadPageForRead(page_id);
         return Node.init(self, page);
     }
 
@@ -884,6 +892,7 @@ pub const Index = struct {
     };
 
     pub fn insertWithOptions(self: *Index, value: BSONValue, loc: DocumentLocation, options: InsertOptions) !void {
+        self.relocate_hint = null;
         if (self.options.unique == 1 and !options.skip_uniqueness_check) {
             if (try self.hasValue(value)) {
                 return error.DuplicateKey;
@@ -905,6 +914,7 @@ pub const Index = struct {
     }
 
     pub fn delete(self: *Index, value: BSONValue, loc: DocumentLocation) !void {
+        self.relocate_hint = null;
         var node = try self.descendToLeafForWrite(value);
         const start_offset_opt = node.leafFindFirstEqualOffset(value) orelse return;
         var offset = start_offset_opt;
@@ -917,6 +927,93 @@ pub const Index = struct {
                 try self.bucket.writePage(node.page);
                 return;
             }
+            offset = entry.offset + entry.total_size;
+        }
+    }
+
+    /// Update the document location stored beside an existing key without
+    /// removing and reinserting the key itself. This is useful for Albedo's
+    /// append-only document updates: when an indexed value did not change,
+    /// only its pointer to the replacement document needs to move.
+    pub fn relocate(
+        self: *Index,
+        value: BSONValue,
+        old_loc: DocumentLocation,
+        new_loc: DocumentLocation,
+    ) !bool {
+        // Batch transforms usually visit an index in key order. Resume just
+        // after the previous relocation so a whole leaf is decoded once
+        // instead of descending from the root and rescanning its prefix for
+        // every document.
+        if (self.relocate_hint) |hint| {
+            const hinted_node = if (self.bucket.active_tx) |tx|
+                if (tx.sequence == hint.transaction_sequence)
+                    Node.init(self, hint.page)
+                else
+                    try self.loadWritableNode(hint.page_id)
+            else
+                try self.loadWritableNode(hint.page_id);
+            if (try self.relocateFrom(hinted_node, hint.offset, value, old_loc, new_loc)) {
+                return true;
+            }
+        }
+
+        const read_node = try self.descendToLeaf(value);
+        var node = try self.loadWritableNode(read_node.id());
+        const start_offset = node.leafFindFirstEqualOffset(value) orelse return false;
+        return self.relocateFrom(node, start_offset, value, old_loc, new_loc);
+    }
+
+    fn relocateFrom(
+        self: *Index,
+        initial_node: Node,
+        initial_offset: u16,
+        value: BSONValue,
+        old_loc: DocumentLocation,
+        new_loc: DocumentLocation,
+    ) !bool {
+        var node = initial_node;
+        var offset = initial_offset;
+
+        while (true) {
+            const entry = node.decodeLeafEntry(offset) orelse {
+                const next_id = node.leafNextId();
+                if (next_id == 0) return false;
+                node = try self.loadWritableNode(next_id);
+                offset = Node.leafDataStart();
+                continue;
+            };
+            const cmp = self.compare(entry.value(), value);
+            if (cmp == .gt) return false;
+            if (cmp == .lt) {
+                offset = entry.offset + entry.total_size;
+                continue;
+            }
+
+            if (entry.location.equal(&old_loc)) {
+                const location_offset = @as(usize, entry.offset) + 1 + entry.value_bytes.len;
+                mem.writeInt(
+                    u64,
+                    @as(*[8]u8, @ptrCast(node.page.data[location_offset..].ptr)),
+                    new_loc.pageId,
+                    .little,
+                );
+                mem.writeInt(
+                    u16,
+                    @as(*[2]u8, @ptrCast(node.page.data[location_offset + 8 ..].ptr)),
+                    new_loc.offset,
+                    .little,
+                );
+                try self.bucket.writePage(node.page);
+                self.relocate_hint = .{
+                    .page_id = node.id(),
+                    .offset = entry.offset + entry.total_size,
+                    .page = node.page,
+                    .transaction_sequence = if (self.bucket.active_tx) |tx| tx.sequence else 0,
+                };
+                return true;
+            }
+
             offset = entry.offset + entry.total_size;
         }
     }

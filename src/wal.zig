@@ -158,6 +158,12 @@ pub const WAL = struct {
 
     pub const frame_size: usize = FrameHeader.byte_size + DEFAULT_PAGE_SIZE;
 
+    pub const PageImage = struct {
+        page_id: u64,
+        header: [32]u8,
+        data: []const u8,
+    };
+
     /// Legacy sentinel page_id used for BucketHeader WAL frames in v2.
     /// Kept for backward compatibility when reading old WAL files.
     /// Version 3+ embeds the BucketHeader in the WAL header instead.
@@ -821,6 +827,7 @@ pub const WAL = struct {
     /// Byte offset where frame data starts in the WAL file.
     /// 48 for version 2 WALs, 112 for version 3+.
     data_offset: u64,
+    append_buffer: std.ArrayList(u8) = .empty,
 
     // ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -938,6 +945,7 @@ pub const WAL = struct {
         self.index.deinit();
         closeFd(self.io, self.write_fd);
         closeFd(self.io, self.read_fd);
+        self.append_buffer.deinit(self.allocator);
         self.allocator.free(self.path);
     }
 
@@ -966,6 +974,7 @@ pub const WAL = struct {
         }
 
         // 6. Free the path allocation.
+        self.append_buffer.deinit(self.allocator);
         self.allocator.free(self.path);
     }
 
@@ -1005,6 +1014,53 @@ pub const WAL = struct {
         self.index.acquireWrite();
         defer self.index.releaseWrite();
         try self.index.insert(page_id, tx_timestamp, wal_offset);
+    }
+
+    /// Append every dirty page in one contiguous write and publish all frame
+    /// locations while holding the SHM index lock once. The on-disk format is
+    /// identical to calling appendPage() for each image.
+    pub fn appendPages(self: *WAL, pages: []const PageImage, tx_timestamp: i64) Error!void {
+        if (pages.len == 0) return;
+
+        const total_size = std.math.mul(usize, pages.len, frame_size) catch return Error.WalWriteFailed;
+        self.append_buffer.resize(self.allocator, total_size) catch return Error.WalWriteFailed;
+
+        const first_live_frame = self.live_frame_count;
+        const first_seq = self.next_seq;
+        for (pages, 0..) |page, i| {
+            std.debug.assert(page.header.len + page.data.len == DEFAULT_PAGE_SIZE);
+
+            const frame_start = i * frame_size;
+            const page_start = frame_start + FrameHeader.byte_size;
+            const page_end = frame_start + frame_size;
+            const frame_page = self.append_buffer.items[page_start..page_end];
+            @memcpy(frame_page[0..page.header.len], &page.header);
+            @memcpy(frame_page[page.header.len..], page.data);
+
+            const frame_hdr = FrameHeader{
+                .page_id = page.page_id,
+                .commit_seq = first_seq + i,
+                .checksum = std.hash.XxHash3.hash(self.header.salt, frame_page),
+                .tx_timestamp = tx_timestamp,
+            };
+            const hdr_bytes = frame_hdr.toBytes();
+            @memcpy(self.append_buffer.items[frame_start..page_start], &hdr_bytes);
+        }
+
+        writeAll(self.io, self.write_fd, self.append_buffer.items) catch return Error.WalWriteFailed;
+
+        self.live_frame_count += pages.len;
+        self.next_seq += pages.len;
+        if (tx_timestamp > self.pending_max_tx) {
+            self.pending_max_tx = tx_timestamp;
+        }
+
+        self.index.acquireWrite();
+        defer self.index.releaseWrite();
+        for (pages, 0..) |page, i| {
+            const wal_offset = self.data_offset + (first_live_frame + i) * frame_size;
+            try self.index.insert(page.page_id, tx_timestamp, wal_offset);
+        }
     }
 
     /// Persist all buffered WAL writes to stable storage, update the header

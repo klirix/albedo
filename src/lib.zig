@@ -801,8 +801,16 @@ test "lib API transform updates matching doc" {
     const allocator = testing.allocator;
     const path = try makeTempPath(allocator, "lib-api-transform-updates-matching-doc");
     defer allocator.free(path);
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{path});
+    defer allocator.free(wal_path);
+    const shm_path = try std.fmt.allocPrint(allocator, "{s}-wal-shm", .{path});
+    defer allocator.free(shm_path);
     tryCwdDeleteFile(path) catch {};
+    tryCwdDeleteFile(wal_path) catch {};
+    tryCwdDeleteFile(shm_path) catch {};
     defer tryCwdDeleteFile(path) catch {};
+    defer tryCwdDeleteFile(wal_path) catch {};
+    defer tryCwdDeleteFile(shm_path) catch {};
 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);

@@ -8,7 +8,7 @@ const UpdateProgram = albedo.UpdateProgram;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-const NUM_RECORDS: usize = 10_000;
+const NUM_RECORDS: usize = 100_000;
 const SEARCH_ITERATIONS: usize = 1000;
 const SEARCH_TARGET_NAME = std.fmt.comptimePrint("record_{}", .{NUM_RECORDS - 2});
 const SEARCH_TARGET_AGE: i32 = 42;
@@ -486,7 +486,7 @@ pub fn main(m: std.process.Init) !void {
 
     std.Io.Dir.cwd().deleteFile(io, "file.bucket") catch {};
     std.Io.Dir.cwd().deleteFile(io, "file.bucket-wal") catch {};
-    std.Io.Dir.cwd().deleteFile(io, "file.bucket-shm") catch {};
+    std.Io.Dir.cwd().deleteFile(io, "file.bucket-wal-shm") catch {};
     std.Io.Dir.cwd().deleteFile(io, "file.sqlite") catch {};
     std.Io.Dir.cwd().deleteFile(io, "file.sqlite-wal") catch {};
     std.Io.Dir.cwd().deleteFile(io, "file.sqlite-shm") catch {};
@@ -497,16 +497,19 @@ pub fn main(m: std.process.Init) !void {
     // ── Setup Albedo ─────────────────────────────────────────────────────
     var bucket = try Bucket.openFileWithOptions(arena.allocator(), io, "file.bucket", .{
         .wal = true,
+        // SQLite does not maintain an equivalent logical changefeed here.
+        .oplog_size = 0,
         .read_durability = .process,
         .auto_vaccuum = false,
         .write_durability = .{
             .periodic = 2048,
         },
-        .wal_auto_checkpoint = 10000,
+        // Keep checkpoint spikes out of this short hot-path comparison.
+        .wal_auto_checkpoint = 20000,
     });
     defer std.Io.Dir.cwd().deleteFile(io, "file.bucket") catch {};
     defer std.Io.Dir.cwd().deleteFile(io, "file.bucket-wal") catch {};
-    defer std.Io.Dir.cwd().deleteFile(io, "file.bucket-shm") catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, "file.bucket-wal-shm") catch {};
     defer bucket.deinit();
 
     // try bucket.dropIndex("_id");

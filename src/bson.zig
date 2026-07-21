@@ -1395,7 +1395,7 @@ pub const BSONDocument = struct {
     pub fn clone(self: BSONDocument, allocator: mem.Allocator) !BSONDocument {
         const buffer = try allocator.alloc(u8, self.buffer.len);
         @memcpy(buffer, self.buffer);
-        return BSONDocument.init(buffer);
+        return .{ .buffer = buffer, .owned = true };
     }
 
     pub fn format(
@@ -1770,20 +1770,15 @@ pub const Editor = struct {
 
     pub fn setValue(self: *Editor, key: []const u8, value: BSONValue) !void {
         std.debug.assert(!self.finished);
-
-        var pairs = [1]BSONKeyValuePair{.{
-            .key = key,
-            .value = value,
-        }};
-        const encoded = try BSONDocument.fromPairs(self.allocator, pairs[0..]);
-        defer encoded.deinit(self.allocator);
-
-        const next = try rewriteDocumentSet(self.current, self.allocator, key, encoded);
+        const next = try rewriteDocumentSetValue(self.current, self.allocator, key, value);
         self.replaceCurrent(next);
     }
 
     pub fn setPathValue(self: *Editor, path: []const u8, value: BSONValue) !void {
         std.debug.assert(!self.finished);
+        if (mem.indexOfScalar(u8, path, '.') == null) {
+            return self.setValue(path, value);
+        }
         const next = try self.current.setPath(self.allocator, path, value);
         self.replaceCurrent(next);
     }
@@ -1895,6 +1890,50 @@ fn rewriteDocumentSet(
 
     const final_buffer = try list.toOwnedSlice();
     std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
+    return BSONDocument{ .buffer = final_buffer, .owned = true };
+}
+
+fn rewriteDocumentSetValue(
+    doc: BSONDocument,
+    allocator: mem.Allocator,
+    key: []const u8,
+    value: BSONValue,
+) !BSONDocument {
+    if (mem.indexOfScalar(u8, key, 0) != null) return error.InvalidKey;
+
+    var final_len: usize = 4 + 1;
+    var idx: usize = 4;
+    while (TypeNamePair.read(doc.buffer[idx..])) |pair| {
+        const value_size = BSONValue.asessSize(doc.buffer[idx + pair.len ..], pair.type);
+        if (!mem.eql(u8, pair.name, key)) {
+            final_len = std.math.add(usize, final_len, pair.len + value_size) catch return error.ValueTooLarge;
+        }
+        idx += pair.len + value_size;
+    }
+
+    const new_element_len = 1 + key.len + 1 + value.size();
+    final_len = std.math.add(usize, final_len, new_element_len) catch return error.ValueTooLarge;
+    if (final_len > std.math.maxInt(i32)) return error.ValueTooLarge;
+
+    const final_buffer = try allocator.alloc(u8, final_len);
+    errdefer allocator.free(final_buffer);
+    var writer = std.Io.Writer.fixed(final_buffer);
+    try writer.writeInt(u32, @intCast(final_len), .little);
+
+    idx = 4;
+    while (TypeNamePair.read(doc.buffer[idx..])) |pair| {
+        const value_size = BSONValue.asessSize(doc.buffer[idx + pair.len ..], pair.type);
+        if (!mem.eql(u8, pair.name, key)) {
+            try appendExistingElement(&writer, doc, idx, pair, value_size);
+        }
+        idx += pair.len + value_size;
+    }
+
+    try writer.writeByte(@intFromEnum(value.valueType()));
+    try writer.writeAll(key);
+    try writer.writeByte(0);
+    try value.write(&writer);
+    try writer.writeByte(0);
     return BSONDocument{ .buffer = final_buffer, .owned = true };
 }
 

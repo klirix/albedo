@@ -552,12 +552,14 @@ pub const Bucket = struct {
     writes_since_sync: u32 = 0,
     write_durability: WriteDurability = .{ .periodic = 100 },
     wal_pending_pages: std.AutoHashMap(u64, *Page),
+    wal_page_images: std.ArrayList(WAL.PageImage) = .empty,
     wal_header_pending: bool = false,
     cached_last_data_page: ?*Page = null,
     read_durability: ReadDurability = .shared,
     oplog_size: u32 = WAL.DEFAULT_OPLOG_REGION_SIZE,
     wal: ?WAL = null,
     active_tx: ?*Transaction = null,
+    transaction_sequence: u64 = 0,
     /// Index objects replaced by resetLoadedIndexes().  Not freed until
     /// bucket teardown because in-flight iterators may still hold the
     /// pointer (same retirement invariant as PageCache.retired_pages).
@@ -670,19 +672,22 @@ pub const Bucket = struct {
 
     pub const Transaction = struct {
         bucket: *Bucket,
+        sequence: u64,
         pending_pages: std.AutoHashMap(u64, *Page),
         header_snapshot: BucketHeader,
         header_dirty: bool = false,
         cached_last_data_page_snapshot: ?*Page,
+        last_data_page: ?*Page = null,
         index_root_snapshots: []IndexRootSnapshot,
         deferred_oplog: std.ArrayList(DeferredOplogEntry) = .empty,
+        oplog_arena: std.heap.ArenaAllocator,
         open_transforms: usize = 0,
         active: bool = true,
 
         pub fn insert(self: *Transaction, insertable: bson.BSONDocument) !DocInsertResult {
             try self.ensureActive();
             try insertable.validate();
-            return self.bucket.insertLocked(insertable, false);
+            return self.bucket.insertLocked(insertable, false, null);
         }
 
         pub fn delete(self: *Transaction, q: query.Query) !void {
@@ -742,9 +747,7 @@ pub const Bucket = struct {
                 return err;
             };
 
-            for (self.deferred_oplog.items) |entry| {
-                self.bucket.emitOplogEntry(entry.op, entry.doc_id, entry.payload);
-            }
+            self.bucket.emitOplogEntries(self.deferred_oplog.items);
 
             self.finishActiveState();
         }
@@ -772,16 +775,18 @@ pub const Bucket = struct {
             }
             self.pending_pages.deinit();
             self.clearDeferredOplog();
+            self.oplog_arena.deinit();
             self.bucket.allocator.free(self.index_root_snapshots);
             self.bucket.allocator.destroy(self);
         }
 
         fn stageOplog(self: *Transaction, op: WAL.OpKind, doc_id: u96, payload: ?[]const u8) !void {
+            const oplog_allocator = self.oplog_arena.allocator();
             const owned_payload = if (payload) |bytes|
-                try self.bucket.allocator.dupe(u8, bytes)
+                try oplog_allocator.dupe(u8, bytes)
             else
                 null;
-            errdefer if (owned_payload) |p| self.bucket.allocator.free(p);
+            errdefer if (owned_payload) |p| oplog_allocator.free(p);
 
             try self.deferred_oplog.append(self.bucket.allocator, .{
                 .op = op,
@@ -792,6 +797,11 @@ pub const Bucket = struct {
 
         fn loadPageForWrite(self: *Transaction, page_id: u64) !*Page {
             if (self.pending_pages.get(page_id)) |page| {
+                if (self.bucket.cached_last_data_page) |cached| {
+                    if (cached.header.page_id == page_id and page.header.page_type == .Data) {
+                        self.last_data_page = page;
+                    }
+                }
                 return page;
             }
 
@@ -806,6 +816,7 @@ pub const Bucket = struct {
             if (self.bucket.cached_last_data_page) |cached| {
                 if (cached.header.page_id == page_id) {
                     self.bucket.cached_last_data_page = page;
+                    if (page.header.page_type == .Data) self.last_data_page = page;
                 }
             }
 
@@ -847,8 +858,9 @@ pub const Bucket = struct {
         }
 
         fn clearDeferredOplog(self: *Transaction) void {
+            const oplog_allocator = self.oplog_arena.allocator();
             for (self.deferred_oplog.items) |*entry| {
-                entry.deinit(self.bucket.allocator);
+                entry.deinit(oplog_allocator);
             }
             self.deferred_oplog.deinit(self.bucket.allocator);
             self.deferred_oplog = .empty;
@@ -952,12 +964,17 @@ pub const Bucket = struct {
         const tx = try self.allocator.create(Transaction);
         errdefer self.allocator.destroy(tx);
 
+        self.transaction_sequence +%= 1;
+        if (self.transaction_sequence == 0) self.transaction_sequence = 1;
+
         tx.* = .{
             .bucket = self,
+            .sequence = self.transaction_sequence,
             .pending_pages = std.AutoHashMap(u64, *Page).init(self.allocator),
             .header_snapshot = self.header,
             .cached_last_data_page_snapshot = self.cached_last_data_page,
             .index_root_snapshots = try self.allocator.dupe(IndexRootSnapshot, root_snapshots.items),
+            .oplog_arena = std.heap.ArenaAllocator.init(self.allocator),
         };
 
         self.active_tx = tx;
@@ -974,6 +991,16 @@ pub const Bucket = struct {
         return self.active_tx;
     }
 
+    /// Read the transaction's latest page image when one exists, otherwise
+    /// fall back to the shared page cache. Unlike loadPageForWrite(), this
+    /// does not clone a clean page into the transaction's pending set.
+    pub fn loadPageForRead(self: *Bucket, page_id: u64) !*Page {
+        if (self.active_tx) |tx| {
+            if (tx.pending_pages.get(page_id)) |page| return page;
+        }
+        return self.loadPage(page_id);
+    }
+
     pub fn loadPageForWrite(self: *Bucket, page_id: u64) !*Page {
         if (self.active_tx) |tx| {
             return tx.loadPageForWrite(page_id);
@@ -982,6 +1009,7 @@ pub const Bucket = struct {
     }
 
     fn stageOplogEntry(self: *Bucket, op: WAL.OpKind, doc_id: u96, payload: ?[]const u8) !void {
+        if (self.in_memory or self.oplog_size == 0 or self.wal == null) return;
         if (self.active_tx) |tx| {
             try tx.stageOplog(op, doc_id, payload);
             return;
@@ -1700,10 +1728,34 @@ pub const Bucket = struct {
     /// For delete, `payload` is null.
     /// Entries are only emitted when WAL mode is active and not in-memory.
     fn emitOplogEntry(self: *Bucket, op: WAL.OpKind, doc_id: u96, payload: ?[]const u8) void {
-        if (self.in_memory) return;
+        if (self.in_memory or self.oplog_size == 0) return;
         const w = &(self.wal orelse return);
 
         const ts = self.walTimestamp();
+        w.index.acquireWrite();
+        defer w.index.releaseWrite();
+        appendOplogEntryLocked(w, op, doc_id, payload, ts);
+    }
+
+    fn emitOplogEntries(self: *Bucket, entries: []const DeferredOplogEntry) void {
+        if (entries.len == 0 or self.in_memory or self.oplog_size == 0) return;
+        const w = &(self.wal orelse return);
+        const ts = self.walTimestamp();
+
+        w.index.acquireWrite();
+        defer w.index.releaseWrite();
+        for (entries) |entry| {
+            appendOplogEntryLocked(w, entry.op, entry.doc_id, entry.payload, ts);
+        }
+    }
+
+    fn appendOplogEntryLocked(
+        w: *WAL,
+        op: WAL.OpKind,
+        doc_id: u96,
+        payload: ?[]const u8,
+        ts: i64,
+    ) void {
 
         // Determine payload kind and actual bytes to write.
         var payload_kind: WAL.PayloadKind = .none;
@@ -1725,8 +1777,6 @@ pub const Bucket = struct {
             }
         }
 
-        w.index.acquireWrite();
-        defer w.index.releaseWrite();
         const doc_id_bytes: [12]u8 = @bitCast(doc_id);
         w.index.appendOplogEntry(op, doc_id_bytes, ts, actual_payload, payload_kind);
     }
@@ -1750,28 +1800,28 @@ pub const Bucket = struct {
         if (self.wal) |*w| {
             const tx_ts = self.walTimestamp();
 
+            self.wal_page_images.clearRetainingCapacity();
+            try self.wal_page_images.ensureTotalCapacity(self.allocator, self.wal_pending_pages.count());
+
+            var pending_iter = self.wal_pending_pages.iterator();
+            while (pending_iter.next()) |entry| {
+                const page = entry.value_ptr.*;
+                self.wal_page_images.appendAssumeCapacity(.{
+                    .page_id = entry.key_ptr.*,
+                    .header = PageHeader.write(&page.header),
+                    .data = page.data,
+                });
+            }
+
             while (true) {
-                var retry = false;
-                var it = self.wal_pending_pages.iterator();
-                while (it.next()) |entry| {
-                    const page_id = entry.key_ptr.*;
-                    const page = entry.value_ptr.*;
-
-                    var buf: [DEFAULT_PAGE_SIZE]u8 = undefined;
-                    const hdr_bytes = PageHeader.write(&page.header);
-                    @memcpy(buf[0..PageHeader.byteSize], hdr_bytes[0..]);
-                    @memcpy(buf[PageHeader.byteSize..], page.data);
-
-                    w.appendPage(page_id, &buf, tx_ts) catch |err| {
-                        if (err != error.WalIndexFailed) return err;
-                        try w.sync();
-                        try self.checkpointWal();
-                        try w.checkpoint();
-                        retry = true;
-                        break;
-                    };
-                }
-                if (!retry) break;
+                w.appendPages(self.wal_page_images.items, tx_ts) catch |err| {
+                    if (err != error.WalIndexFailed) return err;
+                    try w.sync();
+                    try self.checkpointWal();
+                    try w.checkpoint();
+                    continue;
+                };
+                break;
             }
 
             if (self.wal_header_pending) {
@@ -2078,6 +2128,7 @@ pub const Bucket = struct {
         try self.flushHeader(); // Ensure the header is flushed to disk
         if (self.active_tx) |tx| {
             try tx.pending_pages.put(new_page_id, page);
+            if (page_type == .Data) tx.last_data_page = page;
             return page;
         }
         try self.pageCache.put(new_page_id, page);
@@ -2135,14 +2186,18 @@ pub const Bucket = struct {
     };
 
     fn findLastDataPage(self: *Bucket) !?*Page {
+        if (self.active_tx) |tx| {
+            if (tx.last_data_page) |page| return page;
+        }
+
         // Return cached page if still valid (not freed, correct type)
         if (self.cached_last_data_page) |cached| {
             if (self.active_tx) |tx| {
-                if (tx.pending_pages.get(cached.header.page_id)) |pending| {
-                    if (pending.header.page_type == PageType.Data) {
-                        self.cached_last_data_page = pending;
-                        return pending;
-                    }
+                if (cached.header.page_type == PageType.Data) {
+                    const writable = try tx.loadPageForWrite(cached.header.page_id);
+                    self.cached_last_data_page = writable;
+                    tx.last_data_page = writable;
+                    return writable;
                 }
             }
             if (cached.header.page_type == PageType.Data) {
@@ -2160,6 +2215,12 @@ pub const Bucket = struct {
         while (try pageIter.next()) |page| {
             if (page.header.page_type == PageType.Data) {
                 self.cached_last_data_page = page;
+                if (self.active_tx) |tx| {
+                    const writable = try tx.loadPageForWrite(page.header.page_id);
+                    self.cached_last_data_page = writable;
+                    tx.last_data_page = writable;
+                    return writable;
+                }
                 return page;
             }
         }
@@ -2175,10 +2236,19 @@ pub const Bucket = struct {
         try insertable.validate();
         try self.lock();
         defer self.unlock();
-        return self.insertLocked(insertable, true);
+        return self.insertLocked(insertable, true, null);
     }
 
-    fn insertLocked(self: *Bucket, insertable: bson.BSONDocument, autocommit: bool) !DocInsertResult {
+    fn insertLocked(
+        self: *Bucket,
+        insertable: bson.BSONDocument,
+        autocommit: bool,
+        update_context: ?*const UpdateIndexContext,
+    ) !DocInsertResult {
+        const scratch_allocator = if (update_context) |context|
+            context.scratch_allocator
+        else
+            self.allocator;
         var doc = insertable;
         const docId = self.objectIdGenerator.next(self.io);
         const needCleanup = doc.get("_id") == null;
@@ -2200,9 +2270,9 @@ pub const Bucket = struct {
         var planned_index_inserts: std.ArrayList(PlannedIndexInsert) = .empty;
         defer {
             for (planned_index_inserts.items) |*plan| {
-                plan.values.deinit(self.allocator);
+                plan.values.deinit(scratch_allocator);
             }
-            planned_index_inserts.deinit(self.allocator);
+            planned_index_inserts.deinit(scratch_allocator);
         }
 
         var idx_iter = self.indexes.iterator();
@@ -2211,7 +2281,7 @@ pub const Bucket = struct {
             var retain_values = false;
             defer {
                 if (!retain_values) {
-                    values.deinit(self.allocator);
+                    values.deinit(scratch_allocator);
                 }
             }
 
@@ -2219,22 +2289,55 @@ pub const Bucket = struct {
             const path = entry.key_ptr.*;
             self.bindIndex(index_ptr);
 
-            const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values, self.allocator);
+            if (update_context) |context| {
+                if (findIndexPlan(context.old_plans, index_ptr)) |old_plan| {
+                    if (old_plan.known_unchanged) continue;
+                }
+            }
+
+            const has_values = try self.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values, scratch_allocator);
             if (!has_values) {
                 continue;
             }
 
-            try planned_index_inserts.append(self.allocator, PlannedIndexInsert{
+            try planned_index_inserts.append(scratch_allocator, PlannedIndexInsert{
                 .index = index_ptr,
                 .values = values,
             });
             retain_values = true;
         }
 
+        // An update can preserve some indexed values while moving the
+        // document to a new append-only location. Remove only the keys whose
+        // values actually changed; unchanged keys are relocated after the new
+        // document location is known.
+        if (update_context) |context| {
+            for (context.old_plans) |old_plan| {
+                if (old_plan.known_unchanged) continue;
+                const new_plan = findIndexPlan(planned_index_inserts.items, old_plan.index);
+                if (new_plan != null and indexValueListsEqual(old_plan.values.items, new_plan.?.values.items)) {
+                    continue;
+                }
+
+                self.bindIndex(old_plan.index);
+                for (old_plan.values.items) |value| {
+                    try old_plan.index.delete(value, context.old_location);
+                }
+            }
+        }
+
         // Preflight unique indexes before writing any document bytes.
         // This avoids partial writes when duplicate key errors occur.
         for (planned_index_inserts.items) |plan| {
             if (plan.index.options.unique != 1) continue;
+
+            if (update_context) |context| {
+                if (findIndexPlan(context.old_plans, plan.index)) |old_plan| {
+                    if (indexValueListsEqual(old_plan.values.items, plan.values.items)) {
+                        continue;
+                    }
+                }
+            }
 
             for (plan.values.items, 0..) |value, value_idx| {
                 var prior_idx: usize = 0;
@@ -2253,7 +2356,7 @@ pub const Bucket = struct {
 
         // If no pages exist yet, create one
         if (try findLastDataPage(self)) |p| {
-            page = try self.loadPageForWrite(p.header.page_id);
+            page = p;
         } else {
             page = try self.createNewPage(.Data);
             self.cached_last_data_page = page;
@@ -2307,10 +2410,7 @@ pub const Bucket = struct {
             // Determine how much to write
             const to_write = @min(bytes_to_write - bytes_written, available_space);
             // std.debug.print("Writing ({d}){d} bytes to the page \n", .{ page.header.used_size, to_write });
-            @memcpy(
-                writable_buffer[0..to_write],
-                encoded_doc[bytes_written .. bytes_written + to_write],
-            );
+            @memcpy(writable_buffer[0..to_write], encoded_doc[bytes_written .. bytes_written + to_write]);
             // Insert document at the current position
             offset.* += @intCast(to_write);
             bytes_written += to_write;
@@ -2331,8 +2431,34 @@ pub const Bucket = struct {
             .offset = result.offset,
         };
 
+        if (update_context) |context| {
+            for (context.old_plans) |old_plan| {
+                if (!old_plan.known_unchanged) continue;
+                self.bindIndex(old_plan.index);
+                for (old_plan.values.items) |value| {
+                    if (!try old_plan.index.relocate(value, context.old_location, index_location)) {
+                        return error.IndexEntryNotFound;
+                    }
+                }
+            }
+        }
+
         for (planned_index_inserts.items) |plan| {
             self.bindIndex(plan.index);
+
+            if (update_context) |context| {
+                if (findIndexPlan(context.old_plans, plan.index)) |old_plan| {
+                    if (indexValueListsEqual(old_plan.values.items, plan.values.items)) {
+                        for (plan.values.items) |value| {
+                            if (!try plan.index.relocate(value, context.old_location, index_location)) {
+                                return error.IndexEntryNotFound;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             for (plan.values.items) |value| {
                 try plan.index.insertWithOptions(value, index_location, .{ .skip_uniqueness_check = true });
             }
@@ -2389,7 +2515,36 @@ pub const Bucket = struct {
     const PlannedIndexInsert = struct {
         index: *Index,
         values: std.ArrayList(BSONValue) = .empty,
+        known_unchanged: bool = false,
     };
+
+    const UpdateIndexContext = struct {
+        old_location: Index.DocumentLocation,
+        old_plans: []const PlannedIndexInsert,
+        scratch_allocator: mem.Allocator,
+    };
+
+    fn findIndexPlan(plans: []const PlannedIndexInsert, index: *Index) ?*const PlannedIndexInsert {
+        for (plans) |*plan| {
+            if (plan.index == index) return plan;
+        }
+        return null;
+    }
+
+    fn indexValueListsEqual(a: []const BSONValue, b: []const BSONValue) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |a_value, b_value| {
+            if (!a_value.eql(&b_value)) return false;
+        }
+        return true;
+    }
+
+    fn indexPathsOverlap(a: []const u8, b: []const u8) bool {
+        if (mem.eql(u8, a, b)) return true;
+        if (a.len < b.len and b[a.len] == '.' and mem.startsWith(u8, b, a)) return true;
+        if (b.len < a.len and a[b.len] == '.' and mem.startsWith(u8, a, b)) return true;
+        return false;
+    }
 
     const IndexValueError = error{
         IndexedStringTooLong,
@@ -2592,27 +2747,19 @@ pub const Bucket = struct {
                 // Skip deleted documents without reading their data
                 const docOffset = self.page.data[self.offset..];
                 const doc_len = mem.readInt(u32, docOffset[0..4], .little);
-                const availableToSkip: u16 = @as(u16, @truncate(self.page.data.len)) - self.offset;
-
+                const availableToSkip: u16 = @truncate(self.page.data.len - self.offset);
                 if (doc_len <= availableToSkip) {
-                    // Deleted doc fits in current page, just advance offset
-                    self.offset += @as(u16, @truncate(doc_len));
+                    self.offset += @truncate(doc_len);
                 } else {
-                    // Deleted doc spans multiple pages
-                    // Calculate how many pages to skip without loading them
                     var remaining: u32 = doc_len - availableToSkip;
                     const pageDataLen: u32 = @intCast(self.page.data.len);
-
-                    // Skip full pages
                     while (remaining > pageDataLen) {
                         self.page = try self.pageIterator.next() orelse return null;
                         remaining -= pageDataLen;
                     }
-
-                    // Load final page and set offset
                     if (remaining > 0) {
                         self.page = try self.pageIterator.next() orelse return null;
-                        self.offset = @as(u16, @truncate(remaining));
+                        self.offset = @truncate(remaining);
                     } else {
                         self.offset = 0;
                     }
@@ -4139,6 +4286,28 @@ pub const Bucket = struct {
         return rc;
     }
 
+    fn simpleRangeFullyCovered(plan: *const QueryPlan, filters: []const query.Filter) bool {
+        // These four operators share the same planner score, so every filter
+        // on the selected path is folded into the iterator's tightened bounds.
+        // Other operators and logical groups still get a document-level check.
+        if (plan.source != .index or plan.index_strategy != .range or plan.index_path == null or filters.len == 0) {
+            return false;
+        }
+
+        const index_path = plan.index_path.?;
+        for (filters) |filter| {
+            const path = switch (filter) {
+                .lt => |data| data.path,
+                .lte => |data| data.path,
+                .gt => |data| data.path,
+                .gte => |data| data.path,
+                else => return false,
+            };
+            if (!mem.eql(u8, path, index_path)) return false;
+        }
+        return true;
+    }
+
     fn collectTargets(
         self: *Bucket,
         plan: *const QueryPlan,
@@ -4147,6 +4316,7 @@ pub const Bucket = struct {
         arena: *std.heap.ArenaAllocator,
     ) error{ OutOfMemory, ScanError }!void {
         const ally = arena.allocator();
+        const range_fully_covered = simpleRangeFullyCovered(plan, q.filters);
 
         switch (plan.source) {
             .full_scan => {
@@ -4286,6 +4456,14 @@ pub const Bucket = struct {
                         };
                         const loc = maybe_loc orelse break;
 
+                        if (range_fully_covered) {
+                            try targets.append(ally, .{
+                                .page_id = loc.pageId,
+                                .offset = loc.offset,
+                            });
+                            continue;
+                        }
+
                         const doc = self.readDocAt(ally, .{
                             .page_id = loc.pageId,
                             .offset = loc.offset,
@@ -4320,6 +4498,7 @@ pub const Bucket = struct {
         targets_buf: []DocumentLocation,
         index: usize = 0,
         current_doc: ?BSONDocument = null,
+        writable_target_page: ?*Page = null,
         owns_arena: bool = false,
 
         pub const IteratorError = error{
@@ -4367,6 +4546,14 @@ pub const Bucket = struct {
         }
 
         pub fn transform(self: *TransformIterator, updated: ?*const bson.BSONDocument) IteratorError!void {
+            return self.transformInternal(updated, null);
+        }
+
+        fn transformInternal(
+            self: *TransformIterator,
+            updated: ?*const bson.BSONDocument,
+            changed_path: ?[]const u8,
+        ) IteratorError!void {
             if (self.index >= self.targets.len) {
                 return error.IteratorDrained;
             }
@@ -4397,12 +4584,6 @@ pub const Bucket = struct {
             }
 
             var planned_index_deletes = std.ArrayList(PlannedIndexInsert).empty;
-            defer {
-                for (planned_index_deletes.items) |*plan| {
-                    plan.values.deinit(self.bucket.allocator);
-                }
-                planned_index_deletes.deinit(self.bucket.allocator);
-            }
 
             var idx_iter = self.bucket.indexes.iterator();
             while (idx_iter.next()) |pair| {
@@ -4410,32 +4591,36 @@ pub const Bucket = struct {
                 const path = pair.key_ptr.*;
 
                 var values = std.ArrayList(BSONValue).empty;
-                var retain_values = false;
-                defer {
-                    if (!retain_values) values.deinit(self.bucket.allocator);
-                }
 
                 self.bucket.bindIndex(index_ptr);
-                const has_values = self.bucket.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values, self.bucket.allocator) catch |err| switch (err) {
+                const has_values = self.bucket.gatherIndexValuesForPath(&doc, path, index_ptr.options, &values, self.ally) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.IndexedStringTooLong => return error.ScanError,
                 };
                 if (!has_values) continue;
 
-                try planned_index_deletes.append(self.bucket.allocator, .{
+                try planned_index_deletes.append(self.ally, .{
                     .index = index_ptr,
                     .values = values,
+                    .known_unchanged = if (changed_path) |changed|
+                        !indexPathsOverlap(path, changed)
+                    else
+                        false,
                 });
-                retain_values = true;
             }
 
             const target = self.targets[self.index];
             const autocommit = self.tx == null;
 
-            var page = self.bucket.loadPageForWrite(target.page_id) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.ScanError,
-            };
+            var page = if (self.tx != null and self.writable_target_page != null and
+                self.writable_target_page.?.header.page_id == target.page_id)
+                self.writable_target_page.?
+            else
+                self.bucket.loadPageForWrite(target.page_id) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ScanError,
+                };
+            if (self.tx != null) self.writable_target_page = page;
             const header_offset = target.offset;
             if (header_offset + DocHeader.byteSize > page.data.len) {
                 return error.ScanError;
@@ -4448,7 +4633,6 @@ pub const Bucket = struct {
 
             var header = std.mem.bytesToValue(DocHeader, page.data[header_offset .. header_offset + DocHeader.byteSize]);
             if (header.is_deleted == 1) {
-                // std.debug.print("Document at {any} is already deleted", .{loc});
                 return error.IteratorDrained;
             }
 
@@ -4456,16 +4640,6 @@ pub const Bucket = struct {
             const header_bytes = std.mem.toBytes(header);
             @memcpy(page.data[header_offset .. header_offset + header_bytes.len], &header_bytes);
             self.bucket.writePage(page) catch return error.OutOfMemory;
-
-            for (planned_index_deletes.items) |plan| {
-                self.bucket.bindIndex(plan.index);
-                for (plan.values.items) |val| {
-                    plan.index.delete(val, loc) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => return error.ScanError,
-                    };
-                }
-            }
 
             self.bucket.header.doc_count -= 1;
             self.bucket.header.deleted_count += 1;
@@ -4493,7 +4667,12 @@ pub const Bucket = struct {
                     self.bucket._suppress_oplog = false;
                 }
 
-                _ = self.bucket.insertLocked(insert_doc, autocommit) catch |err| switch (err) {
+                const update_context = UpdateIndexContext{
+                    .old_location = loc,
+                    .old_plans = planned_index_deletes.items,
+                    .scratch_allocator = self.ally,
+                };
+                _ = self.bucket.insertLocked(insert_doc, autocommit, &update_context) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DuplicateKey => return error.DuplicateKey,
                     else => return error.ScanError,
@@ -4503,6 +4682,16 @@ pub const Bucket = struct {
                 self.bucket.stageOplogEntry(.update, header.doc_id, insert_doc.buffer) catch return error.OutOfMemory;
             } else {
                 // Pure delete (no replacement).
+                for (planned_index_deletes.items) |plan| {
+                    self.bucket.bindIndex(plan.index);
+                    for (plan.values.items) |val| {
+                        plan.index.delete(val, loc) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return error.ScanError,
+                        };
+                    }
+                }
+
                 if (autocommit) {
                     self.bucket.commitWalTransaction() catch return error.ScanError;
                 }
@@ -4520,13 +4709,12 @@ pub const Bucket = struct {
             }
 
             const current = try self.ensureDoc();
-            var updated = program.apply(self.bucket.allocator, current) catch |err| switch (err) {
+            var updated = program.apply(self.ally, current) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.InvalidTransform,
             };
-            defer updated.deinit(self.bucket.allocator);
 
-            try self.transform(&updated);
+            try self.transformInternal(&updated, program.knownSingleSetPath());
         }
 
         pub fn transfigurateAll(self: *TransformIterator, program: UpdateProgram) IteratorError!usize {
@@ -5010,6 +5198,7 @@ pub const Bucket = struct {
         self.pageCache.clear(self.allocator);
         self.pageCache.deinit();
         self.wal_pending_pages.deinit();
+        self.wal_page_images.deinit(self.allocator);
         self.allocator.free(self.path);
 
         if (self.file) |file| closeFsFile(self.io, file);
@@ -5061,6 +5250,7 @@ pub const Bucket = struct {
         self.pageCache.deinit();
 
         self.wal_pending_pages.deinit();
+        self.wal_page_images.deinit(self.allocator);
 
         // Free path
         self.allocator.free(self.path);
@@ -5314,7 +5504,7 @@ test "Bucket.transfigurate updates matching documents without manual iteration" 
     const allocator = std.testing.allocator;
 
     _ = tryCwdDeleteFile("bucket-transfigurate.bucket") catch {};
-    var bucket = try Bucket.init(allocator, "bucket-transfigurate.bucket");
+    var bucket = try Bucket.init(allocator, std.testing.io, "bucket-transfigurate.bucket");
     defer {
         bucket.deinit();
         tryCwdDeleteFile("bucket-transfigurate.bucket") catch {};
@@ -5363,6 +5553,61 @@ test "Bucket.transfigurate updates matching documents without manual iteration" 
     try testing.expectEqualStrings("dead", updated.get("state").?.string.value);
     try testing.expect(updated.get("marriage") == null);
     try testing.expect((try list_iter.next(list_iter)) == null);
+}
+
+test "Bucket.transfigurate relocates unchanged index entries across leaves" {
+    const allocator = std.testing.allocator;
+
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
+    defer bucket.deinit();
+    try bucket.ensureIndex("group", .{});
+
+    const document_count = 600;
+    for (0..document_count) |i| {
+        const doc = try bson.fmt.serialize(.{
+            .group = @as(i32, @intCast(i)),
+            .state = "old",
+        }, allocator);
+        defer doc.deinit(allocator);
+        _ = try bucket.insert(doc);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ally = arena.allocator();
+
+    const all_query_doc = try bson.fmt.serialize(.{
+        .query = .{
+            .group = .{
+                .@"$gte" = @as(i32, 0),
+                .@"$lt" = @as(i32, document_count),
+            },
+        },
+    }, ally);
+    var all_query = try query.Query.parse(ally, all_query_doc);
+    defer all_query.deinit(ally);
+    const state_program_doc = try bson.fmt.serialize(.{
+        .@"$set" = .{ .state = "new" },
+    }, ally);
+    var state_program = try UpdateProgram.parse(ally, state_program_doc);
+    defer state_program.deinit(ally);
+
+    try testing.expectEqual(document_count, try bucket.transfigurate(all_query, state_program));
+    try testing.expectEqual(@as(usize, 1), try testListCount(&bucket, ally, "{\"query\":{\"group\":42,\"state\":\"new\"}}"));
+
+    const indexed_query_doc = try bson.fmt.serialize(.{ .query = .{ .group = @as(i32, 42) } }, ally);
+    var indexed_query = try query.Query.parse(ally, indexed_query_doc);
+    defer indexed_query.deinit(ally);
+
+    const group_program_doc = try bson.fmt.serialize(.{
+        .@"$set" = .{ .group = @as(i32, 999) },
+    }, ally);
+    var group_program = try UpdateProgram.parse(ally, group_program_doc);
+    defer group_program.deinit(ally);
+
+    try testing.expectEqual(@as(usize, 1), try bucket.transfigurate(indexed_query, group_program));
+    try testing.expectEqual(@as(usize, 0), try testListCount(&bucket, ally, "{\"query\":{\"group\":42}}"));
+    try testing.expectEqual(@as(usize, 1), try testListCount(&bucket, ally, "{\"query\":{\"group\":999}}"));
 }
 
 test "Bucket.Transaction commit keeps writes hidden until commit" {
@@ -5483,7 +5728,7 @@ test "Bucket.Transaction transfigurate rolls back with the transaction" {
     defer arena.deinit();
     const ally = arena.allocator();
 
-    var bucket = try Bucket.openFileWithOptions(ally, db_path, .{ .wal = true });
+    var bucket = try Bucket.openFileWithOptions(ally, std.testing.io, db_path, .{ .wal = true });
     defer bucket.deinit();
 
     const original = try bson.fmt.serialize(.{ .name = "Alice", .age = 30 }, ally);

@@ -5,6 +5,15 @@ const Allocator = std.mem.Allocator;
 
 pub const UpdateProgram = struct {
     raw: bson.BSONDocument,
+    prepared: bool = false,
+    pipeline: bool = false,
+    uses_now: bool = true,
+    fast_set: ?FastSet = null,
+
+    const FastSet = struct {
+        path: []const u8,
+        value: bson.BSONValue,
+    };
 
     pub const ApplyError = error{
         InvalidUpdateProgram,
@@ -25,14 +34,14 @@ pub const UpdateProgram = struct {
 
     const OwnedValue = struct {
         value: bson.BSONValue,
+        owned: bool = false,
 
         fn deinit(self: *const OwnedValue, ally: Allocator) void {
-            freeOwnedValue(ally, self.value);
+            if (self.owned) freeOwnedValue(ally, self.value);
         }
 
-        fn literal(ally: Allocator, value: bson.BSONValue) ApplyError!OwnedValue {
-            const owned = dupeOwnedValue(ally, value) catch return error.OutOfMemory;
-            return .{ .value = owned };
+        fn borrowed(value: bson.BSONValue) OwnedValue {
+            return .{ .value = value };
         }
     };
 
@@ -73,35 +82,68 @@ pub const UpdateProgram = struct {
 
     pub fn parse(ally: Allocator, raw_program: bson.BSONDocument) UpdateProgramParsingErrors!UpdateProgram {
         try validateProgram(raw_program);
-        return .{ .raw = try raw_program.clone(ally) };
+        const cloned = try raw_program.clone(ally);
+        return .{
+            .raw = cloned,
+            .prepared = true,
+            .pipeline = looksLikeStageArray(cloned),
+            .uses_now = documentUsesNow(cloned),
+            .fast_set = detectFastSet(cloned),
+        };
     }
 
     pub fn deinit(self: *UpdateProgram, ally: Allocator) void {
         self.raw.deinit(ally);
     }
 
+    /// Returns the only path modified by this program when parsing proved it
+    /// is a single literal set. Callers can use this to preserve unrelated
+    /// derived state such as index keys; null means "assume any path changes".
+    pub fn knownSingleSetPath(self: UpdateProgram) ?[]const u8 {
+        if (!self.prepared) return null;
+        return if (self.fast_set) |fast_set| fast_set.path else null;
+    }
+
     pub fn apply(self: UpdateProgram, ally: Allocator, source: bson.BSONDocument) ApplyError!bson.BSONDocument {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const now_ms: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
+        const needs_now = if (self.prepared) self.uses_now else documentUsesNow(self.raw);
+        const now_ms: u64 = if (needs_now) blk: {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            break :blk @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
+        } else 0;
         return self.applyWithNowMillis(ally, source, now_ms);
     }
 
     fn applyWithNowMillis(self: UpdateProgram, ally: Allocator, source: bson.BSONDocument, now_ms: u64) ApplyError!bson.BSONDocument {
-        var current = try source.clone(ally);
-        errdefer current.deinit(ally);
-
-        if (looksLikeStageArray(self.raw)) {
-            var iter = self.raw.iter();
-            while (iter.next()) |pair| {
-                if (pair.value != .document) return error.InvalidUpdateStage;
-                const next = try applyStage(ally, current, pair.value.document, now_ms);
-                current.deinit(ally);
-                current = next;
+        if (self.prepared) {
+            if (self.fast_set) |fast_set| {
+                var editor = bson.Editor.init(ally, source);
+                defer editor.deinit();
+                editor.setPathValue(fast_set.path, fast_set.value) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidPath => return error.InvalidUpdatePath,
+                    error.WriteFailed => return error.WriteFailed,
+                    else => return error.InvalidExpression,
+                };
+                return editor.finish() catch return error.OutOfMemory;
             }
-        } else {
-            const next = try applyStage(ally, current, self.raw, now_ms);
-            current.deinit(ally);
+        }
+
+        const is_pipeline = if (self.prepared) self.pipeline else looksLikeStageArray(self.raw);
+        if (!is_pipeline) {
+            return applyStage(ally, source, self.raw, now_ms);
+        }
+
+        var current = source;
+        var owns_current = false;
+        errdefer if (owns_current) current.deinit(ally);
+
+        var iter = self.raw.iter();
+        while (iter.next()) |pair| {
+            if (pair.value != .document) return error.InvalidUpdateStage;
+            const next = try applyStage(ally, current, pair.value.document, now_ms);
+            if (owns_current) current.deinit(ally);
             current = next;
+            owns_current = true;
         }
 
         return current;
@@ -273,6 +315,7 @@ pub const UpdateProgram = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidPath => return error.InvalidUpdatePath,
                 error.WriteFailed => return error.WriteFailed,
+                else => return error.InvalidExpression,
             };
         }
 
@@ -295,6 +338,7 @@ pub const UpdateProgram = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidPath => return error.InvalidUpdatePath,
                 error.WriteFailed => return error.WriteFailed,
+                else => return error.InvalidExpression,
             };
         }
     }
@@ -307,6 +351,7 @@ pub const UpdateProgram = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.InvalidPath => return error.InvalidUpdatePath,
                     error.WriteFailed => return error.WriteFailed,
+                    else => return error.InvalidExpression,
                 };
             },
             .array => |arr| {
@@ -318,6 +363,7 @@ pub const UpdateProgram = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.InvalidPath => return error.InvalidUpdatePath,
                         error.WriteFailed => return error.WriteFailed,
+                        else => return error.InvalidExpression,
                     };
                 }
             },
@@ -330,6 +376,7 @@ pub const UpdateProgram = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.InvalidPath => return error.InvalidUpdatePath,
                         error.WriteFailed => return error.WriteFailed,
+                        else => return error.InvalidExpression,
                     };
                 }
             },
@@ -344,15 +391,14 @@ pub const UpdateProgram = struct {
         now_ms: u64,
     ) ApplyError!OwnedValue {
         return switch (raw) {
-            .string => |str| evalString(ally, stage_source, str.value, now_ms),
+            .string => |str| evalString(stage_source, str.value, now_ms),
             .document => |doc| try evalDocument(ally, stage_source, doc, now_ms),
             .array => |arr| try evalLiteralArray(ally, stage_source, arr, now_ms),
-            else => OwnedValue.literal(ally, raw),
+            else => OwnedValue.borrowed(raw),
         };
     }
 
     fn evalString(
-        ally: Allocator,
         stage_source: bson.BSONDocument,
         raw: []const u8,
         now_ms: u64,
@@ -362,9 +408,9 @@ pub const UpdateProgram = struct {
         }
         if (std.mem.startsWith(u8, raw, "$.") and raw.len > 2) {
             const resolved = stage_source.getPath(raw[2..]) orelse bson.BSONValue{ .null = .{} };
-            return OwnedValue.literal(ally, resolved);
+            return OwnedValue.borrowed(resolved);
         }
-        return OwnedValue.literal(ally, .{ .string = .{ .value = raw } });
+        return OwnedValue.borrowed(.{ .string = .{ .value = raw } });
     }
 
     fn evalDocument(
@@ -424,7 +470,7 @@ pub const UpdateProgram = struct {
             error.WriteFailed => return error.WriteFailed,
             else => return error.InvalidExpression,
         };
-        return .{ .value = .{ .document = doc } };
+        return .{ .value = .{ .document = doc }, .owned = true };
     }
 
     fn evalLiteralArray(
@@ -457,7 +503,7 @@ pub const UpdateProgram = struct {
             error.WriteFailed => return error.WriteFailed,
             else => return error.InvalidExpression,
         };
-        return .{ .value = .{ .array = doc } };
+        return .{ .value = .{ .array = doc }, .owned = true };
     }
 
     fn evalPlus(
@@ -520,7 +566,10 @@ pub const UpdateProgram = struct {
             try buffer.appendSlice(ally, evaluated.value.string.value);
         }
 
-        return .{ .value = .{ .string = .{ .value = try buffer.toOwnedSlice(ally) } } };
+        return .{
+            .value = .{ .string = .{ .value = try buffer.toOwnedSlice(ally) } },
+            .owned = true,
+        };
     }
 
     fn evalIsoDateTime(
@@ -623,6 +672,50 @@ pub const UpdateProgram = struct {
             if (idx != expected) return false;
         }
         return true;
+    }
+
+    fn documentUsesNow(doc: bson.BSONDocument) bool {
+        var iter = doc.iter();
+        while (iter.next()) |pair| {
+            if (valueUsesNow(pair.value)) return true;
+        }
+        return false;
+    }
+
+    fn detectFastSet(program: bson.BSONDocument) ?FastSet {
+        if (looksLikeStageArray(program) or program.keyNumber() != 1) return null;
+
+        var program_iter = program.iter();
+        const stage_pair = program_iter.next() orelse return null;
+        const set_pair = if (std.mem.eql(u8, stage_pair.key, "$set")) blk: {
+            if (stage_pair.value != .document or stage_pair.value.document.keyNumber() != 1) return null;
+            var set_iter = stage_pair.value.document.iter();
+            break :blk set_iter.next() orelse return null;
+        } else blk: {
+            if (stage_pair.key.len != 0 and stage_pair.key[0] == '$') return null;
+            break :blk stage_pair;
+        };
+
+        if (!isBorrowedLiteral(set_pair.value)) return null;
+        return .{ .path = set_pair.key, .value = set_pair.value };
+    }
+
+    fn isBorrowedLiteral(value: bson.BSONValue) bool {
+        return switch (value) {
+            .string => |str| !std.mem.eql(u8, str.value, "$$now") and
+                !(std.mem.startsWith(u8, str.value, "$.") and str.value.len > 2),
+            .document, .array => false,
+            else => true,
+        };
+    }
+
+    fn valueUsesNow(value: bson.BSONValue) bool {
+        return switch (value) {
+            .string => |str| std.mem.eql(u8, str.value, "$$now"),
+            .document => |doc| documentUsesNow(doc),
+            .array => |arr| documentUsesNow(arr),
+            else => false,
+        };
     }
 
     fn parseIsoDateTimeMillis(raw: []const u8) ApplyError!u64 {
@@ -747,16 +840,6 @@ pub const UpdateProgram = struct {
         return era * 146_097 + doe - 719_468;
     }
 };
-
-fn dupeOwnedValue(ally: Allocator, v: bson.BSONValue) Allocator.Error!bson.BSONValue {
-    return switch (v) {
-        .string => |s| bson.BSONValue{ .string = .{ .value = try ally.dupe(u8, s.value) } },
-        .binary => |b| bson.BSONValue{ .binary = .{ .value = try ally.dupe(u8, b.value), .subtype = b.subtype } },
-        .array => |a| bson.BSONValue{ .array = bson.BSONDocument{ .buffer = try ally.dupe(u8, a.buffer) } },
-        .document => |d| bson.BSONValue{ .document = bson.BSONDocument{ .buffer = try ally.dupe(u8, d.buffer) } },
-        else => v,
-    };
-}
 
 fn freeOwnedValue(ally: Allocator, v: bson.BSONValue) void {
     switch (v) {
