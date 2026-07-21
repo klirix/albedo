@@ -13,7 +13,8 @@ pub const Error = error{
     ContainerClosed,
     InvalidContainerType,
     CannotEndRoot,
-};
+    IntegerInvalid,
+} || bson.ValidationError || bson.EncodingError;
 
 pub fn ParseResult(comptime T: type) type {
     return struct {
@@ -54,6 +55,7 @@ pub fn serialize(value: anytype, allocator: std.mem.Allocator) (Error || std.mem
 }
 
 pub fn parse(comptime T: type, doc: bson.BSONDocument, allocator: std.mem.Allocator) (Error || std.mem.Allocator.Error)!ParseResult(T) {
+    try doc.validate();
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
 
@@ -74,6 +76,10 @@ pub fn encodeFields(value: anytype, doc: *bson.DocEncoder) (Error || std.mem.All
     }
 }
 
+/// `allocator` must be an arena (or otherwise bulk-freed by the
+/// caller).  Decoded strings/sub-documents are individually allocated and
+/// are NOT freed on error paths — use `parse()`, which wraps an arena and
+/// reclaims everything via ParseResult.deinit().
 pub fn decodeFields(comptime T: type, doc: bson.BSONDocument, allocator: std.mem.Allocator) (Error || std.mem.Allocator.Error)!T {
     const type_info = @typeInfo(T);
     if (type_info != .@"struct") return Error.UnsupportedType;
@@ -358,7 +364,7 @@ fn decodeValue(comptime T: type, bson_value: bson.BSONValue, allocator: std.mem.
         .int => switch (bson_value) {
             .int32 => std.math.cast(T, bson_value.int32.value) orelse Error.IntegerOverflow,
             .int64 => std.math.cast(T, bson_value.int64.value) orelse Error.IntegerOverflow,
-            .double => std.math.cast(T, @as(i64, @intFromFloat(bson_value.double.value))) orelse Error.IntegerOverflow,
+            .double => try doubleToInt(T, bson_value.double.value),
             else => Error.TypeMismatch,
         },
         .optional => |opt| switch (bson_value) {
@@ -430,6 +436,12 @@ fn decodeValue(comptime T: type, bson_value: bson.BSONValue, allocator: std.mem.
     };
 }
 
+fn doubleToInt(comptime T: type, value: f64) Error!T {
+    if (!std.math.isFinite(value)) return Error.IntegerInvalid;
+    if (value < -0x1p63 or value >= 0x1p63) return Error.IntegerOverflow;
+    return std.math.cast(T, @as(i64, @intFromFloat(value))) orelse Error.IntegerOverflow;
+}
+
 fn parseBsonArrayToSlice(
     comptime Elem: type,
     array_doc: bson.BSONDocument,
@@ -437,12 +449,15 @@ fn parseBsonArrayToSlice(
 ) (Error || std.mem.Allocator.Error)![]Elem {
     const len: usize = @intCast(array_doc.keyNumber());
     const out = try allocator.alloc(Elem, len);
+    errdefer allocator.free(out);
 
+    var iter = array_doc.iter();
     for (0..len) |idx| {
         var key_buf: [20]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{d}", .{idx}) catch unreachable;
-        const value = array_doc.get(key) orelse return Error.MissingField;
-        out[idx] = try decodeValue(Elem, value, allocator);
+        const pair = iter.next() orelse return Error.MissingField;
+        if (!std.mem.eql(u8, pair.key, key)) return Error.MissingField;
+        out[idx] = try decodeValue(Elem, pair.value, allocator);
     }
 
     return out;
@@ -455,13 +470,16 @@ fn parseBsonArrayToFixedArray(
     allocator: std.mem.Allocator,
 ) (Error || std.mem.Allocator.Error)!ArrT {
     var out: ArrT = undefined;
+    var iter = array_doc.iter();
 
     for (0..out.len) |idx| {
         var key_buf: [20]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{d}", .{idx}) catch unreachable;
-        const value = array_doc.get(key) orelse return Error.MissingField;
-        out[idx] = try decodeValue(Elem, value, allocator);
+        const pair = iter.next() orelse return Error.MissingField;
+        if (!std.mem.eql(u8, pair.key, key)) return Error.MissingField;
+        out[idx] = try decodeValue(Elem, pair.value, allocator);
     }
+    if (iter.next() != null) return Error.TypeMismatch;
 
     return out;
 }
@@ -469,7 +487,7 @@ fn parseBsonArrayToFixedArray(
 fn copyDocument(doc: bson.BSONDocument, allocator: std.mem.Allocator) !bson.BSONDocument {
     const buffer = try allocator.alloc(u8, doc.buffer.len);
     @memcpy(buffer, doc.buffer);
-    return bson.BSONDocument.init(buffer);
+    return bson.BSONDocument{ .buffer = buffer, .owned = true };
 }
 
 fn copyValue(value: bson.BSONValue, allocator: std.mem.Allocator) !bson.BSONValue {
@@ -553,6 +571,24 @@ test "parse optional missing field" {
 
     try std.testing.expectEqualStrings("Alice", parsed.value.name);
     try std.testing.expectEqual(@as(?i32, null), parsed.value.age);
+}
+
+test "parse rejects invalid double to integer conversions" {
+    const T = struct { value: i64 };
+
+    var invalid = try serialize(.{ .value = std.math.nan(f64) }, std.testing.allocator);
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expectError(Error.IntegerInvalid, parse(T, invalid, std.testing.allocator));
+
+    var overflow = try serialize(.{ .value = @as(f64, 0x1p63) }, std.testing.allocator);
+    defer overflow.deinit(std.testing.allocator);
+    try std.testing.expectError(Error.IntegerOverflow, parse(T, overflow, std.testing.allocator));
+
+    var fractional = try serialize(.{ .value = @as(f64, 3.5) }, std.testing.allocator);
+    defer fractional.deinit(std.testing.allocator);
+    var parsed = try parse(T, fractional, std.testing.allocator);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.value);
 }
 
 test "serialize/parse nested struct roundtrip" {

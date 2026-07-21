@@ -72,6 +72,12 @@ fn mapQueryParseError(err: anyerror) Result {
         Query.QueryParsingErrors.InvalidCursorOffset,
         => Result.InvalidCursor,
         Query.QueryParsingErrors.OutOfMemory => Result.OutOfMemory,
+        error.InvalidLength,
+        error.InvalidType,
+        error.MissingTerminator,
+        error.InvalidBoolean,
+        error.NestingTooDeep,
+        => Result.InvalidFormat,
         else => Result.Error,
     };
 }
@@ -103,6 +109,13 @@ fn mapWriteError(err: anyerror) Result {
         error.TransactionActive => Result.TransactionActive,
         error.InvalidTransaction => Result.InvalidTransaction,
         error.TransactionBusy => Result.TransactionBusy,
+        error.InvalidLength,
+        error.InvalidType,
+        error.MissingTerminator,
+        error.InvalidBoolean,
+        error.NestingTooDeep,
+        error.InvalidFormat,
+        => Result.InvalidFormat,
         else => Result.Error,
     };
 }
@@ -207,10 +220,7 @@ pub export fn albedo_transaction_delete(tx: *Bucket.Transaction, queryBuffer: [*
         return Result.OutOfMemory;
     };
 
-    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => return Result.OutOfMemory,
-        else => return Result.Error,
-    };
+    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| return mapQueryParseError(err);
     defer query.deinit(local_ally);
 
     tx.delete(query) catch |err| return mapWriteError(err);
@@ -238,10 +248,7 @@ pub export fn albedo_transaction_transform(
     const query = Query.parseRaw(
         arena_ptr.allocator(),
         arena_ptr.allocator().dupe(u8, queryBufProper) catch return Result.OutOfMemory,
-    ) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => return Result.OutOfMemory,
-        else => return Result.Error,
-    };
+    ) catch |err| return mapQueryParseError(err);
 
     const iter = tx.transformIterate(arena_ptr, query) catch |err| return mapWriteError(err);
     iter.owns_arena = true;
@@ -356,14 +363,7 @@ pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen
         return Result.OutOfMemory;
     };
 
-    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => {
-            return Result.OutOfMemory;
-        },
-        else => {
-            return Result.Error;
-        },
-    };
+    var query = Query.parseRaw(local_ally, docBufferProper) catch |err| return mapQueryParseError(err);
     defer query.deinit(local_ally);
 
     bucket.delete(query) catch |err| return mapWriteError(err);
@@ -442,7 +442,7 @@ pub export fn albedo_close_iterator(iterator: *ListHandle) Result {
 }
 
 pub export fn albedo_checkpoint(bucket: *Bucket) Result {
-    bucket.checkpoint();
+    bucket.checkpoint() catch |err| return mapTransactionError(err);
     return Result.OK;
 }
 
@@ -481,14 +481,7 @@ pub export fn albedo_transform(
         arena_ptr.allocator().dupe(u8, queryBufProper) catch {
             return Result.OutOfMemory;
         },
-    ) catch |err| switch (err) {
-        Query.QueryParsingErrors.OutOfMemory => {
-            return Result.OutOfMemory;
-        },
-        else => {
-            return Result.Error;
-        },
-    };
+    ) catch |err| return mapQueryParseError(err);
 
     // Create an arena for the iterator and mark it as owned
 
@@ -502,6 +495,9 @@ pub export fn albedo_transform(
     return Result.OK;
 }
 
+/// The returned pointer is owned by the iterator's arena and is valid only
+/// until the next albedo_transform_data / albedo_transform_apply /
+/// albedo_transform_close call.
 pub export fn albedo_transform_data(
     iterator: *Bucket.TransformIterator,
     outDoc: *[*c]u8,
@@ -598,16 +594,12 @@ pub export fn albedo_subscribe(
 
     var q = Query.parseRaw(ally, queryBufProper) catch |err| return mapQueryParseError(err);
 
-    const sub = bucket.subscribe(q) catch |err| switch (err) {
-        error.WalNotActive => return Result.Error,
-        error.OutOfMemory => {
-            q.deinit(ally);
-            return Result.OutOfMemory;
-        },
-        error.OplogGap => {
-            q.deinit(ally);
-            return Result.Error;
-        },
+    const sub = bucket.subscribe(q) catch |err| {
+        q.deinit(ally);
+        return switch (err) {
+            error.OutOfMemory => Result.OutOfMemory,
+            else => Result.Error,
+        };
     };
 
     const handle = ally.create(SubscriptionHandle) catch {
@@ -1680,4 +1672,20 @@ fn cwdDeleteFile(path: []const u8) void {
 fn tryCwdDeleteFile(path: []const u8) !void {
     if (!builtin.is_test) unreachable;
     try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+}
+
+test "regression: albedo_subscribe on WAL-less bucket errors without leaking the query" {
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(@constCast(":memory:"), &bucket));
+    defer _ = albedo_close(bucket);
+
+    // In-memory buckets have no WAL, so subscribe fails with WalNotActive;
+    // the parsed query must still be freed (testing.allocator checks leaks).
+    var q_doc = try bson.BSONDocument.fromJSON(testing.allocator,
+        \\{ "query": { "a": 1 } }
+    );
+    defer q_doc.deinit(testing.allocator);
+
+    var handle: *SubscriptionHandle = undefined;
+    try testing.expectEqual(Result.Error, albedo_subscribe(bucket, @constCast(q_doc.buffer.ptr), &handle));
 }

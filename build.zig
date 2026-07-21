@@ -6,9 +6,59 @@ const lib_mod = @import("./src/lib.zig");
 // declaratively construct a build graph that will be executed by an external
 // runner.
 
-const ndkBase = "/Users/askhat/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr";
-const include_dir = ndkBase ++ "/include";
-const lib_dir = ndkBase ++ "/lib";
+// ponytail: API level pinned to 35 (Android 15). Add a -D option if a consumer needs to lower it.
+const ANDROID_API_LEVEL = "35";
+
+const AndroidPaths = struct {
+    include_dir: []const u8,
+    lib_dir: []const u8,
+};
+
+fn androidFail(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("albedo build: " ++ fmt ++ "\n", args);
+    std.process.exit(1);
+}
+
+// Resolves NDK sysroot paths from -DandroidSDK=<path>. Picks the newest
+// installed NDK under $sdk/ndk/* (lexicographic max == highest version).
+fn resolveAndroidPaths(b: *std.Build, raw_sdk: []const u8) AndroidPaths {
+    // ponytail: expand leading ~ to $HOME — zsh/bash don't do this after `=`,
+    // and `-DandroidSDK=~/...` is what users naturally type.
+    const sdk = if (std.mem.startsWith(u8, raw_sdk, "~/")) blk: {
+        const home = b.graph.environ_map.get("HOME") orelse
+            androidFail("could not read $HOME to expand {s}", .{raw_sdk});
+        break :blk b.fmt("{s}/{s}", .{ home, raw_sdk[2..] });
+    } else raw_sdk;
+
+    const host_tag = switch (b.graph.host.result.os.tag) {
+        .macos => "darwin-x86_64", // works on arm64 via Rosetta; every NDK ships this tag
+        .linux => "linux-x86_64",
+        .windows => "windows-x86_64",
+        else => androidFail("unsupported host OS for Android build: {s}", .{@tagName(b.graph.host.result.os.tag)}),
+    };
+
+    const ndk_dir_path = b.fmt("{s}/ndk", .{sdk});
+    const io = b.graph.io;
+    var ndk_dir = std.Io.Dir.cwd().openDir(io, ndk_dir_path, .{ .iterate = true }) catch
+        androidFail("cannot open {s} — is -DandroidSDK pointing at a valid SDK root?", .{ndk_dir_path});
+    defer ndk_dir.close(io);
+
+    var best: []const u8 = "";
+    var it = ndk_dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.order(u8, best, entry.name) == .lt) {
+            best = b.allocator.dupe(u8, entry.name) catch unreachable;
+        }
+    }
+    if (best.len == 0) androidFail("no NDK found under {s}", .{ndk_dir_path});
+
+    const sysroot = b.fmt("{s}/{s}/toolchains/llvm/prebuilt/{s}/sysroot/usr", .{ ndk_dir_path, best, host_tag });
+    return .{
+        .include_dir = b.fmt("{s}/include", .{sysroot}),
+        .lib_dir = b.fmt("{s}/lib", .{sysroot}),
+    };
+}
 
 fn createLibModule(
     b: *std.Build,
@@ -74,7 +124,7 @@ fn buildWasmTarget(b: *std.Build, libModule: *std.Build.Module) void {
     b.installArtifact(wasm_module);
 }
 
-fn configureAndroidDynamic(b: *std.Build, libModule: *std.Build.Module, dynamic: *std.Build.Step.Compile, arch: []const u8) void {
+fn configureAndroidDynamic(b: *std.Build, libModule: *std.Build.Module, dynamic: *std.Build.Step.Compile, arch: []const u8, paths: AndroidPaths) void {
     dynamic.root_module.link_libc = true;
     dynamic.link_z_max_page_size = 16 << 10;
     dynamic.link_z_common_page_size = 16 << 10;
@@ -88,21 +138,19 @@ fn configureAndroidDynamic(b: *std.Build, libModule: *std.Build.Module, dynamic:
         libModule.linkSystemLibrary(lib, .{ .weak = true });
     }
 
-    libModule.addIncludePath(.{ .cwd_relative = b.fmt("{s}", .{include_dir}) });
-    libModule.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}/35", .{ lib_dir, arch }) });
-    // libModule.export_table = true;
+    libModule.addIncludePath(.{ .cwd_relative = paths.include_dir });
+    libModule.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}/{s}", .{ paths.lib_dir, arch, ANDROID_API_LEVEL }) });
+    libModule.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}", .{ paths.lib_dir, arch }) });
     dynamic.export_table = true;
-    libModule.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}", .{ lib_dir, arch }) });
-    dynamic.setLibCFile(.{ .cwd_relative = b.fmt("android-confs/{s}.conf", .{arch}) });
 
-    dynamic.libc_file.?.addStepDependencies(&dynamic.step);
+    dynamic.setLibCFile(createLibCFile(b, arch, paths));
 
     if (dynamic.root_module.resolved_target.?.result.cpu.arch == .x86) {
         dynamic.link_z_notext = true;
     }
 }
 
-fn buildSharedLibrary(b: *std.Build, libModule: *std.Build.Module, target: std.Build.ResolvedTarget, isAndroid: bool) void {
+fn buildSharedLibrary(b: *std.Build, libModule: *std.Build.Module, target: std.Build.ResolvedTarget, isAndroid: bool, android_paths: ?AndroidPaths) void {
     const dynamic = b.addLibrary(.{
         .name = "albedo",
         .linkage = .dynamic,
@@ -119,7 +167,7 @@ fn buildSharedLibrary(b: *std.Build, libModule: *std.Build.Module, target: std.B
     };
 
     if (isAndroid) {
-        configureAndroidDynamic(b, libModule, dynamic, arch);
+        configureAndroidDynamic(b, libModule, dynamic, arch, android_paths.?);
     }
 
     b.installArtifact(dynamic);
@@ -179,31 +227,21 @@ fn addTests(b: *std.Build, libModule: *std.Build.Module) void {
     test_step.dependOn(&run_lib_unit_tests.step);
 }
 
-fn createLibCFile(b: *std.Build, arch: []const u8) ![]const u8 {
-    const fname = b.fmt("android-{s}.conf", .{arch});
+// Generates a libc conf file into Zig's build cache (no committed per-machine paths).
+fn createLibCFile(b: *std.Build, arch: []const u8, paths: AndroidPaths) std.Build.LazyPath {
+    // include_dir: directory holding `stdlib.h`.
+    // sys_include_dir: directory holding `sys/errno.h` (arch-specific on Android).
+    const content = b.fmt(
+        "include_dir={s}\n" ++
+        "sys_include_dir={s}/{s}\n" ++
+        "crt_dir={s}/{s}/{s}\n" ++
+        "msvc_lib_dir=\n" ++
+        "kernel32_lib_dir=\n" ++
+        "gcc_dir=\n",
+        .{ paths.include_dir, paths.include_dir, arch, paths.lib_dir, arch, ANDROID_API_LEVEL },
+    );
 
-    var contents = std.ArrayList(u8);
-    errdefer contents.deinit();
-
-    var writer = contents.writer(b.allocator);
-
-    //  The directory that contains `stdlib.h`.
-    //  On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null
-    try writer.print("include_dir={s}\n", .{include_dir});
-
-    // The system-specific include directory. May be the same as `include_dir`.
-    // On Windows it's the directory that includes `vcruntime.h`.
-    // On POSIX it's the directory that includes `sys/errno.h`.
-    try writer.print("sys_include_dir={s}/{s}\n", .{ include_dir, arch });
-
-    try writer.print("crt_dir={s}/{s}\n", .{ lib_dir, arch });
-    try writer.writeAll("msvc_lib_dir=\n");
-    try writer.writeAll("kernel32_lib_dir=\n");
-    try writer.writeAll("gcc_dir=\n");
-
-    const step = b.addWriteFile(fname, contents.items);
-    b.getInstallStep().dependOn(&step.step);
-    return step.files.items[0].sub_path;
+    return b.addWriteFiles().add(b.fmt("{s}.conf", .{arch}), content);
 }
 
 pub fn build(b: *std.Build) void {
@@ -234,13 +272,19 @@ pub fn build(b: *std.Build) void {
     const isAndroid = target.result.abi == .android;
     const isWasm = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
 
+    const android_sdk = b.option([]const u8, "androidSDK", "Path to Android SDK root (required for -Dtarget=*-android)") orelse "";
+    if (isAndroid and android_sdk.len == 0) {
+        androidFail("-DandroidSDK=<path> is required when target is Android (e.g. -DandroidSDK=~/Library/Android/sdk)", .{});
+    }
+    const android_paths: ?AndroidPaths = if (isAndroid) resolveAndroidPaths(b, android_sdk) else null;
+
     const libModule = createLibModule(b, target, optimize, isAndroid, isWasm);
 
     if (isWasm) {
         buildWasmTarget(b, libModule);
     } else {
         if (!buildStatic) {
-            buildSharedLibrary(b, libModule, target, isAndroid);
+            buildSharedLibrary(b, libModule, target, isAndroid, android_paths);
         } else {
             buildStaticLibrary(b, libModule, outputName);
         }

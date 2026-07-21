@@ -1,15 +1,32 @@
 const std = @import("std");
 const mem = std.mem;
+const builtin = @import("builtin");
 pub const ObjectId = @import("./object_id.zig").ObjectId;
 pub const fmt = @import("./bson_formatter.zig");
+
+pub const MAX_NESTING_DEPTH = 100;
+
+pub const ValidationError = error{
+    InvalidLength,
+    InvalidType,
+    MissingTerminator,
+    InvalidBoolean,
+    NestingTooDeep,
+};
+
+pub const EncodingError = error{
+    InvalidKey,
+    ValueTooLarge,
+};
 
 pub const BSONString = struct {
     // code: i8, // 0x02
     value: []const u8,
 
-    pub fn write(self: BSONString, memory: []u8) void {
+    pub fn write(self: BSONString, memory: []u8) EncodingError!void {
         // var memory = try allocator.alloc(u8, 4 + self.length);
-        const length = @as(u32, @truncate(self.value.len)) + 1;
+        if (self.value.len >= std.math.maxInt(i32)) return error.ValueTooLarge;
+        const length: u32 = @intCast(self.value.len + 1);
 
         std.mem.writeInt(u32, memory[0..4], length, .little);
         // std.mem.copyForwards(u8, memory[4 .. length + 3], self.value);
@@ -17,8 +34,8 @@ pub const BSONString = struct {
         memory[length + 3] = 0x00;
     }
 
-    pub fn size(self: *const BSONString) u32 {
-        return 4 + @as(u32, @truncate(self.value.len)) + 1;
+    pub fn size(self: *const BSONString) usize {
+        return 4 + self.value.len + 1;
     }
 
     pub fn read(memory: []const u8) BSONString {
@@ -35,7 +52,7 @@ test "encodes BSONString" {
     const actual = allocator.alloc(u8, string.size()) catch unreachable;
     defer allocator.free(actual);
 
-    string.write(actual);
+    try string.write(actual);
 
     // for (actual) |value| {
     //     std.debug.print("{x} ", .{value});
@@ -216,15 +233,16 @@ pub const BSONBinary = struct {
     value: []const u8,
     subtype: u8,
 
-    pub fn write(self: BSONBinary, memory: []u8) void {
-        const length = @as(u32, @truncate(self.value.len));
+    pub fn write(self: BSONBinary, memory: []u8) EncodingError!void {
+        if (self.value.len > std.math.maxInt(i32)) return error.ValueTooLarge;
+        const length: u32 = @intCast(self.value.len);
         std.mem.copyForwards(u8, memory[0..4], &mem.toBytes(length));
         memory[4] = self.subtype;
         std.mem.copyForwards(u8, memory[5..], self.value);
     }
 
-    pub fn size(self: BSONBinary) u32 {
-        return 5 + @as(u32, @truncate(self.value.len));
+    pub fn size(self: BSONBinary) usize {
+        return 5 + self.value.len;
     }
 
     pub fn read(memory: []const u8) BSONBinary {
@@ -243,7 +261,7 @@ test "encodes BSONBinary" {
     const test_subtype: u8 = 0x00;
     var binary = BSONBinary{ .value = @constCast(&test_binary), .subtype = test_subtype };
     const actual = allocator.alloc(u8, binary.size()) catch unreachable;
-    binary.write(actual);
+    try binary.write(actual);
     defer allocator.free(actual);
 
     const expected_binary = @constCast(&[_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03 });
@@ -502,12 +520,12 @@ pub const BSONValue = union(BSONValueType) {
 
     pub fn toString() [:0]u8 {}
 
-    pub inline fn size(self: *const BSONValue) u32 {
+    pub inline fn size(self: *const BSONValue) usize {
         return switch (self.*) {
             .string => self.string.size(),
             .double => 8,
             .int32 => 4,
-            .document, .array => |sizable| @truncate(sizable.buffer.len),
+            .document, .array => |sizable| sizable.buffer.len,
             .datetime => 8,
             .int64 => 8,
             .binary => self.binary.size(),
@@ -610,7 +628,8 @@ pub const BSONValue = union(BSONValueType) {
             .double => self.double.value == other.double.value,
             .document => false,
             .datetime => self.datetime.value == other.datetime.value,
-            .binary => std.mem.eql(u8, self.binary.value, other.binary.value),
+            .binary => self.binary.subtype == other.binary.subtype and
+                std.mem.eql(u8, self.binary.value, other.binary.value),
             .boolean => self.boolean.value == other.boolean.value,
             .null => true,
             .minKey => true,
@@ -633,8 +652,31 @@ pub const BSONValue = union(BSONValueType) {
             .document => .eq,
             .array => .eq,
             .datetime => std.math.order(self.datetime.value, other.datetime.value),
-            .binary => .eq,
-            .boolean => std.math.order(@intFromBool(self.boolean.value), @intFromBool(other.boolean.value)),
+            .binary => blk: {
+                const length_order = std.math.order(
+                    self.binary.value.len,
+                    other.binary.value.len,
+                );
+                if (length_order != .eq) break :blk length_order;
+
+                const subtype_order = std.math.order(
+                    self.binary.subtype,
+                    other.binary.subtype,
+                );
+                if (subtype_order != .eq) break :blk subtype_order;
+
+                break :blk std.mem.order(
+                    u8,
+                    self.binary.value,
+                    other.binary.value,
+                );
+            },
+            .boolean => if (self.boolean.value == other.boolean.value)
+                .eq
+            else if (self.boolean.value)
+                .gt
+            else
+                .lt,
             .null => .eq,
             .minKey => .eq,
             .maxKey => .eq,
@@ -675,7 +717,8 @@ pub const BSONValue = union(BSONValueType) {
     pub fn write(self: *const BSONValue, writer: *std.Io.Writer) !void {
         switch (self.*) {
             .string => {
-                try writer.writeInt(u32, @as(u32, @truncate(self.string.value.len)) + 1, .little);
+                if (self.string.value.len >= std.math.maxInt(i32)) return error.ValueTooLarge;
+                try writer.writeInt(u32, @intCast(self.string.value.len + 1), .little);
                 try writer.writeAll(self.string.value);
                 try writer.writeByte(0);
             },
@@ -695,7 +738,8 @@ pub const BSONValue = union(BSONValueType) {
                 try writer.writeInt(i64, self.int64.value, .little);
             },
             .binary => {
-                try writer.writeInt(u32, @as(u32, @truncate(self.binary.value.len)), .little);
+                if (self.binary.value.len > std.math.maxInt(i32)) return error.ValueTooLarge;
+                try writer.writeInt(u32, @intCast(self.binary.value.len), .little);
                 try writer.writeByte(self.binary.subtype);
                 try writer.writeAll(self.binary.value);
             },
@@ -772,6 +816,35 @@ test "BSONValue.order min/max key" {
     const another_max = BSONValue{ .maxKey = BSONMaxKey{} };
     try std.testing.expect(min_val.eql(&another_min));
     try std.testing.expect(max_val.eql(&another_max));
+}
+
+test "BSONValue.order boolean" {
+    const false_val = BSONValue{ .boolean = .{ .value = false } };
+    const true_val = BSONValue{ .boolean = .{ .value = true } };
+
+    try std.testing.expectEqual(std.math.Order.lt, false_val.order(true_val));
+    try std.testing.expectEqual(std.math.Order.gt, true_val.order(false_val));
+    try std.testing.expectEqual(std.math.Order.eq, false_val.order(false_val));
+}
+
+test "BSONValue.order binary compares length first" {
+    const short = BSONValue{ .binary = .{ .value = &.{0xff}, .subtype = 0x00 } };
+    const long = BSONValue{ .binary = .{ .value = &.{ 0x00, 0x00 }, .subtype = 0x00 } };
+
+    try std.testing.expectEqual(std.math.Order.lt, short.order(long));
+    try std.testing.expectEqual(std.math.Order.gt, long.order(short));
+}
+
+test "BSONValue binary equality agrees with ordering" {
+    const payload = [_]u8{ 0x01, 0x02, 0x03 };
+    const generic = BSONValue{ .binary = .{ .value = &payload, .subtype = 0x00 } };
+    const same_generic = BSONValue{ .binary = .{ .value = &payload, .subtype = 0x00 } };
+    const user_defined = BSONValue{ .binary = .{ .value = &payload, .subtype = 0x80 } };
+
+    try std.testing.expect(generic.eql(&same_generic));
+    try std.testing.expectEqual(std.math.Order.eq, generic.order(same_generic));
+    try std.testing.expect(!generic.eql(&user_defined));
+    try std.testing.expect(generic.order(user_defined) != .eq);
 }
 
 pub const BSONValueType = enum(u8) {
@@ -867,14 +940,232 @@ test "from json" {
     try std.testing.expectEqualStrings("val", doc.getPath("key.key2").?.string.value);
 }
 
+test "from json supports nested arrays" {
+    const json = "{\"items\":[\"x\",2,true,null,{\"name\":\"n\"},[3]]}";
+    const doc = try BSONDocument.fromJSON(std.testing.allocator, json);
+    defer doc.deinit(std.testing.allocator);
+
+    try doc.validate();
+    try std.testing.expectEqualStrings("x", doc.getPath("items.0").?.string.value);
+    try std.testing.expectEqual(@as(i32, 2), doc.getPath("items.1").?.int32.value);
+    try std.testing.expect(doc.getPath("items.2").?.boolean.value);
+    try std.testing.expectEqualStrings("n", doc.getPath("items.4.name").?.string.value);
+    try std.testing.expectEqual(@as(i32, 3), doc.getPath("items.5.0").?.int32.value);
+}
+
+test "BSONDocument validates malformed data and nesting depth" {
+    const truncated = [_]u8{ 5, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidLength, BSONDocument.init(&truncated).validate());
+
+    const unknown_type = [_]u8{ 8, 0, 0, 0, 0x06, 'a', 0, 0 };
+    try std.testing.expectError(error.InvalidType, BSONDocument.init(&unknown_type).validate());
+
+    const unterminated_name = [_]u8{ 8, 0, 0, 0, 0x10, 'a', 'b', 0 };
+    try std.testing.expectError(error.MissingTerminator, BSONDocument.init(&unterminated_name).validate());
+
+    const invalid_boolean = [_]u8{ 9, 0, 0, 0, 0x08, 'a', 0, 2, 0 };
+    try std.testing.expectError(error.InvalidBoolean, BSONDocument.init(&invalid_boolean).validate());
+
+    var nested = BSONDocument.initEmpty();
+    var owns_nested = false;
+    defer if (owns_nested) nested.deinit(std.testing.allocator);
+    for (0..MAX_NESTING_DEPTH) |_| {
+        const parent = try BSONDocument.fromPairs(std.testing.allocator, &.{.{
+            .key = "child",
+            .value = .{ .document = nested },
+        }});
+        if (owns_nested) nested.deinit(std.testing.allocator);
+        nested = parent;
+        owns_nested = true;
+    }
+    try std.testing.expectError(error.NestingTooDeep, nested.validate());
+}
+
+test "BSONDocument supports empty keys and rejects embedded null keys" {
+    const doc = try BSONDocument.fromPairs(std.testing.allocator, &.{.{
+        .key = "",
+        .value = .{ .int32 = .{ .value = 7 } },
+    }});
+    defer doc.deinit(std.testing.allocator);
+
+    try doc.validate();
+    try std.testing.expectEqual(@as(i32, 7), doc.get("").?.int32.value);
+    try std.testing.expectError(error.InvalidKey, BSONDocument.fromPairs(std.testing.allocator, &.{.{
+        .key = "bad\x00key",
+        .value = .{ .null = .{} },
+    }}));
+}
+
+test "fuzz BSON validation and accessors" {
+    try std.testing.fuzz({}, fuzzBSONValidation, .{ .corpus = &.{
+        "\x05\x00\x00\x00\x05\x00\x00\x00\x00",
+        "\x0c\x00\x00\x00\x0c\x00\x00\x00\x10a\x00\x01\x00\x00\x00\x00",
+        "\x0e\x00\x00\x00\x0e\x00\x00\x00\x02s\x00\x02\x00\x00\x00x\x00\x00",
+        "\x0d\x00\x00\x00\x0d\x00\x00\x00\x03d\x00\x05\x00\x00\x00\x00\x00",
+    } });
+}
+
+fn fuzzBSONValidation(_: void, smith: *std.testing.Smith) anyerror!void {
+    var storage: [4096]u8 = undefined;
+    const bytes = storage[0..smith.slice(&storage)];
+    const doc = BSONDocument.init(bytes);
+    doc.validate() catch {
+        try fuzzBSONEncoding({}, smith);
+        return;
+    };
+
+    try exerciseValidatedDocument(doc);
+
+    var parse_buffer: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&parse_buffer);
+    var parsed = fmt.parse(BSONDocument, doc, fba.allocator()) catch |err| switch (err) {
+        error.OutOfMemory => return,
+        else => return err,
+    };
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try fuzzBSONEncoding({}, smith);
+}
+
+fn exerciseValidatedDocument(doc: BSONDocument) anyerror!void {
+    var count: u32 = 0;
+    var iter = doc.iter();
+    while (iter.next()) |pair| {
+        try std.testing.expect(doc.get(pair.key) != null);
+        switch (pair.value) {
+            .document, .array => |child| try exerciseValidatedDocument(child),
+            else => {},
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(count, doc.keyNumber());
+}
+
+test "fuzz BSON encoding" {
+    try std.testing.fuzz({}, fuzzBSONEncoding, .{ .corpus = &.{
+        "\x03\x00\x00\x00key\x05\x00\x00\x00hello\x02\x00\x00\x00\x00\xff",
+    } });
+}
+
+fn fuzzBSONEncoding(_: void, smith: *std.testing.Smith) anyerror!void {
+    var key_buffer: [64]u8 = undefined;
+    var string_buffer: [512]u8 = undefined;
+    var binary_buffer: [512]u8 = undefined;
+    const key = key_buffer[0..smith.slice(&key_buffer)];
+    const string = string_buffer[0..smith.slice(&string_buffer)];
+    const binary = binary_buffer[0..smith.slice(&binary_buffer)];
+
+    var allocation_buffer: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocation_buffer);
+    const allocator = fba.allocator();
+    var builder = try Builder.init(allocator);
+    defer builder.deinit();
+    builder.putValue(key, .{ .string = .{ .value = string } }) catch |err| switch (err) {
+        error.InvalidKey => return,
+        else => return err,
+    };
+    builder.putValue(key, .{ .binary = .{ .value = binary, .subtype = 0 } }) catch |err| switch (err) {
+        error.InvalidKey => return,
+        else => return err,
+    };
+
+    const doc = try builder.finish();
+    defer doc.deinit(allocator);
+    try doc.validate();
+    try exerciseValidatedDocument(doc);
+}
+
 pub const BSONDocument = struct {
     // values: []BSONKeyValuePair,
     buffer: []const u8,
+    /// True when this document's buffer was heap-allocated by the producing
+    /// API (fromPairs/Builder/Editor/serialize/clone). `deinit` only frees
+    /// owned buffers, so calling it on a borrowed document is a safe no-op.
+    owned: bool = false,
 
     pub fn init(buffer: []const u8) BSONDocument {
         return BSONDocument{
             .buffer = buffer,
         };
+    }
+
+    pub fn validate(self: BSONDocument) ValidationError!void {
+        const Frame = struct {
+            idx: usize,
+            end: usize,
+        };
+
+        if (self.buffer.len < 5 or self.buffer.len > std.math.maxInt(i32)) return error.InvalidLength;
+        const root_len = std.mem.readInt(i32, self.buffer[0..4], .little);
+        if (root_len < 5 or @as(usize, @intCast(root_len)) != self.buffer.len) return error.InvalidLength;
+
+        var frames: [MAX_NESTING_DEPTH]Frame = undefined;
+        frames[0] = .{ .idx = 4, .end = self.buffer.len - 1 };
+        var depth: usize = 1;
+
+        while (depth > 0) {
+            const frame = &frames[depth - 1];
+            if (frame.idx == frame.end) {
+                if (self.buffer[frame.end] != 0) return error.MissingTerminator;
+                depth -= 1;
+                continue;
+            }
+            if (frame.idx > frame.end or self.buffer[frame.idx] == 0) return error.InvalidLength;
+
+            const value_type = self.buffer[frame.idx];
+            const name_start = frame.idx + 1;
+            const relative_name_end = std.mem.indexOfScalar(u8, self.buffer[name_start..frame.end], 0) orelse return error.MissingTerminator;
+            const name_end = name_start + relative_name_end;
+            const value_start = name_end + 1;
+            const available = frame.end - value_start;
+
+            const fixed_size: ?usize = switch (value_type) {
+                0x01, 0x09, 0x12 => 8,
+                0x07 => 12,
+                0x08 => 1,
+                0x0A, 0x7F, 0xFF => 0,
+                0x10 => 4,
+                0x02, 0x03, 0x04, 0x05 => null,
+                else => return error.InvalidType,
+            };
+
+            if (fixed_size) |size| {
+                if (size > available) return error.InvalidLength;
+                if (value_type == 0x08 and self.buffer[value_start] > 1) return error.InvalidBoolean;
+                frame.idx = value_start + size;
+                continue;
+            }
+
+            if (available < 4) return error.InvalidLength;
+            const encoded_len = std.mem.readInt(i32, self.buffer[value_start..][0..4], .little);
+            switch (value_type) {
+                0x02 => {
+                    if (encoded_len < 1) return error.InvalidLength;
+                    const string_len: usize = @intCast(encoded_len);
+                    if (string_len > available - 4) return error.InvalidLength;
+                    if (self.buffer[value_start + 4 + string_len - 1] != 0) return error.MissingTerminator;
+                    frame.idx = value_start + 4 + string_len;
+                },
+                0x05 => {
+                    if (encoded_len < 0) return error.InvalidLength;
+                    const binary_len: usize = @intCast(encoded_len);
+                    if (available < 5 or binary_len > available - 5) return error.InvalidLength;
+                    frame.idx = value_start + 5 + binary_len;
+                },
+                0x03, 0x04 => {
+                    if (encoded_len < 5) return error.InvalidLength;
+                    const child_len: usize = @intCast(encoded_len);
+                    if (child_len > available) return error.InvalidLength;
+                    const child_end = value_start + child_len - 1;
+                    if (self.buffer[child_end] != 0) return error.MissingTerminator;
+                    if (depth == MAX_NESTING_DEPTH) return error.NestingTooDeep;
+                    frame.idx = value_start + child_len;
+                    frames[depth] = .{ .idx = value_start + 4, .end = child_end };
+                    depth += 1;
+                },
+                else => unreachable,
+            }
+        }
     }
 
     pub fn initEmpty() BSONDocument {
@@ -883,14 +1174,16 @@ pub const BSONDocument = struct {
         };
     }
 
-    pub fn fromJSON(ally: mem.Allocator, json: []const u8) !BSONDocument {
+    fn fromJSONInternal(ally: mem.Allocator, json: []const u8) !BSONDocument {
         var jsonStream = std.json.Scanner.initCompleteInput(ally, json);
         defer jsonStream.deinit();
 
-        return .{ .buffer = try jsonToDoc(&jsonStream, ally) };
+        return .{ .buffer = try jsonToDoc(&jsonStream, ally), .owned = true };
     }
 
-    fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) ![]u8 {
+    pub const fromJSON = if (builtin.is_test) fromJSONInternal else {};
+
+    fn jsonToDoc(json: *std.json.Scanner, allocator: mem.Allocator) anyerror![]u8 {
         var pairs = std.Io.Writer.Allocating.init(allocator);
         errdefer pairs.deinit();
         const writer = &pairs.writer;
@@ -904,73 +1197,98 @@ pub const BSONDocument = struct {
                 return error.InvalidJSON;
             }
             const key = token.allocated_string;
+            defer allocator.free(key);
+            if (mem.indexOfScalar(u8, key, 0) != null) return error.InvalidKey;
             const nextType = try json.peekNextTokenType();
-            if (nextType == .object_end) {
+            try writeJsonValue(json, allocator, writer, key, nextType);
+            token = try json.nextAlloc(allocator, .alloc_always);
+        }
+        if (pairs.written().len >= std.math.maxInt(i32)) return error.ValueTooLarge;
+        std.mem.writeInt(u32, pairs.written()[0..4], @intCast(pairs.written().len + 1), .little);
+        try writer.writeByte(0); // Null terminator for the document
+        return pairs.toOwnedSlice();
+    }
+
+    fn jsonToArray(json: *std.json.Scanner, allocator: mem.Allocator) anyerror![]u8 {
+        var pairs = std.Io.Writer.Allocating.init(allocator);
+        errdefer pairs.deinit();
+        const writer = &pairs.writer;
+        try writer.writeInt(u32, 0, .little);
+        if (try json.next() != .array_begin) return error.InvalidJSON;
+
+        var index: usize = 0;
+        while (true) : (index += 1) {
+            const next_type = try json.peekNextTokenType();
+            if (next_type == .array_end) {
+                _ = try json.next();
                 break;
             }
 
-            switch (nextType) {
-                .number => {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-                    if (std.mem.indexOf(u8, token.allocated_number, ".") != null) {
-                        const value = try std.fmt.parseFloat(f64, token.allocated_number);
-                        try writer.writeByte(@intFromEnum(BSONValueType.double));
-                        try writer.writeAll(key);
-                        try writer.writeByte(0);
-                        try writer.writeAll(&mem.toBytes(value));
-                        allocator.free(token.allocated_number);
-                    } else {
-                        const value = try std.fmt.parseInt(i32, token.allocated_number, 10);
-                        try writer.writeByte(@intFromEnum(BSONValueType.int32));
-                        try writer.writeAll(key);
-                        try writer.writeByte(0);
-                        try writer.writeInt(i32, value, .little);
-                        allocator.free(token.allocated_number);
-                    }
-                },
-                .string => {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-
-                    try writer.writeByte(@intFromEnum(BSONValueType.string));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                    try writer.writeInt(u32, @as(u32, @truncate(token.allocated_string.len)) + 1, .little);
-                    try writer.writeAll(token.allocated_string);
-                    try writer.writeByte(0);
-                    allocator.free(token.allocated_string);
-                },
-                .true, .false => |tok| {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-                    try writer.writeByte(@intFromEnum(BSONValueType.boolean));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                    try writer.writeByte(if (tok == .true) 0x01 else 0x00);
-                },
-                .null => {
-                    token = try json.nextAlloc(allocator, .alloc_always);
-                    try writer.writeByte(@intFromEnum(BSONValueType.null));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                },
-                .object_begin => {
-                    // token = try json.nextAlloc(allocator, .alloc_always);
-                    const value = try jsonToDoc(json, allocator);
-                    try writer.writeByte(@intFromEnum(BSONValueType.document));
-                    try writer.writeAll(key);
-                    try writer.writeByte(0);
-                    try writer.writeAll(value);
-                    allocator.free(value);
-                },
-                else => {
-                    return error.InvalidJSON;
-                },
-            }
-            allocator.free(key);
-            token = try json.nextAlloc(allocator, .alloc_always);
+            var key_buffer: [20]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buffer, "{d}", .{index}) catch unreachable;
+            try writeJsonValue(json, allocator, writer, key, next_type);
         }
-        std.mem.writeInt(u32, pairs.written()[0..4], @truncate(pairs.written().len + 1), .little);
-        try writer.writeByte(0); // Null terminator for the document
+
+        if (pairs.written().len >= std.math.maxInt(i32)) return error.ValueTooLarge;
+        std.mem.writeInt(u32, pairs.written()[0..4], @intCast(pairs.written().len + 1), .little);
+        try writer.writeByte(0);
         return pairs.toOwnedSlice();
+    }
+
+    fn writeJsonValue(
+        json: *std.json.Scanner,
+        allocator: mem.Allocator,
+        writer: *std.Io.Writer,
+        key: []const u8,
+        value_type: std.json.TokenType,
+    ) anyerror!void {
+        switch (value_type) {
+            .number => {
+                const token = try json.nextAlloc(allocator, .alloc_always);
+                defer allocator.free(token.allocated_number);
+                if (std.mem.indexOfAny(u8, token.allocated_number, ".eE") != null) {
+                    try writeJsonElementHeader(writer, .double, key);
+                    try writer.writeAll(&mem.toBytes(try std.fmt.parseFloat(f64, token.allocated_number)));
+                } else {
+                    try writeJsonElementHeader(writer, .int32, key);
+                    try writer.writeInt(i32, try std.fmt.parseInt(i32, token.allocated_number, 10), .little);
+                }
+            },
+            .string => {
+                const token = try json.nextAlloc(allocator, .alloc_always);
+                defer allocator.free(token.allocated_string);
+                if (token.allocated_string.len >= std.math.maxInt(i32)) return error.ValueTooLarge;
+                try writeJsonElementHeader(writer, .string, key);
+                try writer.writeInt(u32, @intCast(token.allocated_string.len + 1), .little);
+                try writer.writeAll(token.allocated_string);
+                try writer.writeByte(0);
+            },
+            .true, .false => |token_type| {
+                _ = try json.next();
+                try writeJsonElementHeader(writer, .boolean, key);
+                try writer.writeByte(if (token_type == .true) 1 else 0);
+            },
+            .null => {
+                _ = try json.next();
+                try writeJsonElementHeader(writer, .null, key);
+            },
+            .object_begin, .array_begin => |token_type| {
+                const value = if (token_type == .object_begin)
+                    try jsonToDoc(json, allocator)
+                else
+                    try jsonToArray(json, allocator);
+                defer allocator.free(value);
+                try writeJsonElementHeader(writer, if (token_type == .object_begin) .document else .array, key);
+                try writer.writeAll(value);
+            },
+            else => return error.InvalidJSON,
+        }
+    }
+
+    fn writeJsonElementHeader(writer: *std.Io.Writer, value_type: BSONValueType, key: []const u8) !void {
+        try writer.writeByte(@intFromEnum(value_type));
+        try writer.writeAll(key);
+        try writer.writeByte(0);
     }
 
     const PairIterator = struct {
@@ -998,13 +1316,14 @@ pub const BSONDocument = struct {
         };
     }
 
-    pub fn fromPairs(allocator: mem.Allocator, pairs: []BSONKeyValuePair) !BSONDocument {
+    pub fn fromPairs(allocator: mem.Allocator, pairs: []const BSONKeyValuePair) !BSONDocument {
         var list = std.Io.Writer.Allocating.init(allocator);
         errdefer list.deinit();
         const writer = &list.writer;
         try writer.writeInt(u32, 0, .little);
 
         for (pairs) |pair| {
+            if (mem.indexOfScalar(u8, pair.key, 0) != null) return error.InvalidKey;
             try writer.writeByte(@intFromEnum(pair.value.valueType()));
             try writer.writeAll(pair.key);
             try writer.writeByte(0);
@@ -1012,9 +1331,10 @@ pub const BSONDocument = struct {
         }
         try writer.writeByte(0); // Null terminator for the document
 
-        std.mem.writeInt(u32, list.written()[0..4], @as(u32, @truncate(list.written().len)), .little);
+        if (list.written().len > std.math.maxInt(i32)) return error.ValueTooLarge;
+        std.mem.writeInt(u32, list.written()[0..4], @intCast(list.written().len), .little);
 
-        return BSONDocument{ .buffer = try list.toOwnedSlice() };
+        return BSONDocument{ .buffer = try list.toOwnedSlice(), .owned = true };
     }
 
     pub fn write(self: *const BSONDocument, writer: *std.Io.Writer) !void {
@@ -1054,10 +1374,8 @@ pub const BSONDocument = struct {
             idx += nameLen + 1; // Move past name and null terminator
 
             // Fast path: check first char and length before full comparison
-            if (nameLen == key_len and name[0] == key[0]) {
-                if (mem.eql(u8, name, key)) {
-                    return BSONValue.read(buffer[idx..], typeByte);
-                }
+            if (nameLen == key_len and mem.eql(u8, name, key)) {
+                return BSONValue.read(buffer[idx..], typeByte);
             }
 
             const size = BSONValue.asessSize(buffer[idx..], typeByte);
@@ -1192,8 +1510,10 @@ pub const BSONDocument = struct {
         });
     }
 
+    /// Frees the buffer iff this document owns it (see `owned`).
+    /// Safe to call on any document — a no-op for borrowed/static buffers.
     pub fn deinit(self: *const BSONDocument, allocator: mem.Allocator) void {
-        defer allocator.free(self.buffer);
+        if (self.owned) allocator.free(self.buffer);
     }
 };
 
@@ -1257,7 +1577,7 @@ pub const Builder = struct {
         try self.closeContainer(0, true);
         self.finished = true;
         const buffer = try self.buffer.toOwnedSlice();
-        return BSONDocument.init(buffer);
+        return BSONDocument{ .buffer = buffer, .owned = true };
     }
 
     pub fn deinit(self: *Builder) void {
@@ -1320,12 +1640,14 @@ pub const Builder = struct {
 
         const frame = self.frames.items[frame_index];
         try self.buffer.writer.writeByte(0);
+        if (self.buffer.written().len - frame.len_pos > std.math.maxInt(i32)) return error.ValueTooLarge;
         const len: u32 = @intCast(self.buffer.written().len - frame.len_pos);
         std.mem.writeInt(u32, self.buffer.written()[frame.len_pos..][0..4], len, .little);
         _ = self.frames.pop();
     }
 
     fn appendElementHeader(self: *Builder, value_type: BSONValueType, key: []const u8) !void {
+        if (mem.indexOfScalar(u8, key, 0) != null) return error.InvalidKey;
         try self.buffer.writer.writeByte(@intFromEnum(value_type));
         try self.buffer.writer.writeAll(key);
         try self.buffer.writer.writeByte(0);
@@ -1523,7 +1845,9 @@ fn pathSegmentLooksNumeric(path: []const u8) bool {
 }
 
 fn cloneDocument(allocator: mem.Allocator, doc: BSONDocument) !BSONDocument {
-    return doc.clone(allocator);
+    const buffer = try allocator.alloc(u8, doc.buffer.len);
+    @memcpy(buffer, doc.buffer);
+    return BSONDocument{ .buffer = buffer, .owned = true };
 }
 
 fn appendExistingElement(
@@ -1571,7 +1895,7 @@ fn rewriteDocumentSet(
 
     const final_buffer = try list.toOwnedSlice();
     std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
-    return BSONDocument.init(final_buffer);
+    return BSONDocument{ .buffer = final_buffer, .owned = true };
 }
 
 fn rewriteDocumentUnset(
@@ -1595,7 +1919,7 @@ fn rewriteDocumentUnset(
 
     const final_buffer = try list.toOwnedSlice();
     std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
-    return BSONDocument.init(final_buffer);
+    return BSONDocument{ .buffer = final_buffer, .owned = true };
 }
 
 test "Builder composes flat and nested documents" {
@@ -1797,4 +2121,43 @@ test "BSONDoc embedded array" {
     try std.testing.expectEqualStrings("\x62", text);
 
     // std.debug.print("\n Text: {x} \n", .{text});
+}
+
+test "BSONDocument.deinit frees only owned buffers" {
+    const ally = std.testing.allocator;
+
+    // Static buffer: deinit must be a no-op.
+    const empty = BSONDocument.initEmpty();
+    try std.testing.expect(!empty.owned);
+    empty.deinit(ally);
+
+    // Borrowed caller buffer: deinit must be a no-op.
+    var stack_buf = [_]u8{ 5, 0, 0, 0, 0 };
+    const borrowed = BSONDocument.init(stack_buf[0..]);
+    try std.testing.expect(!borrowed.owned);
+    borrowed.deinit(ally);
+
+    // Heap-produced documents are owned and freed exactly once by deinit;
+    // the testing allocator fails the test on any leak or double-free.
+    var built = try BSONDocument.fromPairs(ally, &.{});
+    try std.testing.expect(built.owned);
+    built.deinit(ally);
+
+    var serialized = try fmt.serialize(.{ .a = 1 }, ally);
+    try std.testing.expect(serialized.owned);
+    serialized.deinit(ally);
+
+    var builder = try Builder.init(ally);
+    defer builder.deinit();
+    try builder.put("x", @as(i32, 7));
+    const finished = try builder.finish();
+    try std.testing.expect(finished.owned);
+    finished.deinit(ally);
+
+    // set/unset produce owned documents.
+    var base = try fmt.serialize(.{ .keep = 1, .drop = 2 }, ally);
+    defer base.deinit(ally);
+    const edited = try base.unset(ally, "drop");
+    try std.testing.expect(edited.owned);
+    edited.deinit(ally);
 }

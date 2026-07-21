@@ -8,7 +8,7 @@ const UpdateProgram = albedo.UpdateProgram;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-const NUM_RECORDS: usize = 100_000;
+const NUM_RECORDS: usize = 10_000;
 const SEARCH_ITERATIONS: usize = 1000;
 const SEARCH_TARGET_NAME = std.fmt.comptimePrint("record_{}", .{NUM_RECORDS - 2});
 const SEARCH_TARGET_AGE: i32 = 42;
@@ -414,6 +414,31 @@ fn benchAlbedoBatchUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples
         _ = try bucket.transfigurate(q, program);
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
+        // while (true) {
+        //     // Read current doc's age to preserve it in the replacement.
+        //     const maybe_doc = try iter.data();
+        //     if (maybe_doc == null) break;
+        //     const orig = maybe_doc.?;
+
+        //     const age = orig.get("age").?.int32.value;
+
+        //     // Reconstruct name deterministically from age (avoids holding a
+        //     // slice into the iter's arena past the transform() arena-reset).
+        //     var name_buf: [16]u8 = undefined;
+        //     const name = std.fmt.bufPrint(&name_buf, "record_{d:0>6}", .{@as(usize, @intCast(age))}) catch unreachable;
+
+        //     var replacement = try bson.fmt.serialize(.{
+        //         .name = name,
+        //         .age = age,
+        //         .email = email,
+        //         .active = true,
+        //     }, arena_alloc.allocator());
+
+        //     iter.transform(&replacement) catch |err| {
+        //         if (err == error.IteratorDrained) break;
+        //         return err;
+        //     };
+        // }
     }
 }
 
