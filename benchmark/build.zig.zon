@@ -65,8 +65,8 @@
             .path = "..",
         },
         .sqlite = .{
-            .url = "git+https://github.com/vrischmann/zig-sqlite#0b75ba276d34de3141ec1697e3ef7c836d7b38e7",
-            .hash = "sqlite-3.48.0-F2R_a8eODgD9X8XjvWlZ1K7C-tDuHae4FuShM2N-yIT2",
+            .url = "git+https://github.com/vrischmann/zig-sqlite#7fd71e242b71ae8cb84f01d14f068f773f620207",
+            .hash = "sqlite-3.48.0-F2R_a8KPDgC9FKAvA3_lf1enn92aBWSbm5TV_W9J8bXx",
         },
         .zbench = .{
             .url = "git+https://github.com/hendriknielaender/zbench#a945e79374556f858d5077b1ab8440a8a87349c0",

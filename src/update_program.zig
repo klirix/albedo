@@ -18,6 +18,7 @@ pub const UpdateProgram = struct {
         InvalidDateTime,
         IntegerOverflow,
         OutOfMemory,
+        WriteFailed,
     };
 
     pub const UpdateProgramParsingErrors = ApplyError;
@@ -80,8 +81,8 @@ pub const UpdateProgram = struct {
     }
 
     pub fn apply(self: UpdateProgram, ally: Allocator, source: bson.BSONDocument) ApplyError!bson.BSONDocument {
-        const now_raw = std.time.milliTimestamp();
-        const now_ms: u64 = if (now_raw < 0) 0 else @intCast(now_raw);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const now_ms: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
         return self.applyWithNowMillis(ally, source, now_ms);
     }
 
@@ -271,6 +272,7 @@ pub const UpdateProgram = struct {
             editor.setPathValue(pair.key, evaluated.value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidPath => return error.InvalidUpdatePath,
+                error.WriteFailed => return error.WriteFailed,
             };
         }
 
@@ -292,6 +294,7 @@ pub const UpdateProgram = struct {
             editor.setPathValue(pair.key, evaluated.value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidPath => return error.InvalidUpdatePath,
+                error.WriteFailed => return error.WriteFailed,
             };
         }
     }
@@ -303,6 +306,7 @@ pub const UpdateProgram = struct {
                 editor.unsetPath(str.value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.InvalidPath => return error.InvalidUpdatePath,
+                    error.WriteFailed => return error.WriteFailed,
                 };
             },
             .array => |arr| {
@@ -313,6 +317,7 @@ pub const UpdateProgram = struct {
                     editor.unsetPath(pair.value.string.value) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.InvalidPath => return error.InvalidUpdatePath,
+                        error.WriteFailed => return error.WriteFailed,
                     };
                 }
             },
@@ -324,6 +329,7 @@ pub const UpdateProgram = struct {
                     editor.unsetPath(pair.value.string.value) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.InvalidPath => return error.InvalidUpdatePath,
+                        error.WriteFailed => return error.WriteFailed,
                     };
                 }
             },
@@ -397,7 +403,10 @@ pub const UpdateProgram = struct {
         raw: bson.BSONDocument,
         now_ms: u64,
     ) ApplyError!OwnedValue {
-        var builder = try bson.Builder.init(ally);
+        var builder = bson.Builder.init(ally) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.WriteFailed => return error.WriteFailed,
+        };
         defer builder.deinit();
 
         var iter = raw.iter();
@@ -405,13 +414,14 @@ pub const UpdateProgram = struct {
             var evaluated = try evalValue(ally, stage_source, pair.value, now_ms);
             defer evaluated.deinit(ally);
             builder.putValue(pair.key, evaluated.value) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.WriteFailed => return error.WriteFailed,
                 else => return error.InvalidExpression,
             };
         }
 
         const doc = builder.finish() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.WriteFailed => return error.WriteFailed,
             else => return error.InvalidExpression,
         };
         return .{ .value = .{ .document = doc } };
@@ -423,7 +433,10 @@ pub const UpdateProgram = struct {
         raw: bson.BSONDocument,
         now_ms: u64,
     ) ApplyError!OwnedValue {
-        var builder = try bson.Builder.init(ally);
+        var builder = bson.Builder.init(ally) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.WriteFailed => return error.WriteFailed,
+        };
         defer builder.deinit();
 
         var index: usize = 0;
@@ -434,13 +447,14 @@ pub const UpdateProgram = struct {
             var evaluated = try evalValue(ally, stage_source, pair.value, now_ms);
             defer evaluated.deinit(ally);
             builder.putValue(key, evaluated.value) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.WriteFailed => return error.WriteFailed,
                 else => return error.InvalidExpression,
             };
         }
 
         const doc = builder.finish() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.WriteFailed => return error.WriteFailed,
             else => return error.InvalidExpression,
         };
         return .{ .value = .{ .array = doc } };
@@ -495,7 +509,7 @@ pub const UpdateProgram = struct {
         const args = arrayLikeDocument(operand) orelse return error.InvalidExpressionArgument;
         if (args.keyNumber() == 0) return error.InvalidExpressionArgumentCount;
 
-        var buffer = std.ArrayList(u8){};
+        var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(ally);
 
         var iter = args.iter();

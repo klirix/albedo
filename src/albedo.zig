@@ -5156,11 +5156,11 @@ test "Bucket.TransformIterator deletes document when null transform" {
 test "Bucket.transfigurate updates matching documents without manual iteration" {
     const allocator = std.testing.allocator;
 
-    _ = platform.deleteFile("bucket-transfigurate.bucket") catch {};
+    _ = tryCwdDeleteFile("bucket-transfigurate.bucket") catch {};
     var bucket = try Bucket.init(allocator, "bucket-transfigurate.bucket");
     defer {
         bucket.deinit();
-        platform.deleteFile("bucket-transfigurate.bucket") catch {};
+        tryCwdDeleteFile("bucket-transfigurate.bucket") catch {};
     }
 
     const insert_doc = try bson.fmt.serialize(.{
@@ -5315,12 +5315,12 @@ test "Bucket.Transaction transfigurate rolls back with the transaction" {
     const wal_path = "transaction_transfigurate_rollback.bucket-wal";
     const shm_path = "transaction_transfigurate_rollback.bucket-wal-shm";
 
-    platform.deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(shm_path) catch {};
-    defer platform.deleteFile(db_path) catch {};
-    defer std.fs.cwd().deleteFile(wal_path) catch {};
-    defer std.fs.cwd().deleteFile(shm_path) catch {};
+    tryCwdDeleteFile(db_path) catch {};
+    tryCwdDeleteFile(wal_path) catch {};
+    tryCwdDeleteFile(shm_path) catch {};
+    defer tryCwdDeleteFile(db_path) catch {};
+    defer tryCwdDeleteFile(wal_path) catch {};
+    defer tryCwdDeleteFile(shm_path) catch {};
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
