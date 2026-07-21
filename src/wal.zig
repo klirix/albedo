@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const atomic64 = @import("atomic64.zig");
 fn cwdDeleteFile(io: std.Io, path: []const u8) void {
     if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64) {
         unreachable;
@@ -1123,11 +1124,7 @@ pub const WAL = struct {
         defer self.index.releaseWrite();
         self.index.clear();
         const gen_ptr = &self.index.shmHeader().checkpoint_generation;
-        if (builtin.single_threaded) {
-            gen_ptr.* += 1;
-        } else {
-            _ = @atomicRmw(u64, gen_ptr, .Add, 1, .release);
-        }
+        _ = atomic64.fetchAdd(gen_ptr, 1);
     }
 
     // ── Private helpers ───────────────────────────────────────────────

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const atomic64 = @import("atomic64.zig");
 pub const bson = @import("bson.zig");
 pub const BSONValue = bson.BSONValue;
 pub const BSONDocument = bson.BSONDocument;
@@ -500,16 +501,11 @@ fn closeFsFile(io: std.Io, file: BucketFile) void {
 }
 
 fn atomicLoadU64(ptr: *const u64) u64 {
-    if (builtin.single_threaded) return ptr.*;
-    return @atomicLoad(u64, ptr, .acquire);
+    return atomic64.load(ptr);
 }
 
 fn atomicStoreU64(ptr: *u64, value: u64) void {
-    if (builtin.single_threaded) {
-        ptr.* = value;
-        return;
-    }
-    @atomicStore(u64, ptr, value, .release);
+    atomic64.store(ptr, value);
 }
 
 /// Controls when fsync is called to guarantee write durability.
