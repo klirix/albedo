@@ -1078,6 +1078,10 @@ fn fuzzBSONEncoding(_: void, smith: *std.testing.Smith) anyerror!void {
 pub const BSONDocument = struct {
     // values: []BSONKeyValuePair,
     buffer: []const u8,
+    /// True when this document's buffer was heap-allocated by the producing
+    /// API (fromPairs/Builder/Editor/serialize/clone). `deinit` only frees
+    /// owned buffers, so calling it on a borrowed document is a safe no-op.
+    owned: bool = false,
 
     pub fn init(buffer: []const u8) BSONDocument {
         return BSONDocument{
@@ -1174,7 +1178,7 @@ pub const BSONDocument = struct {
         var jsonStream = std.json.Scanner.initCompleteInput(ally, json);
         defer jsonStream.deinit();
 
-        return .{ .buffer = try jsonToDoc(&jsonStream, ally) };
+        return .{ .buffer = try jsonToDoc(&jsonStream, ally), .owned = true };
     }
 
     pub const fromJSON = if (builtin.is_test) fromJSONInternal else {};
@@ -1330,7 +1334,7 @@ pub const BSONDocument = struct {
         if (list.written().len > std.math.maxInt(i32)) return error.ValueTooLarge;
         std.mem.writeInt(u32, list.written()[0..4], @intCast(list.written().len), .little);
 
-        return BSONDocument{ .buffer = try list.toOwnedSlice() };
+        return BSONDocument{ .buffer = try list.toOwnedSlice(), .owned = true };
     }
 
     pub fn write(self: *const BSONDocument, writer: *std.Io.Writer) !void {
@@ -1445,8 +1449,10 @@ pub const BSONDocument = struct {
         return try editor.finish();
     }
 
+    /// Frees the buffer iff this document owns it (see `owned`).
+    /// Safe to call on any document — a no-op for borrowed/static buffers.
     pub fn deinit(self: *const BSONDocument, allocator: mem.Allocator) void {
-        defer allocator.free(self.buffer);
+        if (self.owned) allocator.free(self.buffer);
     }
 };
 
@@ -1510,7 +1516,7 @@ pub const Builder = struct {
         try self.closeContainer(0, true);
         self.finished = true;
         const buffer = try self.buffer.toOwnedSlice();
-        return BSONDocument.init(buffer);
+        return BSONDocument{ .buffer = buffer, .owned = true };
     }
 
     pub fn deinit(self: *Builder) void {
@@ -1761,7 +1767,7 @@ fn kindValueType(kind: ContainerKind) BSONValueType {
 fn cloneDocument(allocator: mem.Allocator, doc: BSONDocument) !BSONDocument {
     const buffer = try allocator.alloc(u8, doc.buffer.len);
     @memcpy(buffer, doc.buffer);
-    return BSONDocument.init(buffer);
+    return BSONDocument{ .buffer = buffer, .owned = true };
 }
 
 fn appendExistingElement(
@@ -1809,7 +1815,7 @@ fn rewriteDocumentSet(
 
     const final_buffer = try list.toOwnedSlice();
     std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
-    return BSONDocument.init(final_buffer);
+    return BSONDocument{ .buffer = final_buffer, .owned = true };
 }
 
 fn rewriteDocumentUnset(
@@ -1833,7 +1839,7 @@ fn rewriteDocumentUnset(
 
     const final_buffer = try list.toOwnedSlice();
     std.mem.writeInt(u32, final_buffer[0..4], @intCast(final_buffer.len), .little);
-    return BSONDocument.init(final_buffer);
+    return BSONDocument{ .buffer = final_buffer, .owned = true };
 }
 
 test "Builder composes flat and nested documents" {
@@ -2010,4 +2016,43 @@ test "BSONDoc embedded array" {
     try std.testing.expectEqualStrings("\x62", text);
 
     // std.debug.print("\n Text: {x} \n", .{text});
+}
+
+test "BSONDocument.deinit frees only owned buffers" {
+    const ally = std.testing.allocator;
+
+    // Static buffer: deinit must be a no-op.
+    const empty = BSONDocument.initEmpty();
+    try std.testing.expect(!empty.owned);
+    empty.deinit(ally);
+
+    // Borrowed caller buffer: deinit must be a no-op.
+    var stack_buf = [_]u8{ 5, 0, 0, 0, 0 };
+    const borrowed = BSONDocument.init(stack_buf[0..]);
+    try std.testing.expect(!borrowed.owned);
+    borrowed.deinit(ally);
+
+    // Heap-produced documents are owned and freed exactly once by deinit;
+    // the testing allocator fails the test on any leak or double-free.
+    var built = try BSONDocument.fromPairs(ally, &.{});
+    try std.testing.expect(built.owned);
+    built.deinit(ally);
+
+    var serialized = try fmt.serialize(.{ .a = 1 }, ally);
+    try std.testing.expect(serialized.owned);
+    serialized.deinit(ally);
+
+    var builder = try Builder.init(ally);
+    defer builder.deinit();
+    try builder.put("x", @as(i32, 7));
+    const finished = try builder.finish();
+    try std.testing.expect(finished.owned);
+    finished.deinit(ally);
+
+    // set/unset produce owned documents.
+    var base = try fmt.serialize(.{ .keep = 1, .drop = 2 }, ally);
+    defer base.deinit(ally);
+    const edited = try base.unset(ally, "drop");
+    try std.testing.expect(edited.owned);
+    edited.deinit(ally);
 }

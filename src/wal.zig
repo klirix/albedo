@@ -1136,6 +1136,12 @@ pub const WAL = struct {
     fn rebuildIndex(self: *WAL) Error!void {
         self.index.acquireWrite();
         defer self.index.releaseWrite();
+        return self.rebuildIndexLocked();
+    }
+
+    /// Same as rebuildIndex, but the caller already holds the index write
+    /// lock (the spinlock is not re-entrant).
+    fn rebuildIndexLocked(self: *WAL) Error!void {
         self.index.clear();
 
         if (self.header.frame_count == 0) return;
@@ -1210,8 +1216,10 @@ pub const WAL = struct {
                 self.latest_committed_tx = old_latest_tx;
                 self.pending_max_tx = old_pending_max;
                 self.header.tx_timestamp = old_header_tx;
-                self.index.clear();
-                self.rebuildIndex() catch {};
+                // Already holding the write lock — use the lock-free
+                // variant (rebuildIndex would deadlock on the
+                // non-reentrant spinlock).
+                self.rebuildIndexLocked() catch {};
                 return Error.WalIndexFailed;
             };
             last_commit_seq = hdr.commit_seq;

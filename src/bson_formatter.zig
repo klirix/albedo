@@ -76,6 +76,10 @@ pub fn encodeFields(value: anytype, doc: *bson.DocEncoder) (Error || std.mem.All
     }
 }
 
+/// `allocator` must be an arena (or otherwise bulk-freed by the
+/// caller).  Decoded strings/sub-documents are individually allocated and
+/// are NOT freed on error paths — use `parse()`, which wraps an arena and
+/// reclaims everything via ParseResult.deinit().
 pub fn decodeFields(comptime T: type, doc: bson.BSONDocument, allocator: std.mem.Allocator) (Error || std.mem.Allocator.Error)!T {
     const type_info = @typeInfo(T);
     if (type_info != .@"struct") return Error.UnsupportedType;
@@ -483,7 +487,7 @@ fn parseBsonArrayToFixedArray(
 fn copyDocument(doc: bson.BSONDocument, allocator: std.mem.Allocator) !bson.BSONDocument {
     const buffer = try allocator.alloc(u8, doc.buffer.len);
     @memcpy(buffer, doc.buffer);
-    return bson.BSONDocument.init(buffer);
+    return bson.BSONDocument{ .buffer = buffer, .owned = true };
 }
 
 fn copyValue(value: bson.BSONValue, allocator: std.mem.Allocator) !bson.BSONValue {

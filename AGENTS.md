@@ -23,8 +23,9 @@ This document summarizes how the core database machinery works based on src/albe
 - PageCache: LRU cache keyed by page_id.
   - AutoHashMap for lookup and DoublyLinkedList for LRU order.
   - put() evicts oldest entry when capacity is reached.
-  - evicted pages are not immediately destroyed because B+ tree nodes may still reference them.
-  - clear() frees all cached pages and entries.
+  - evicted/invalidated pages are retired, not destroyed, because B+ tree nodes and live iterators may still reference them (retired_pages, bounded by max_retired_pages).
+  - retireAll() drops all cached pages into retirement (used on checkpoint invalidation); clear() is retireAll() + actual reclaim, used at teardown.
+  - Bucket.retired_indexes does the same for *Index replaced by resetLoadedIndexes(); reclaimed at Bucket.deinit.
 - Bucket: central handle for a database file.
   - Maintains file handle, header, page cache, index map, and an RW lock.
   - Tracks WAL state, oplog configuration, and staged page/header updates for WAL commits.
@@ -162,8 +163,10 @@ This document summarizes how the core database machinery works based on src/albe
   - Writes (insert, delete, index changes) use exclusive lock.
   - Read/scan paths use shared lock where possible.
 - Memory ownership:
+  - BSONDocument has an `owned` flag: heap-producing APIs (fromPairs, fromJSON, Builder/Editor finish, fmt.serialize, readDocAt multi-page) set it; deinit() frees only owned buffers, so deinit on a borrowed/static doc is a safe no-op.
+  - Query is fully self-contained after parse (filters, sort path, projection, and cursor fields are all duped); the source document can be freed immediately. Query.deinit releases everything.
   - Many iterators return buffers owned by an arena or allocator passed in.
-  - For multi-page docs, readDocAt allocates a buffer that the caller must free.
+  - For multi-page docs, readDocAt allocates a buffer marked owned=true; ScanIterator's IteratorResult carries the same flag.
   - PageCache retains Page objects until cleared.
 
 ## Key invariants

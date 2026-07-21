@@ -264,6 +264,27 @@ const PageCache = struct {
         self.map.deinit();
     }
 
+    /// Retire a page: keep it allocated so pointers held by in-flight B+
+    /// tree nodes and iterators stay valid, reclaim at clear()/deinit().
+    /// heuristic ceiling — beyond the backlog below the oldest
+    /// retired pages are destroyed, trading the UAF guard for bounded
+    /// memory; the window is far longer than any live-iterator lifetime.
+    /// Upgrade path: refcount active iterators and reclaim when it hits 0.
+    const max_retired_pages = 4096; // 32MB of 8KB pages
+
+    fn retirePage(self: *PageCache, page: *Page) void {
+        self.retired_pages.append(self.allocator, page) catch {
+            page.deinit(self.allocator);
+            self.allocator.destroy(page);
+            return;
+        };
+        if (self.retired_pages.items.len > max_retired_pages) {
+            const oldest = self.retired_pages.orderedRemove(0);
+            oldest.deinit(self.allocator);
+            self.allocator.destroy(oldest);
+        }
+    }
+
     fn promote(self: *PageCache, entry: *Entry) void {
         self.lru.remove(&entry.node);
         self.lru.prepend(&entry.node);
@@ -286,15 +307,14 @@ const PageCache = struct {
         if (self.map.get(page_id)) |entry| {
             self.promote(entry);
             if (entry.page == page) return;
-            try self.retired_pages.append(self.allocator, entry.page);
+            self.retirePage(entry.page);
             entry.page = page;
             return;
         }
 
         if (self.map.count() >= self.capacity) {
-            try self.retired_pages.ensureUnusedCapacity(self.allocator, 1);
             if (self.takeOldestEntry()) |evicted_entry| {
-                self.retired_pages.appendAssumeCapacity(evicted_entry.page);
+                self.retirePage(evicted_entry.page);
                 self.allocator.destroy(evicted_entry);
             }
         }
@@ -321,29 +341,31 @@ const PageCache = struct {
         return null;
     }
 
-    pub fn clear(self: *PageCache, page_allocator: std.mem.Allocator) void {
-        // Clear all entries from LRU list and free pages
+    /// Move every cached page into retired_pages without freeing it.
+    /// Use this instead of clear() when live readers (scan/index iterators,
+    /// previously returned document slices) may still point into page data —
+    /// retired pages stay valid until clear()/deinit().
+    pub fn retireAll(self: *PageCache) void {
         while (self.lru.popFirst()) |node| {
             const entry: *Entry = @alignCast(@fieldParentPtr("node", node));
             _ = self.map.remove(entry.page_id);
-
-            // Deinit and destroy page
-            entry.page.deinit(page_allocator);
-            page_allocator.destroy(entry.page);
-
-            // Destroy entry
+            self.retirePage(entry.page);
             self.allocator.destroy(entry);
         }
+
+        // Reset state
+        self.lru = .{};
+        self.map.clearRetainingCapacity();
+    }
+
+    pub fn clear(self: *PageCache, page_allocator: std.mem.Allocator) void {
+        self.retireAll();
 
         for (self.retired_pages.items) |page| {
             page.deinit(page_allocator);
             page_allocator.destroy(page);
         }
         self.retired_pages.clearRetainingCapacity();
-
-        // Reset state
-        self.lru = .{};
-        self.map.clearRetainingCapacity();
     }
 };
 
@@ -538,6 +560,10 @@ pub const Bucket = struct {
     oplog_size: u32 = WAL.DEFAULT_OPLOG_REGION_SIZE,
     wal: ?WAL = null,
     active_tx: ?*Transaction = null,
+    /// Index objects replaced by resetLoadedIndexes().  Not freed until
+    /// bucket teardown because in-flight iterators may still hold the
+    /// pointer (same retirement invariant as PageCache.retired_pages).
+    retired_indexes: std.ArrayList(*Index) = .empty,
     /// Local snapshot of the WAL SHM checkpoint_generation.  When the
     /// SHM value is higher (another connection checkpointed), the page
     /// cache is stale and must be cleared before reading.
@@ -675,11 +701,17 @@ pub const Bucket = struct {
             try self.ensureActive();
             if (self.open_transforms != 0) return error.TransactionBusy;
 
-            var it = self.pending_pages.iterator();
-            while (it.next()) |entry| {
+            // Move pages one at a time, removing each from pending_pages as
+            // soon as ownership has transferred to the page cache.  If a put
+            // fails mid-loop, abort() will only destroy the pages that are
+            // still ours — pages already moved must not be double-freed.
+            while (self.pending_pages.count() > 0) {
+                var it = self.pending_pages.iterator();
+                const entry = it.next().?;
                 const page_id = entry.key_ptr.*;
                 const page = entry.value_ptr.*;
                 try self.bucket.pageCache.put(page_id, page);
+                _ = self.pending_pages.remove(page_id);
                 try self.bucket.wal_pending_pages.put(page_id, page);
             }
 
@@ -705,11 +737,15 @@ pub const Bucket = struct {
             self.abort(false);
         }
 
+        /// Closes the transaction, rolling back if still active.  Always
+        /// frees the handle — when transforms are still open it force-aborts
+        /// and reports TransactionBusy (the handle is invalid afterwards;
+        /// the open iterators must not be used).
         pub fn close(self: *Transaction) !void {
-            if (self.active) {
-                try self.rollback();
-            }
+            const busy = self.active and self.open_transforms != 0;
+            // deinit() force-aborts when active, so memory is always released.
             self.deinit();
+            if (busy) return error.TransactionBusy;
         }
 
         pub fn deinit(self: *Transaction) void {
@@ -727,6 +763,7 @@ pub const Bucket = struct {
                 try self.bucket.allocator.dupe(u8, bytes)
             else
                 null;
+            errdefer if (owned_payload) |p| self.bucket.allocator.free(p);
 
             try self.deferred_oplog.append(self.bucket.allocator, .{
                 .op = op,
@@ -744,6 +781,7 @@ pub const Bucket = struct {
             const page = try self.bucket.allocator.create(Page);
             errdefer self.bucket.allocator.destroy(page);
             page.* = try Page.init(self.bucket.allocator, self.bucket, source_page.header);
+            errdefer page.deinit(self.bucket.allocator);
             @memcpy(page.data, source_page.data);
             try self.pending_pages.put(page_id, page);
 
@@ -1556,8 +1594,10 @@ pub const Bucket = struct {
         // Update generation FIRST to prevent re-entry from loadPage(0) below.
         self.wal_checkpoint_generation = shm_gen;
 
-        // Another connection checkpointed — clear stale cached pages.
-        self.pageCache.clear(self.allocator);
+        // Another connection checkpointed — drop stale cached pages, but
+        // only retire them: in-flight iterators and document slices handed
+        // out earlier may still point into their data.
+        self.pageCache.retireAll();
         self.cached_last_data_page = null;
 
         // Re-read the BucketHeader from the main DB file (now authoritative).
@@ -1804,8 +1844,11 @@ pub const Bucket = struct {
 
     fn invalidateCachedPage(self: *Bucket, page_id: u64) void {
         if (self.pageCache.remove(page_id)) |old_page| {
-            old_page.deinit(self.allocator);
-            self.allocator.destroy(old_page);
+            // Retire rather than free: B+ tree nodes and iterators may still
+            // reference this page (same invariant as LRU eviction).
+            self.pageCache.retirePage(old_page);
+            // A replicated frame supersedes any staged local write.
+            _ = self.wal_pending_pages.remove(page_id);
         }
         if (self.cached_last_data_page) |last_page| {
             if (last_page.header.page_id == page_id) {
@@ -1819,10 +1862,21 @@ pub const Bucket = struct {
         while (idx_iter.next()) |pair| {
             const index_ptr = pair.value_ptr.*;
             const key = pair.key_ptr.*;
-            self.allocator.destroy(index_ptr);
+            self.retired_indexes.append(self.allocator, index_ptr) catch {
+                // OOM: fall back to immediate free.
+                self.allocator.destroy(index_ptr);
+            };
             self.allocator.free(key);
         }
         self.indexes.clearRetainingCapacity();
+    }
+
+    fn destroyRetiredIndexes(self: *Bucket) void {
+        for (self.retired_indexes.items) |index_ptr| {
+            self.allocator.destroy(index_ptr);
+        }
+        self.retired_indexes.deinit(self.allocator);
+        self.retired_indexes = .empty;
     }
 
     pub fn replicationCursor(self: *Bucket) !ReplicationCursor {
@@ -2301,6 +2355,10 @@ pub const Bucket = struct {
         offset: u16,
         header: DocHeader,
         data: []u8,
+        /// True when `data` was heap-allocated for a multi-page document
+        /// (free with the iterator's allocator); false when it is a slice
+        /// into a cached page.
+        owned: bool = false,
     };
 
     const ListRecord = struct {
@@ -2560,8 +2618,11 @@ pub const Bucket = struct {
                 };
             }
 
-            // Allocate fresh buffer from arena for this document
+            // Allocate a fresh buffer for this multi-page document.
+            // Callers either free it via the `owned` flag or collect it
+            // with an arena.
             const docBuffer = try self.allocator.alloc(u8, doc_len);
+            errdefer self.allocator.free(docBuffer);
 
             var writableBuffer = docBuffer[0..doc_len];
             @memcpy(writableBuffer[0..availableToCopy], self.page.data[self.offset .. self.offset + availableToCopy]);
@@ -2571,7 +2632,10 @@ pub const Bucket = struct {
             while (leftToCopy > 0) {
                 writableBuffer = docBuffer[(doc_len - leftToCopy)..doc_len];
                 // Check if we need to load a new page
-                self.page = try self.pageIterator.next() orelse return null;
+                self.page = try self.pageIterator.next() orelse {
+                    self.allocator.free(docBuffer);
+                    return null;
+                };
                 availableToCopy = @truncate(@min(leftToCopy, self.page.data.len));
 
                 @memcpy(writableBuffer[0..availableToCopy], self.page.data[0..availableToCopy]);
@@ -2579,13 +2643,12 @@ pub const Bucket = struct {
                 leftToCopy -= availableToCopy;
             }
 
-            // Return the arena-allocated buffer directly
-            // The buffer will be freed when the arena is freed
             return .{
                 .page_id = location.page_id,
                 .offset = location.offset,
                 .header = location.header,
                 .data = docBuffer,
+                .owned = true,
             };
         }
     };
@@ -3484,15 +3547,11 @@ pub const Bucket = struct {
     }
 
     fn releaseIndexedDocBuffer(self: *Bucket, ally: std.mem.Allocator, loc: DocumentLocation, doc: BSONDocument) void {
-        const page = self.loadPage(loc.page_id) catch {
-            ally.free(doc.buffer);
-            return;
-        };
-        const doc_start = @intFromPtr(doc.buffer.ptr);
-        const page_start = @intFromPtr(page.data.ptr);
-        const page_end = page_start + page.data.len;
-        if (doc_start >= page_start and doc_start < page_end) return;
-        ally.free(doc.buffer);
+        _ = self;
+        _ = loc;
+        // Frees only heap-allocated (multi-page) buffers; page slices are
+        // owned by the page cache. Ownership is explicit via `doc.owned`.
+        doc.deinit(ally);
     }
 
     fn collectExcludedDocIds(
@@ -3574,7 +3633,7 @@ pub const Bucket = struct {
                         else => return error.ScanError,
                     } orelse break;
                     const docRaw = next_doc;
-                    const doc = BSONDocument{ .buffer = docRaw.data };
+                    const doc = BSONDocument{ .buffer = docRaw.data, .owned = docRaw.owned };
                     if (q.filters.len == 0 or q.match(&doc)) {
                         try docList.append(ally, doc);
                     } else {
@@ -3643,10 +3702,10 @@ pub const Bucket = struct {
                             self.releaseIndexedDocBuffer(ally, .{
                                 .page_id = doc_raw.page_id,
                                 .offset = doc_raw.offset,
-                            }, .{ .buffer = doc_raw.data });
+                            }, .{ .buffer = doc_raw.data, .owned = doc_raw.owned });
                             continue;
                         }
-                        const doc: BSONDocument = .{ .buffer = doc_raw.data };
+                        const doc: BSONDocument = .{ .buffer = doc_raw.data, .owned = doc_raw.owned };
 
                         if (q.filters.len == 0 or q.match(&doc)) {
                             try docList.append(ally, doc);
@@ -3891,7 +3950,10 @@ pub const Bucket = struct {
                         .document = maybe_doc,
                     };
                     const ev_doc = ev.toBson(a) catch return error.OutOfMemory;
-                    event_docs.append(a, ev_doc) catch return error.OutOfMemory;
+                    event_docs.append(a, ev_doc) catch {
+                        ev_doc.deinit(a);
+                        return error.OutOfMemory;
+                    };
                 }
 
                 self.last_seqno = entry.header.seqno;
@@ -4235,6 +4297,9 @@ pub const Bucket = struct {
         query: query.Query,
         plan: QueryPlan,
         targets: []DocumentLocation,
+        /// Full allocation backing `targets` (which may be a shortened view
+        /// after sector offset/limit). Freed in close().
+        targets_buf: []DocumentLocation,
         index: usize = 0,
         current_doc: ?BSONDocument = null,
         owns_arena: bool = false,
@@ -4433,8 +4498,22 @@ pub const Bucket = struct {
         pub fn close(self: *TransformIterator) !void {
             const allocator = self.bucket.allocator;
 
+            // Clean up memory first so a vacuum failure can't leak the
+            // iterator, the targets buffer, or the arena.
+            defer {
+                if (self.owns_arena) {
+                    self.arena.deinit();
+                    allocator.destroy(self.arena);
+                }
+                allocator.free(self.targets_buf);
+                allocator.destroy(self);
+            }
+
+            // The tx may have been force-aborted by Transaction.close while
+            // this iterator was open — only touch it if it is still the
+            // bucket's live transaction (pointer comparison only, no deref).
             if (self.tx) |tx| {
-                if (tx.open_transforms > 0) {
+                if (tx == self.bucket.active_tx and tx.open_transforms > 0) {
                     tx.open_transforms -= 1;
                 }
             } else if (!self.bucket.in_memory and self.bucket.autoVaccuum and self.bucket.header.deleted_count > self.bucket.header.doc_count) {
@@ -4443,13 +4522,6 @@ pub const Bucket = struct {
                     else => return error.ScanError,
                 };
             }
-            // If we own the arena, clean it up
-            if (self.owns_arena) {
-                self.arena.deinit();
-                allocator.destroy(self.arena);
-            }
-            allocator.free(self.targets);
-            allocator.destroy(self);
         }
     };
 
@@ -4508,6 +4580,7 @@ pub const Bucket = struct {
             .query = q,
             .plan = plan,
             .targets = targets_slice,
+            .targets_buf = targets_buf,
             .index = 0,
             .current_doc = null,
             .owns_arena = false,
@@ -4520,9 +4593,16 @@ pub const Bucket = struct {
         return iter;
     }
 
+    /// Returns an exact-size slice the caller can free with the same
+    /// allocator. Document buffers inside are owned by the page cache or
+    /// the documents themselves (see BSONDocument.owned).
     pub fn list(self: *Bucket, allocator: std.mem.Allocator, q: query.Query) ![]BSONDocument {
         var plan = self.planQuery(&q);
         var docList: std.ArrayList(BSONDocument) = .empty;
+        errdefer {
+            for (docList.items) |*d| d.deinit(allocator);
+            docList.deinit(allocator);
+        }
         if (q.sector) |sector| if (sector.limit) |limit| try docList.ensureTotalCapacity(allocator, limit);
 
         try self.collectDocs(&docList, allocator, &q, &plan);
@@ -4537,11 +4617,24 @@ pub const Bucket = struct {
         const offset = if (q.sector) |sector| sector.offset orelse 0 else 0;
         const limit = if (q.sector) |sector| sector.limit orelse resultSlice.len else resultSlice.len;
 
-        const selected = resultSlice[@min(resultSlice.len, offset)..@min(offset + limit, resultSlice.len)];
+        const start = @min(resultSlice.len, offset);
+        const end = @min(offset + limit, resultSlice.len);
+        const selected = resultSlice[start..end];
         if (q.projection != null) {
-            for (selected) |*doc| doc.* = try q.project(allocator, doc.*);
+            for (selected) |*doc| {
+                const projected = try q.project(allocator, doc.*);
+                doc.deinit(allocator);
+                doc.* = projected;
+            }
         }
-        return selected;
+
+        // Copy the selection into an exact-size allocation so the caller can
+        // free it, then release everything that didn't make the cut.
+        const out = try allocator.dupe(BSONDocument, selected);
+        for (resultSlice[0..start]) |*d| d.deinit(allocator);
+        for (resultSlice[end..]) |*d| d.deinit(allocator);
+        docList.deinit(allocator);
+        return out;
     }
 
     fn readDocAt(
@@ -4577,6 +4670,7 @@ pub const Bucket = struct {
             };
         }
         var docBuffer = try ally.alloc(u8, doc_len);
+        errdefer ally.free(docBuffer);
         @memcpy(docBuffer[0..first_chunk], page.data[offset .. offset + first_chunk]);
         remaining -= first_chunk;
         var written = first_chunk;
@@ -4598,7 +4692,7 @@ pub const Bucket = struct {
             remaining -= chunk;
         }
 
-        return BSONDocument{ .buffer = docBuffer };
+        return BSONDocument{ .buffer = docBuffer, .owned = true };
     }
 
     fn readDocHeaderAt(
@@ -4759,7 +4853,12 @@ pub const Bucket = struct {
         defer if (new_bucket_owned) newBucket.deinit();
         newBucket.header.replication_generation = next_generation;
         try newBucket.flushHeader();
-        var iterator = try ScanIterator.init(self, self.allocator);
+        // ScanIterator allocates multi-page document buffers from the
+        // allocator it is given and never frees them individually —
+        // use an arena so they are all reclaimed in one shot.
+        var scan_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scan_arena.deinit();
+        var iterator = try ScanIterator.init(self, scan_arena.allocator());
         const oldMeta = try self.loadPage(0);
         var idxReader = std.Io.Reader.fixed(oldMeta.data);
         while (true) {
@@ -4830,6 +4929,7 @@ pub const Bucket = struct {
             self.allocator.free(@constCast(pair.key_ptr.*));
         }
         self.indexes.deinit();
+        self.destroyRetiredIndexes();
 
         self.pageCache.clear(self.allocator);
         self.pageCache.deinit();
@@ -4878,6 +4978,7 @@ pub const Bucket = struct {
             self.allocator.free(key);
         }
         self.indexes.deinit();
+        self.destroyRetiredIndexes();
 
         // Clear page cache (free all cached pages)
         self.pageCache.clear(self.allocator);
@@ -7585,4 +7686,223 @@ test "$or index union: uses index scan when all branches are covered" {
     const results = try bucket.list(result_arena.allocator(), q);
     // Three documents match: admin-not-public, user-public, admin-public.
     try testing.expectEqual(@as(usize, 3), results.len);
+}
+
+test "regression: TransformIterator with sector frees the right buffer on close" {
+    const allocator = std.testing.allocator;
+
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
+    defer bucket.deinit();
+
+    var d1 = try bson.fmt.serialize(.{ .name = "A" }, allocator);
+    defer d1.deinit(allocator);
+    _ = try bucket.insert(d1);
+    var d2 = try bson.fmt.serialize(.{ .name = "B" }, allocator);
+    defer d2.deinit(allocator);
+    _ = try bucket.insert(d2);
+    var d3 = try bson.fmt.serialize(.{ .name = "C" }, allocator);
+    defer d3.deinit(allocator);
+    _ = try bucket.insert(d3);
+
+    // offset/limit shorten the targets view; close() must free the full
+    // backing allocation (used to trip "Invalid free" in the debug
+    // allocator).
+    var q_doc = try bson.fmt.serialize(.{ .sector = .{ .offset = 1, .limit = 1 } }, allocator);
+    defer q_doc.deinit(allocator);
+    var q = try query.Query.parse(allocator, q_doc);
+    defer q.deinit(allocator);
+
+    var iter_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iter_arena.deinit();
+
+    var iter = try bucket.transformIterate(&iter_arena, q);
+    try iter.close();
+}
+
+test "regression: Bucket.list returns an exactly-sized, freeable slice" {
+    const allocator = std.testing.allocator;
+
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
+    defer bucket.deinit();
+
+    inline for (.{ "A", "B", "C" }) |name| {
+        var d = try bson.fmt.serialize(.{ .name = name }, allocator);
+        defer d.deinit(allocator);
+        _ = try bucket.insert(d);
+    }
+
+    var q_doc = try bson.fmt.serialize(.{ .sector = .{ .offset = 1 } }, allocator);
+    defer q_doc.deinit(allocator);
+    var q = try query.Query.parse(allocator, q_doc);
+    defer q.deinit(allocator);
+
+    // With offset > 0 the returned slice used to point into the middle of
+    // the ArrayList allocation — freeing it was undefined behaviour.
+    const docs = try bucket.list(allocator, q);
+    try testing.expectEqual(@as(usize, 2), docs.len);
+    allocator.free(docs);
+}
+
+test "regression: vacuum reclaims multi-page document buffers" {
+    const allocator = std.testing.allocator;
+    const bucket_path = "vacuum-multipage.bucket";
+    tryCwdDeleteFile(bucket_path) catch {};
+    defer tryCwdDeleteFile(bucket_path) catch {};
+    defer tryCwdDeleteFile(bucket_path ++ "-wal") catch {};
+    defer tryCwdDeleteFile(bucket_path ++ "-wal-shm") catch {};
+
+    var bucket = try Bucket.init(allocator, std.testing.io, bucket_path);
+    defer bucket.deinit();
+
+    // One document larger than a page (8192 bytes) forces the multi-page
+    // read path in ScanIterator during vacuum.
+    const big = try allocator.alloc(u8, 20000);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    var big_doc = try bson.fmt.serialize(.{ .payload = big }, allocator);
+    defer big_doc.deinit(allocator);
+    _ = try bucket.insert(big_doc);
+
+    var small_doc = try bson.fmt.serialize(.{ .payload = "small" }, allocator);
+    defer small_doc.deinit(allocator);
+    _ = try bucket.insert(small_doc);
+
+    try bucket.vacuum();
+
+    // The big document must survive the rebuild intact.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var scanner = try Bucket.ScanIterator.init(&bucket, arena.allocator());
+    const stored = (try scanner.next()) orelse return error.TestUnexpectedResult;
+    const stored_doc = BSONDocument.init(stored.data);
+    try testing.expectEqual(@as(usize, 20000), stored_doc.get("payload").?.string.value.len);
+}
+
+test "regression: PageCache.retireAll keeps page memory valid until clear" {
+    const allocator = std.testing.allocator;
+
+    var cache = PageCache.init(allocator, 4);
+    defer cache.deinit();
+
+    const page = try allocator.create(Page);
+    page.* = try Page.init(allocator, undefined, PageHeader.init(.Data, 7));
+    page.data[0] = 0xAB;
+    try cache.put(7, page);
+
+    // retireAll must not free the page — in-flight readers keep valid pointers.
+    cache.retireAll();
+    try testing.expect(cache.get(7) == null);
+    try testing.expectEqual(@as(u8, 0xAB), page.data[0]);
+    try testing.expectEqual(@as(usize, 1), cache.retired_pages.items.len);
+
+    // clear() reclaims retired pages (leak would be flagged by the allocator).
+    cache.clear(allocator);
+    try testing.expectEqual(@as(usize, 0), cache.retired_pages.items.len);
+}
+
+test "regression: invalidateCachedPage retires instead of freeing" {
+    const allocator = std.testing.allocator;
+
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
+    defer bucket.deinit();
+
+    var doc = try bson.fmt.serialize(.{ .v = 1 }, allocator);
+    defer doc.deinit(allocator);
+    _ = try bucket.insert(doc);
+
+    // Locate the data page the document landed on.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var scanner = try Bucket.ScanIterator.init(&bucket, arena.allocator());
+    const found = (try scanner.next()) orelse return error.TestUnexpectedResult;
+
+    const page = try bucket.loadPage(found.page_id);
+    const page_ptr = page.data.ptr;
+    page.data[0] = 0xCD;
+
+    bucket.invalidateCachedPage(found.page_id);
+
+    // Page is gone from the cache but its memory is still valid (retired).
+    try testing.expect(bucket.pageCache.get(found.page_id) == null);
+    try testing.expectEqual(@as(u8, 0xCD), @as(*u8, @ptrCast(page_ptr)).*);
+}
+
+test "regression: transaction commit with allocation failures never double-frees" {
+    const backing = std.testing.allocator;
+
+    // Sweep the failing-allocation index through the commit path: at every
+    // point where pageCache.put / wal_pending_pages.put can fail, the
+    // transaction must still own exactly the unmoved pages — abort() then
+    // frees each page exactly once.
+    var fail_index: usize = 0;
+    var successes: usize = 0;
+    while (fail_index < 200 and successes < 2) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+
+        var bucket = Bucket.init(allocator, std.testing.io, ":memory:") catch continue;
+        defer bucket.deinit();
+
+        var doc = bson.fmt.serialize(.{ .v = 1 }, allocator) catch continue;
+        defer doc.deinit(allocator);
+
+        const tx = bucket.beginTransaction() catch continue;
+        defer tx.deinit();
+        _ = tx.insert(doc) catch continue;
+        tx.commit() catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        successes += 1;
+    }
+}
+
+test "regression: Transaction.close with an open transform frees everything" {
+    const allocator = std.testing.allocator;
+
+    var bucket = try Bucket.init(allocator, std.testing.io, ":memory:");
+    defer bucket.deinit();
+
+    var doc = try bson.fmt.serialize(.{ .name = "A" }, allocator);
+    defer doc.deinit(allocator);
+    _ = try bucket.insert(doc);
+
+    var q_doc = try bson.fmt.serialize(.{ .sector = .{} }, allocator);
+    defer q_doc.deinit(allocator);
+    var q = try query.Query.parse(allocator, q_doc);
+    defer q.deinit(allocator);
+
+    const tx = try bucket.beginTransaction();
+    var iter_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iter_arena.deinit();
+    var iter = try tx.transformIterate(&iter_arena, q);
+
+    // Closing the tx with an open transform force-aborts and reports busy,
+    // but must not leak the transaction.
+    try testing.expectError(error.TransactionBusy, tx.close());
+    try testing.expect(bucket.active_tx == null);
+
+    // The orphaned iterator must still be closable without touching the
+    // freed transaction.
+    try iter.close();
+}
+
+test "regression: PageCache.retired_pages is bounded" {
+    const allocator = std.testing.allocator;
+
+    var cache = PageCache.init(allocator, 1);
+    defer cache.deinit();
+
+    // Overflow the ceiling by a wide margin: evictions retire pages, and the
+    // backlog must stay capped instead of growing without bound.
+    const overflow: usize = PageCache.max_retired_pages + 16;
+    for (0..overflow) |i| {
+        const page = try allocator.create(Page);
+        page.* = try Page.init(allocator, undefined, PageHeader.init(.Data, i));
+        try cache.put(i, page);
+    }
+    try testing.expect(cache.retired_pages.items.len <= PageCache.max_retired_pages);
+
+    cache.clear(allocator);
+    try testing.expectEqual(@as(usize, 0), cache.retired_pages.items.len);
 }

@@ -495,6 +495,9 @@ pub export fn albedo_transform(
     return Result.OK;
 }
 
+/// The returned pointer is owned by the iterator's arena and is valid only
+/// until the next albedo_transform_data / albedo_transform_apply /
+/// albedo_transform_close call.
 pub export fn albedo_transform_data(
     iterator: *Bucket.TransformIterator,
     outDoc: *[*c]u8,
@@ -591,16 +594,12 @@ pub export fn albedo_subscribe(
 
     var q = Query.parseRaw(ally, queryBufProper) catch |err| return mapQueryParseError(err);
 
-    const sub = bucket.subscribe(q) catch |err| switch (err) {
-        error.WalNotActive => return Result.Error,
-        error.OutOfMemory => {
-            q.deinit(ally);
-            return Result.OutOfMemory;
-        },
-        error.OplogGap => {
-            q.deinit(ally);
-            return Result.Error;
-        },
+    const sub = bucket.subscribe(q) catch |err| {
+        q.deinit(ally);
+        return switch (err) {
+            error.OutOfMemory => Result.OutOfMemory,
+            else => Result.Error,
+        };
     };
 
     const handle = ally.create(SubscriptionHandle) catch {
@@ -1673,4 +1672,20 @@ fn cwdDeleteFile(path: []const u8) void {
 fn tryCwdDeleteFile(path: []const u8) !void {
     if (!builtin.is_test) unreachable;
     try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+}
+
+test "regression: albedo_subscribe on WAL-less bucket errors without leaking the query" {
+    var bucket: *Bucket = undefined;
+    try testing.expectEqual(Result.OK, albedo_open(@constCast(":memory:"), &bucket));
+    defer _ = albedo_close(bucket);
+
+    // In-memory buckets have no WAL, so subscribe fails with WalNotActive;
+    // the parsed query must still be freed (testing.allocator checks leaks).
+    var q_doc = try bson.BSONDocument.fromJSON(testing.allocator,
+        \\{ "query": { "a": 1 } }
+    );
+    defer q_doc.deinit(testing.allocator);
+
+    var handle: *SubscriptionHandle = undefined;
+    try testing.expectEqual(Result.Error, albedo_subscribe(bucket, @constCast(q_doc.buffer.ptr), &handle));
 }

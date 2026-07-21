@@ -148,6 +148,11 @@ pub const Filter = union(FilterType) {
         });
         var filters: std.ArrayList(Filter) = .empty;
         defer filters.deinit(ally);
+        errdefer {
+            // Free the contents of every successfully-appended filter;
+            // per-iteration errdefers only cover the in-flight one.
+            for (filters.items) |*f| f.deinit(ally);
+        }
 
         var iter = doc.iter();
         while (iter.next()) |pair| {
@@ -164,6 +169,14 @@ pub const Filter = union(FilterType) {
                 };
                 var group_list: std.ArrayList(FilterGroup) = .empty;
                 defer group_list.deinit(ally);
+                errdefer {
+                    // Free groups already moved into the list (their errdefers
+                    // were cancelled by the successful append).
+                    for (group_list.items) |g| {
+                        for (g) |*f| f.deinit(ally);
+                        ally.free(g);
+                    }
+                }
                 var arr_iter = groups_doc.iter();
                 while (arr_iter.next()) |arr_pair| {
                     if (arr_pair.value != .document) return FilterParsingErrors.InvalidQueryFilter;
@@ -176,6 +189,13 @@ pub const Filter = union(FilterType) {
                     try group_list.append(ally, group);
                 }
                 const groups = try group_list.toOwnedSlice(ally);
+                errdefer {
+                    for (groups) |g| {
+                        for (g) |*f| f.deinit(ally);
+                        ally.free(g);
+                    }
+                    ally.free(groups);
+                }
                 const filter = switch (logical_op) {
                     .@"or" => Filter{ .@"or" = groups },
                     .@"and" => Filter{ .@"and" = groups },
@@ -195,6 +215,13 @@ pub const Filter = union(FilterType) {
                         const operator = filterNameMap.get(op_pair.key) orelse return FilterParsingErrors.InvalidQueryOperator;
                         switch (operator) {
                             inline .eq, .in, .ne, .lt, .lte, .gt, .gte, .startsWith, .endsWith, .exists, .notExists => |op| {
+                                // Validate the operand type before storing:
+                                // match() reads the union tag unchecked.
+                                switch (op) {
+                                    .in => if (operand != .array) return FilterParsingErrors.InvalidInOperatorValue,
+                                    .startsWith, .endsWith => if (operand != .string) return FilterParsingErrors.InvalidQueryOperatorParameter,
+                                    else => {},
+                                }
                                 const path_copy = try ally.dupe(u8, path);
                                 errdefer ally.free(path_copy);
                                 const owned_value = PathValuePair.dupeValue(ally, operand) catch return FilterParsingErrors.OutOfMemory;
@@ -890,7 +917,7 @@ pub const Cursor = struct {
         InvalidCursorDocId,
         InvalidCursorPageId,
         InvalidCursorOffset,
-    };
+    } || Allocator.Error;
 
     fn parsePositiveInteger(value: bson.BSONValue) CursorParsingErrors!u64 {
         return switch (value) {
@@ -910,7 +937,15 @@ pub const Cursor = struct {
         };
     }
 
-    pub fn parse(doc: *const bson.BSONValue) CursorParsingErrors!Cursor {
+    /// Free the heap-owned fields duplicated during parse.
+    pub fn deinit(self: Cursor, ally: Allocator) void {
+        if (self.index_path) |path| ally.free(path);
+        if (self.anchor) |anchor| PathValuePair.freeValue(ally, anchor.user_id);
+    }
+
+    /// Parses a cursor, duplicating any borrowed slices so the result is
+    /// fully owned and independent of the source document's lifetime.
+    pub fn parse(ally: Allocator, doc: *const bson.BSONValue) CursorParsingErrors!Cursor {
         if (doc.* != .document) return error.InvalidCursor;
         const cursor_doc = doc.document;
 
@@ -929,8 +964,9 @@ pub const Cursor = struct {
 
         const index_path = if (cursor_doc.get("indexPath")) |value| blk: {
             if (value != .string or value.string.value.len == 0) return error.MissingCursorIndexPath;
-            break :blk value.string.value;
+            break :blk try ally.dupe(u8, value.string.value);
         } else null;
+        errdefer if (index_path) |path| ally.free(path);
 
         if (mode == .index_range and index_path == null) {
             return error.MissingCursorIndexPath;
@@ -944,6 +980,8 @@ pub const Cursor = struct {
             if (doc_id_value != .objectId) return error.InvalidCursorDocId;
 
             const user_id = anchor_doc.get("_id") orelse return error.InvalidCursorAnchor;
+            const owned_user_id = try PathValuePair.dupeValue(ally, user_id);
+            errdefer PathValuePair.freeValue(ally, owned_user_id);
             const page_id_value = anchor_doc.get("pageId") orelse return error.InvalidCursorPageId;
             const offset_value = anchor_doc.get("offset") orelse return error.InvalidCursorOffset;
             const page_id = try parsePositiveInteger(page_id_value);
@@ -952,7 +990,7 @@ pub const Cursor = struct {
 
             break :blk CursorAnchor{
                 .doc_id = doc_id_value.objectId.value,
-                .user_id = user_id,
+                .user_id = owned_user_id,
                 .page_id = page_id,
                 .offset = @intCast(offset_u64),
             };
@@ -996,12 +1034,20 @@ pub const Query = struct {
 
         const filterDoc = queryDoc.get("query");
         const filters = if (filterDoc) |doc| try Filter.parse(ally, doc) else try ally.alloc(Filter, 0);
+        errdefer {
+            for (filters) |*f| f.deinit(ally);
+            ally.free(filters);
+        }
         const sortDoc = queryDoc.get("sort");
         const sortConfig = if (sortDoc) |doc| try SortConfig.parse(ally, doc) else null;
+        errdefer if (sortConfig) |sc| switch (sc) {
+            .asc, .desc => |p| ally.free(p),
+        };
         const sectorDoc = queryDoc.get("sector");
         const sector = if (sectorDoc) |*doc| try Sector.parse(doc) else null;
         const cursorDoc = queryDoc.get("cursor");
-        const cursor = if (cursorDoc) |*doc| try Cursor.parse(doc) else null;
+        const cursor = if (cursorDoc) |*doc| try Cursor.parse(ally, doc) else null;
+        errdefer if (cursor) |c| c.deinit(ally);
 
         const query = Query{
             .filters = filters,
@@ -1024,6 +1070,7 @@ pub const Query = struct {
             }
         }
         if (self.projection) |projection| projection.deinit(ally);
+        if (self.cursor) |cursor| cursor.deinit(ally);
     }
 
     pub fn match(self: Query, doc: *const bson.BSONDocument) bool {
@@ -1310,4 +1357,99 @@ test "Filter.match $and with combined $or and leaf filter" {
         }
     }
     try std.testing.expect(!match2);
+}
+
+test "Query.parse rejects invalid operator operands" {
+    const ally = std.testing.allocator;
+
+    // $in with a non-array operand must be rejected at parse time
+    // (match() reads the .array union tag unchecked).
+    {
+        var q_doc = try bson.fmt.serialize(.{ .query = .{ .f = .{ .@"$in" = "not-an-array" } } }, ally);
+        defer q_doc.deinit(ally);
+        try std.testing.expectError(error.InvalidInOperatorValue, Query.parse(ally, q_doc));
+    }
+
+    // $startsWith / $endsWith with non-string operands must be rejected.
+    {
+        var q_doc = try bson.fmt.serialize(.{ .query = .{ .f = .{ .@"$startsWith" = 42 } } }, ally);
+        defer q_doc.deinit(ally);
+        try std.testing.expectError(error.InvalidQueryOperatorParameter, Query.parse(ally, q_doc));
+    }
+    {
+        var q_doc = try bson.fmt.serialize(.{ .query = .{ .f = .{ .@"$endsWith" = .{ .nested = true } } } }, ally);
+        defer q_doc.deinit(ally);
+        try std.testing.expectError(error.InvalidQueryOperatorParameter, Query.parse(ally, q_doc));
+    }
+
+    // Valid operands still parse.
+    {
+        var q_doc = try bson.fmt.serialize(.{ .query = .{ .f = .{ .@"$in" = [_]i32{ 1, 2 } } } }, ally);
+        defer q_doc.deinit(ally);
+        var q = try Query.parse(ally, q_doc);
+        defer q.deinit(ally);
+    }
+}
+
+test "Query.parse error paths do not leak parsed filters" {
+    const ally = std.testing.allocator;
+
+    // First filter parses fine (path + value duped), second has a bad
+    // operator: the first filter must be freed on the error path.
+    {
+        var q_doc = try bson.fmt.serialize(.{
+            .query = .{ .good = 1, .bad = .{ .@"$nope" = 2 } },
+        }, ally);
+        defer q_doc.deinit(ally);
+        try std.testing.expectError(error.InvalidQueryOperator, Query.parse(ally, q_doc));
+    }
+
+    // Same for groups already appended inside a logical operator.
+    {
+        var q_doc = try bson.fmt.serialize(.{
+            .query = .{ .@"$or" = .{ .@"0" = .{ .a = 1 }, .@"1" = .{ .b = .{ .@"$nope" = 2 } } } },
+        }, ally);
+        defer q_doc.deinit(ally);
+        try std.testing.expectError(error.InvalidQueryOperator, Query.parse(ally, q_doc));
+    }
+
+    // A failure in a later section (sort after filters) frees the filters.
+    {
+        var q_doc = try bson.fmt.serialize(.{
+            .query = .{ .good = 1 },
+            .sort = .{ .asc = 42 },
+        }, ally);
+        defer q_doc.deinit(ally);
+        try std.testing.expectError(error.InvalidQuerySortParamType, Query.parse(ally, q_doc));
+    }
+}
+
+test "Query cursor is self-contained after source document is freed" {
+    const ally = std.testing.allocator;
+
+    var q = blk: {
+        const doc_id = try bson.ObjectId.parseString("507c7f79bcf86cd7994f6c0e");
+        var builder = try bson.Builder.init(ally);
+        defer builder.deinit();
+        var cursor = try builder.object("cursor");
+        try cursor.put("version", @as(i32, 1));
+        try cursor.put("mode", "index_range");
+        try cursor.put("indexPath", "age");
+        var anchor = try cursor.object("anchor");
+        try anchor.put("docId", doc_id);
+        try anchor.put("_id", "user-42");
+        try anchor.put("pageId", @as(i64, 3));
+        try anchor.put("offset", @as(i32, 16));
+        try anchor.end();
+        try cursor.end();
+        const q_doc = try builder.finish();
+        defer q_doc.deinit(ally); // freed before the Query is used
+        break :blk try Query.parse(ally, q_doc);
+    };
+    defer q.deinit(ally);
+
+    const cursor = q.cursor.?;
+    try std.testing.expectEqualStrings("age", cursor.index_path.?);
+    try std.testing.expectEqualStrings("user-42", cursor.anchor.?.user_id.string.value);
+    try std.testing.expectEqual(@as(u64, 3), cursor.anchor.?.page_id);
 }
