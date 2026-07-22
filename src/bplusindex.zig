@@ -841,21 +841,26 @@ pub const Index = struct {
         var start_node = blk: {
             if (start_bound) |bound| {
                 var node = try self.descendToLeaf(bound.value);
-                while (true) {
-                    const prev_id = node.leafPrevId();
-                    if (prev_id == 0) break;
-                    var prev_node = try self.loadNode(prev_id);
-                    const last_entry = prev_node.leafLastEntry() orelse break;
-                    const order = self.compare(last_entry.value(), bound.value);
-                    const should_move = switch (bound.filter) {
-                        .gte => order != .lt,
-                        .gt => order == .gt,
-                        .lte => order != .lt,
-                        .lt => order == .gt,
-                        else => false,
-                    };
-                    if (!should_move) break;
-                    node = prev_node;
+                // Duplicate values can span leaves, so non-unique indexes may
+                // need to walk left to the first matching leaf. A unique index
+                // can never require that correction.
+                if (self.options.unique == 0) {
+                    while (true) {
+                        const prev_id = node.leafPrevId();
+                        if (prev_id == 0) break;
+                        var prev_node = try self.loadNode(prev_id);
+                        const last_entry = prev_node.leafLastEntry() orelse break;
+                        const order = self.compare(last_entry.value(), bound.value);
+                        const should_move = switch (bound.filter) {
+                            .gte => order != .lt,
+                            .gt => order == .gt,
+                            .lte => order != .lt,
+                            .lt => order == .gt,
+                            else => false,
+                        };
+                        if (!should_move) break;
+                        node = prev_node;
+                    }
                 }
                 break :blk node;
             } else {
@@ -872,8 +877,10 @@ pub const Index = struct {
             .index = self,
             .current_node = start_node,
             .current_offset = start_offset,
-            .lower = lower,
-            .upper = upper,
+            // The initial seek already proves the starting-side bound, and
+            // physical index order keeps every later entry on that side.
+            .lower = if (self.options.reverse == 0) null else lower,
+            .upper = if (self.options.reverse == 1) null else upper,
         };
     }
 

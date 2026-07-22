@@ -10,11 +10,18 @@ const UpdateProgram = albedo.UpdateProgram;
 
 const NUM_RECORDS: usize = 100_000;
 const SEARCH_ITERATIONS: usize = 1000;
-const SEARCH_TARGET_NAME = std.fmt.comptimePrint("record_{}", .{NUM_RECORDS - 2});
+const SEARCH_TARGET_NAME = std.fmt.comptimePrint("record_{d:0>6}", .{NUM_RECORDS - 2});
 const SEARCH_TARGET_AGE: i32 = 42;
 const UPDATE_TARGET_AGE: i32 = 42;
-const UPDATE_TARGET_NAME = std.fmt.comptimePrint("record_{d:0>6}", .{UPDATE_TARGET_AGE});
 const BATCH_UPDATE_SIZE: i32 = 100; // docs updated per iteration
+
+const SqliteDocRow = struct {
+    name: [13]u8,
+    age: i32,
+    id: i32,
+    email: [16]u8,
+    active: bool,
+};
 
 // ─── Output Helper ───────────────────────────────────────────────────────────
 
@@ -187,7 +194,7 @@ fn benchSqliteInsert(db: *sqlite.Db, clock: std.Io.Clock, io: std.Io) !std.Io.Du
     for (0..NUM_RECORDS) |i| {
         const age: i32 = @intCast(i);
         var name_buf: [64]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "record_{d}", .{i}) catch unreachable;
+        const name = std.fmt.bufPrint(&name_buf, "record_{d:0>6}", .{i}) catch unreachable;
 
         stmt.exec(.{}, .{
             i,
@@ -208,43 +215,43 @@ fn benchSqliteInsert(db: *sqlite.Db, clock: std.Io.Clock, io: std.Io) !std.Io.Du
 
 /// Per-iteration benchmarks fill samples[] with per-iteration nanoseconds.
 fn benchAlbedoScan(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
-    for (samples, 0..) |*sample, i| {
-        if (i >= SEARCH_ITERATIONS) break;
-        if (@mod(1, 10) == 0) {
-            print("  {s}Albedo scan iteration {d}/{d}{s}\n", .{ C.dim, i + 1, SEARCH_ITERATIONS, C.reset });
-        }
+    var query_arena = std.heap.ArenaAllocator.init(allocator);
+    defer query_arena.deinit();
+    const query_allocator = query_arena.allocator();
+    const qdoc = try bson.fmt.serialize(.{
+        .query = .{ .name = @as([]const u8, SEARCH_TARGET_NAME) },
+    }, query_allocator);
+    const q = try Query.parse(query_allocator, qdoc);
+
+    var iterator_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iterator_arena.deinit();
+
+    for (samples) |*sample| {
+        _ = iterator_arena.reset(.retain_capacity);
         const ts = std.Io.Timestamp.now(io, clock);
 
-        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
-        defer arena_alloc.deinit();
-
-        var qdoc = try bson.fmt.serialize(.{
-            .query = .{ .name = @as([]const u8, SEARCH_TARGET_NAME) },
-        }, arena_alloc.allocator());
-        defer qdoc.deinit(arena_alloc.allocator());
-
-        var q = try Query.parse(arena_alloc.allocator(), qdoc);
-        defer q.deinit(arena_alloc.allocator());
-
-        var iter = try bucket.listIterate(&arena_alloc, q);
+        var iter = try bucket.listIterate(&iterator_arena, q);
         defer iter.deinit() catch {};
 
-        while ((try iter.next(iter))) |_| {}
+        while (try iter.next(iter)) |doc| {
+            if (!doc.get("active").?.boolean.value) return error.UnexpectedValue;
+        }
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
     }
 }
 
 fn benchSqliteScan(db: *sqlite.Db, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
-    var stmt = try db.prepareDynamic("SELECT id, age, active FROM docs WHERE name = ?");
+    var stmt = try db.prepareDynamic("SELECT name, age, id, email, active FROM docs WHERE name = ?");
     defer stmt.deinit();
 
     for (samples) |*sample| {
         const ts = std.Io.Timestamp.now(io, clock);
 
-        const Row = struct { id: i64, age: i32, active: i32 };
-        var iter = try stmt.iterator(Row, .{@as([]const u8, SEARCH_TARGET_NAME)});
-        while (try iter.next(.{})) |_| {}
+        var iter = try stmt.iterator(SqliteDocRow, .{@as([]const u8, SEARCH_TARGET_NAME)});
+        while (try iter.next(.{})) |row| {
+            if (!row.active) return error.UnexpectedValue;
+        }
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
         stmt.reset();
@@ -252,35 +259,42 @@ fn benchSqliteScan(db: *sqlite.Db, samples: []u64, io: std.Io, clock: std.Io.Clo
 }
 
 fn benchAlbedoIndexSearch(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
-    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
-    defer arena_alloc.deinit();
+    var query_arena = std.heap.ArenaAllocator.init(allocator);
+    defer query_arena.deinit();
     const qdoc = try bson.fmt.serialize(.{
         .query = .{ .age = SEARCH_TARGET_AGE },
-    }, arena_alloc.allocator());
+    }, query_arena.allocator());
 
-    const q = try Query.parse(arena_alloc.allocator(), qdoc);
+    const q = try Query.parse(query_arena.allocator(), qdoc);
+    var iterator_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iterator_arena.deinit();
+
     for (samples) |*sample| {
+        _ = iterator_arena.reset(.retain_capacity);
         const ts = std.Io.Timestamp.now(io, clock);
 
-        const iter = try bucket.listIterate(&arena_alloc, q);
+        const iter = try bucket.listIterate(&iterator_arena, q);
         defer iter.deinit() catch {};
 
-        while (try iter.next(iter)) |_| {}
+        while (try iter.next(iter)) |doc| {
+            if (!doc.get("active").?.boolean.value) return error.UnexpectedValue;
+        }
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
     }
 }
 
 fn benchSqliteIndexSearch(db: *sqlite.Db, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
-    var stmt = try db.prepareDynamic("SELECT id, age, active FROM docs WHERE age = ?");
+    var stmt = try db.prepareDynamic("SELECT name, age, id, email, active FROM docs WHERE age = ?");
     defer stmt.deinit();
 
     for (samples) |*sample| {
         const ts = std.Io.Timestamp.now(io, clock);
 
-        const Row = struct { id: i64, age: i32, active: i32 };
-        var iter = try stmt.iterator(Row, .{SEARCH_TARGET_AGE});
-        while (try iter.next(.{})) |_| {}
+        var iter = try stmt.iterator(SqliteDocRow, .{SEARCH_TARGET_AGE});
+        while (try iter.next(.{})) |row| {
+            if (!row.active) return error.UnexpectedValue;
+        }
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
         stmt.reset();
@@ -288,21 +302,22 @@ fn benchSqliteIndexSearch(db: *sqlite.Db, samples: []u64, io: std.Io, clock: std
 }
 
 fn benchAlbedoReadAll(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
+    var query_arena = std.heap.ArenaAllocator.init(allocator);
+    defer query_arena.deinit();
+    const qdoc = try bson.fmt.serialize(.{
+        .query = .{ .active = true },
+        .sector = .{ .limit = 1000 },
+    }, query_arena.allocator());
+    const q = try Query.parse(query_arena.allocator(), qdoc);
+
+    var iterator_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iterator_arena.deinit();
+
     for (samples) |*sample| {
+        _ = iterator_arena.reset(.retain_capacity);
         const ts = std.Io.Timestamp.now(io, clock);
 
-        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
-        defer arena_alloc.deinit();
-
-        var qdoc = try bson.fmt.serialize(.{
-            .query = .{ ._id = .{ .@"$gte" = @as(i32, 0) } },
-            .sector = .{ .limit = 1000 },
-        }, arena_alloc.allocator());
-        _ = &qdoc;
-
-        const q = try Query.parse(arena_alloc.allocator(), qdoc);
-
-        var iter = try bucket.listIterate(&arena_alloc, q);
+        var iter = try bucket.listIterate(&iterator_arena, q);
         defer iter.deinit() catch {};
 
         while (try iter.next(iter)) |doc| {
@@ -319,41 +334,36 @@ fn benchAlbedoReadAll(allocator: std.mem.Allocator, bucket: *Bucket, samples: []
 }
 
 fn benchAlbedoUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
-    // Pre-build two replacement docs with alternating email so each iteration
-    // writes a different value, preventing any short-circuit optimisation.
-    var doc_a = try bson.fmt.serialize(.{
-        .name = @as([]const u8, UPDATE_TARGET_NAME),
-        .age = UPDATE_TARGET_AGE,
-        .email = @as([]const u8, "updated_a@example.com"),
-        .active = true,
-    }, allocator);
-    defer doc_a.deinit(allocator);
+    var setup_arena = std.heap.ArenaAllocator.init(allocator);
+    defer setup_arena.deinit();
+    const setup_allocator = setup_arena.allocator();
 
-    var doc_b = try bson.fmt.serialize(.{
-        .name = @as([]const u8, UPDATE_TARGET_NAME),
-        .age = UPDATE_TARGET_AGE,
-        .email = @as([]const u8, "updated_b@example.com"),
-        .active = true,
-    }, allocator);
-    defer doc_b.deinit(allocator);
+    const qdoc = try bson.fmt.serialize(.{
+        .query = .{ .age = UPDATE_TARGET_AGE },
+    }, setup_allocator);
+    const q = try Query.parse(setup_allocator, qdoc);
+
+    const raw_program_a = try bson.fmt.serialize(.{
+        .@"$set" = .{ .email = "updated_a@example.com" },
+    }, setup_allocator);
+    const raw_program_b = try bson.fmt.serialize(.{
+        .@"$set" = .{ .email = "updated_b@example.com" },
+    }, setup_allocator);
+    const program_a = try UpdateProgram.parse(setup_allocator, raw_program_a);
+    const program_b = try UpdateProgram.parse(setup_allocator, raw_program_b);
+
+    var iterator_arena = std.heap.ArenaAllocator.init(allocator);
+    defer iterator_arena.deinit();
 
     for (samples, 0..) |*sample, i| {
-        var arena_alloc = std.heap.ArenaAllocator.init(allocator);
-        defer arena_alloc.deinit();
-
-        const qdoc = try bson.fmt.serialize(.{
-            .query = .{ .age = UPDATE_TARGET_AGE },
-        }, arena_alloc.allocator());
-
-        const q = try Query.parse(arena_alloc.allocator(), qdoc);
+        _ = iterator_arena.reset(.retain_capacity);
 
         const ts = std.Io.Timestamp.now(io, clock);
 
-        var iter = try bucket.transformIterate(&arena_alloc, q);
+        var iter = try bucket.transformIterate(&iterator_arena, q);
         defer iter.close() catch {};
 
-        const replacement = if (i % 2 == 0) &doc_a else &doc_b;
-        try iter.transform(replacement);
+        try iter.transfigurate(if (i % 2 == 0) program_a else program_b);
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
     }
@@ -369,32 +379,30 @@ fn benchSqliteUpdate(db: *sqlite.Db, samples: []u64, io: std.Io, clock: std.Io.C
         const ts = std.Io.Timestamp.now(io, clock);
 
         try stmt.exec(.{}, .{ emails[i % 2], UPDATE_TARGET_AGE });
-        stmt.reset();
-
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
+        stmt.reset();
     }
 }
 
 fn benchAlbedoBatchUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
-    const emails = [2][]const u8{ "batch_a@example.com", "batch_b@example.com" };
+    var program_arena = std.heap.ArenaAllocator.init(allocator);
+    defer program_arena.deinit();
+    const program_allocator = program_arena.allocator();
+    const raw_program_a = try bson.fmt.serialize(.{
+        .@"$set" = .{ .email = "batch_a@example.com" },
+    }, program_allocator);
+    const raw_program_b = try bson.fmt.serialize(.{
+        .@"$set" = .{ .email = "batch_b@example.com" },
+    }, program_allocator);
+    const program_a = try UpdateProgram.parse(program_allocator, raw_program_a);
+    const program_b = try UpdateProgram.parse(program_allocator, raw_program_b);
 
-    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
-    defer arena_alloc.deinit();
-    // const tx = try bucket.beginTransaction();
-
-    // defer tx.commit() catch {
-    //     std.debug.print("Albedo batch update error: \n", .{});
-    // };
-
-    const email = emails[1];
-    const raw_program = try bson.fmt.serialize(.{
-        .@"$set" = .{
-            .email = email,
-        },
-    }, arena_alloc.allocator());
-    const program = try UpdateProgram.parse(arena_alloc.allocator(), raw_program);
+    var query_arena = std.heap.ArenaAllocator.init(allocator);
+    defer query_arena.deinit();
 
     for (samples, 0..) |*sample, i| {
+        _ = query_arena.reset(.retain_capacity);
+        const query_allocator = query_arena.allocator();
         const batch_start: i32 = @intCast((i * @as(usize, @intCast(BATCH_UPDATE_SIZE))) % NUM_RECORDS);
         const batch_end: i32 = batch_start + BATCH_UPDATE_SIZE;
 
@@ -405,40 +413,14 @@ fn benchAlbedoBatchUpdate(allocator: std.mem.Allocator, bucket: *Bucket, samples
                     .@"$lt" = batch_end,
                 },
             },
-        }, arena_alloc.allocator());
-        var q = try Query.parse(arena_alloc.allocator(), qdoc);
-        defer q.deinit(arena_alloc.allocator());
+        }, query_allocator);
+        const q = try Query.parse(query_allocator, qdoc);
 
         const ts = std.Io.Timestamp.now(io, clock);
 
-        _ = try bucket.transfigurate(q, program);
+        _ = try bucket.transfigurate(q, if (i % 2 == 0) program_a else program_b);
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
-        // while (true) {
-        //     // Read current doc's age to preserve it in the replacement.
-        //     const maybe_doc = try iter.data();
-        //     if (maybe_doc == null) break;
-        //     const orig = maybe_doc.?;
-
-        //     const age = orig.get("age").?.int32.value;
-
-        //     // Reconstruct name deterministically from age (avoids holding a
-        //     // slice into the iter's arena past the transform() arena-reset).
-        //     var name_buf: [16]u8 = undefined;
-        //     const name = std.fmt.bufPrint(&name_buf, "record_{d:0>6}", .{@as(usize, @intCast(age))}) catch unreachable;
-
-        //     var replacement = try bson.fmt.serialize(.{
-        //         .name = name,
-        //         .age = age,
-        //         .email = email,
-        //         .active = true,
-        //     }, arena_alloc.allocator());
-
-        //     iter.transform(&replacement) catch |err| {
-        //         if (err == error.IteratorDrained) break;
-        //         return err;
-        //     };
-        // }
     }
 }
 
@@ -455,22 +437,22 @@ fn benchSqliteBatchUpdate(db: *sqlite.Db, samples: []u64, io: std.Io, clock: std
         const ts = std.Io.Timestamp.now(io, clock);
 
         try stmt.exec(.{}, .{ emails[i % 2], batch_start, batch_end });
-        stmt.reset();
-
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
+        stmt.reset();
     }
 }
 
 fn benchSqliteReadAll(db: *sqlite.Db, samples: []u64, io: std.Io, clock: std.Io.Clock) !void {
-    var stmt = try db.prepareDynamic("SELECT id, age, active FROM docs LIMIT 1000");
+    var stmt = try db.prepareDynamic("SELECT name, age, id, email, active FROM docs WHERE active = 1 LIMIT 1000");
     defer stmt.deinit();
 
     for (samples) |*sample| {
         const ts = std.Io.Timestamp.now(io, clock);
 
-        const Row = struct { id: i64, age: i32, active: i32 };
-        var iter = try stmt.iterator(Row, .{});
-        while (try iter.next(.{})) |_| {}
+        var iter = try stmt.iterator(SqliteDocRow, .{});
+        while (try iter.next(.{})) |row| {
+            if (!row.active) return error.UnexpectedValue;
+        }
 
         sample.* = durationToNs(std.Io.Timestamp.untilNow(ts, io, clock));
         stmt.reset();
@@ -525,12 +507,19 @@ pub fn main(m: std.process.Init) !void {
     defer std.Io.Dir.cwd().deleteFile(io, "file.sqlite-shm") catch {};
     defer db.deinit();
 
+    try db.execDynamic("PRAGMA page_size = 8192", .{}, .{});
     {
         var pragma_stmt = try db.prepareDynamic("PRAGMA journal_mode = wal");
         defer pragma_stmt.deinit();
         _ = try pragma_stmt.one([16:0]u8, .{}, .{});
     }
-    // _ = try db.pragma(void, .{}, "synchronous", "NORMAL");
+    try db.execDynamic("PRAGMA synchronous = NORMAL", .{}, .{});
+    {
+        var pragma_stmt = try db.prepareDynamic("PRAGMA wal_autocheckpoint = 20000");
+        defer pragma_stmt.deinit();
+        _ = try pragma_stmt.one(i32, .{}, .{});
+    }
+    try db.execDynamic("PRAGMA cache_size = -131072", .{}, .{});
     try db.execDynamic(
         "CREATE TABLE IF NOT EXISTS docs (id INTEGER, name TEXT, age INTEGER, email TEXT, active INTEGER)",
         .{},
@@ -597,7 +586,7 @@ pub fn main(m: std.process.Init) !void {
     // 4. INDEX-BASED SEARCH
     // ══════════════════════════════════════════════════════════════════════
     {
-        try bucket.ensureIndex("age", .{});
+        try bucket.ensureIndex("age", .{ .unique = 1 });
         try db.execDynamic("CREATE UNIQUE INDEX IF NOT EXISTS idx_age ON docs(age)", .{}, .{});
 
         var a_samples: [SEARCH_ITERATIONS]u64 = undefined;

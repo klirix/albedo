@@ -104,6 +104,7 @@ This document summarizes how the core database machinery works based on src/albe
   - Arrays are expanded into multiple values.
   - Strings over MAX_INDEX_STRING_BYTES are rejected.
   - Sparse indexes skip missing values; non-sparse get a null value inserted.
+- Range iterators seek to the starting bound once and only retain the bound needed to stop traversal; unique indexes skip duplicate-leaf backtracking.
 
 ## Query planning and execution
 
@@ -116,7 +117,10 @@ This document summarizes how the core database machinery works based on src/albe
 - listIterate():
   - Produces a ListIterator that can run eager (prequery + sort) or streaming.
   - Streaming index scans use range or point iterators.
+  - Streaming index reads decode the document header and BSON in one pass and reuse the current data page for in-memory/process-local reads.
+  - When every query filter is represented by the chosen index bounds or point set, document-level predicate matching is skipped.
   - Point strategy uses dedup: none (1 value), check_last (2 values), hashmap (many values).
+  - Cursor anchor values are extracted lazily from the last emitted record when exportCursor() is called.
 - list():
   - Collects all documents into a list, optionally sorts and applies offset/limit.
 

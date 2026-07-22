@@ -289,6 +289,7 @@ const PageCache = struct {
     }
 
     fn promote(self: *PageCache, entry: *Entry) void {
+        if (self.lru.first == &entry.node) return;
         self.lru.remove(&entry.node);
         self.lru.prepend(&entry.node);
     }
@@ -2505,6 +2506,11 @@ pub const Bucket = struct {
         owned: bool = false,
     };
 
+    const ReadDocResult = struct {
+        doc: BSONDocument,
+        header: DocHeader,
+    };
+
     const ListRecord = struct {
         doc: BSONDocument,
         page_id: u64,
@@ -3163,8 +3169,10 @@ pub const Bucket = struct {
         or_seen_initialized: bool = false,
         limitLeft: ?u64 = null,
         offsetLeft: u64 = 0,
-        last_emitted: ?query.CursorAnchor = null,
-        cursor_mode_enabled: bool = false,
+        last_emitted: ?ListRecord = null,
+        document_page: ?*Page = null,
+        document_page_generation: u64 = 0,
+        filters_fully_covered: bool = false,
         next: *const fn (*ListIterator) error{ OutOfMemory, ScanError }!?BSONDocument = nextUnfetched,
 
         fn ensureIndexIterator(self: *ListIterator) error{ScanError}!*Index.RangeIterator {
@@ -3178,6 +3186,40 @@ pub const Bucket = struct {
                 self.index_iterator_initialized = true;
             }
             return &self.index_iterator;
+        }
+
+        fn loadIndexedDocumentPage(self: *ListIterator, page_id: u64) error{ OutOfMemory, ScanError }!*Page {
+            const can_reuse = self.bucket.in_memory or self.bucket.read_durability == .process;
+            if (can_reuse) {
+                if (!self.bucket.in_memory) self.bucket.maybeInvalidateCacheOnCheckpoint();
+                if (self.document_page_generation == self.bucket.wal_checkpoint_generation) {
+                    if (self.document_page) |page| {
+                        if (page.header.page_id == page_id) return page;
+                    }
+                }
+            }
+
+            const page = self.bucket.loadPage(page_id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.ScanError,
+            };
+            if (can_reuse) {
+                self.document_page = page;
+                self.document_page_generation = self.bucket.wal_checkpoint_generation;
+            }
+            return page;
+        }
+
+        fn readIndexedDocument(
+            self: *ListIterator,
+            loc: DocumentLocation,
+        ) error{ OutOfMemory, ScanError, DocumentDeleted }!ReadDocResult {
+            const page = try self.loadIndexedDocumentPage(loc.page_id);
+            return self.bucket.readDocFromPage(self.ally, loc, page) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.DocumentDeleted => return error.DocumentDeleted,
+                else => return error.ScanError,
+            };
         }
 
         pub fn prequery(self: *ListIterator) !void {
@@ -3213,13 +3255,7 @@ pub const Bucket = struct {
         }
 
         fn rememberRecord(self: *ListIterator, record: *const ListRecord) void {
-            const user_id = record.doc.get("_id") orelse return;
-            self.last_emitted = .{
-                .doc_id = record.doc_id,
-                .user_id = user_id,
-                .page_id = record.page_id,
-                .offset = record.offset,
-            };
+            self.last_emitted = record.*;
         }
 
         fn nextFullScanRecord(self: *ListIterator) error{ OutOfMemory, ScanError }!?ListRecord {
@@ -3262,7 +3298,6 @@ pub const Bucket = struct {
             if (self.limitLeft != null and self.limitLeft.? == 0) {
                 return null;
             }
-            const ally = self.ally;
             const iterator = try self.ensureIndexIterator();
 
             while (true) {
@@ -3270,7 +3305,7 @@ pub const Bucket = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.ScanError,
                 } orelse return null;
-                const header = self.bucket.readDocHeaderAt(.{
+                const stored = self.readIndexedDocument(.{
                     .page_id = loc.pageId,
                     .offset = loc.offset,
                 }) catch |err| switch (err) {
@@ -3278,17 +3313,9 @@ pub const Bucket = struct {
                     error.DocumentDeleted => continue,
                     else => return error.ScanError,
                 };
+                const doc = stored.doc;
 
-                var doc = self.bucket.readDocAt(ally, .{
-                    .page_id = loc.pageId,
-                    .offset = loc.offset,
-                }) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DocumentDeleted => continue,
-                    else => return error.ScanError,
-                };
-
-                if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
+                if (!self.filters_fully_covered and !(self.query.filters.len == 0 or self.query.match(&doc))) {
                     continue;
                 }
 
@@ -3308,7 +3335,7 @@ pub const Bucket = struct {
                     .doc = doc,
                     .page_id = loc.pageId,
                     .offset = loc.offset,
-                    .doc_id = ObjectId.fromInt(header.doc_id),
+                    .doc_id = ObjectId.fromInt(stored.header.doc_id),
                 };
             }
         }
@@ -3369,7 +3396,7 @@ pub const Bucket = struct {
                     },
                 }
 
-                var doc = self.bucket.readDocAt(ally, .{
+                const stored = self.readIndexedDocument(.{
                     .page_id = loc.pageId,
                     .offset = loc.offset,
                 }) catch |err| switch (err) {
@@ -3377,8 +3404,9 @@ pub const Bucket = struct {
                     error.DocumentDeleted => continue,
                     else => return error.ScanError,
                 };
+                const doc = stored.doc;
 
-                if (!(self.query.filters.len == 0 or self.query.match(&doc))) {
+                if (!self.filters_fully_covered and !(self.query.filters.len == 0 or self.query.match(&doc))) {
                     // ally.free(doc.buffer);
                     continue;
                 }
@@ -3397,20 +3425,11 @@ pub const Bucket = struct {
                     limit.* -= 1;
                 }
 
-                const header = self.bucket.readDocHeaderAt(.{
-                    .page_id = loc.pageId,
-                    .offset = loc.offset,
-                }) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DocumentDeleted => continue,
-                    else => return error.ScanError,
-                };
-
                 return .{
                     .doc = doc,
                     .page_id = loc.pageId,
                     .offset = loc.offset,
-                    .doc_id = ObjectId.fromInt(header.doc_id),
+                    .doc_id = ObjectId.fromInt(stored.header.doc_id),
                 };
             }
         }
@@ -3445,7 +3464,7 @@ pub const Bucket = struct {
                 if (self.or_seen_set.contains(key)) continue;
                 try self.or_seen_set.put(key, {});
 
-                var doc = self.bucket.readDocAt(ally, .{
+                const stored = self.readIndexedDocument(.{
                     .page_id = loc.pageId,
                     .offset = loc.offset,
                 }) catch |err| switch (err) {
@@ -3453,6 +3472,7 @@ pub const Bucket = struct {
                     error.DocumentDeleted => continue,
                     else => return error.ScanError,
                 };
+                const doc = stored.doc;
 
                 if (!(self.query.filters.len == 0 or self.query.match(&doc))) continue;
 
@@ -3466,20 +3486,11 @@ pub const Bucket = struct {
                     limit.* -= 1;
                 }
 
-                const header = self.bucket.readDocHeaderAt(.{
-                    .page_id = loc.pageId,
-                    .offset = loc.offset,
-                }) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DocumentDeleted => continue,
-                    else => return error.ScanError,
-                };
-
                 return .{
                     .doc = doc,
                     .page_id = loc.pageId,
                     .offset = loc.offset,
-                    .doc_id = ObjectId.fromInt(header.doc_id),
+                    .doc_id = ObjectId.fromInt(stored.header.doc_id),
                 };
             }
             return null;
@@ -3575,29 +3586,29 @@ pub const Bucket = struct {
                 };
             }
 
-            if (self.last_emitted) |anchor| {
+            if (self.last_emitted) |record| if (record.doc.get("_id")) |user_id| {
                 var anchor_doc = root.object("anchor") catch |err| switch (err) {
                     // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
-                anchor_doc.putValue("docId", BSONValue.init(anchor.doc_id)) catch |err| switch (err) {
+                anchor_doc.putValue("docId", BSONValue.init(record.doc_id)) catch |err| switch (err) {
                     // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
-                anchor_doc.putValue("_id", anchor.user_id) catch |err| switch (err) {
+                anchor_doc.putValue("_id", user_id) catch |err| switch (err) {
                     // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
-                anchor_doc.putValue("pageId", .{ .int64 = .{ .value = @intCast(anchor.page_id) } }) catch |err| switch (err) {
+                anchor_doc.putValue("pageId", .{ .int64 = .{ .value = @intCast(record.page_id) } }) catch |err| switch (err) {
                     // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
-                anchor_doc.putValue("offset", .{ .int32 = .{ .value = @intCast(anchor.offset) } }) catch |err| switch (err) {
+                anchor_doc.putValue("offset", .{ .int32 = .{ .value = @intCast(record.offset) } }) catch |err| switch (err) {
                     // error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
                 anchor_doc.end() catch unreachable;
-            }
+            };
 
             return builder.finish() catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -4226,7 +4237,9 @@ pub const Bucket = struct {
             .offsetLeft = 0,
             .index = 0,
             .last_emitted = null,
-            .cursor_mode_enabled = q.cursor != null,
+            .document_page = null,
+            .document_page_generation = self.wal_checkpoint_generation,
+            .filters_fully_covered = indexFiltersFullyCovered(&plan, q.filters),
         };
 
         if (Bucket.planUsesPointStrategy(&rc.plan)) {
@@ -4286,21 +4299,30 @@ pub const Bucket = struct {
         return rc;
     }
 
-    fn simpleRangeFullyCovered(plan: *const QueryPlan, filters: []const query.Filter) bool {
-        // These four operators share the same planner score, so every filter
-        // on the selected path is folded into the iterator's tightened bounds.
-        // Other operators and logical groups still get a document-level check.
-        if (plan.source != .index or plan.index_strategy != .range or plan.index_path == null or filters.len == 0) {
+    fn indexFiltersFullyCovered(plan: *const QueryPlan, filters: []const query.Filter) bool {
+        // Only skip document-level matching when every filter is represented
+        // by the selected index strategy. Any residual path or operator keeps
+        // the normal BSON predicate evaluation.
+        if (plan.source != .index or plan.index_path == null or filters.len == 0) {
             return false;
         }
 
         const index_path = plan.index_path.?;
         for (filters) |filter| {
-            const path = switch (filter) {
-                .lt => |data| data.path,
-                .lte => |data| data.path,
-                .gt => |data| data.path,
-                .gte => |data| data.path,
+            const path = switch (plan.index_strategy) {
+                .range => switch (filter) {
+                    .eq => |data| data.path,
+                    .lt => |data| data.path,
+                    .lte => |data| data.path,
+                    .gt => |data| data.path,
+                    .gte => |data| data.path,
+                    .between => |data| data.path,
+                    else => return false,
+                },
+                .points => switch (filter) {
+                    .in => |data| data.path,
+                    else => return false,
+                },
                 else => return false,
             };
             if (!mem.eql(u8, path, index_path)) return false;
@@ -4316,7 +4338,7 @@ pub const Bucket = struct {
         arena: *std.heap.ArenaAllocator,
     ) error{ OutOfMemory, ScanError }!void {
         const ally = arena.allocator();
-        const range_fully_covered = simpleRangeFullyCovered(plan, q.filters);
+        const filters_fully_covered = indexFiltersFullyCovered(plan, q.filters);
 
         switch (plan.source) {
             .full_scan => {
@@ -4430,6 +4452,14 @@ pub const Bucket = struct {
                             if (seen.contains(key)) continue;
                             try seen.put(key, {});
 
+                            if (filters_fully_covered) {
+                                try targets.append(ally, .{
+                                    .page_id = loc.pageId,
+                                    .offset = loc.offset,
+                                });
+                                continue;
+                            }
+
                             const doc = self.readDocAt(ally, .{
                                 .page_id = loc.pageId,
                                 .offset = loc.offset,
@@ -4456,7 +4486,7 @@ pub const Bucket = struct {
                         };
                         const loc = maybe_loc orelse break;
 
-                        if (range_fully_covered) {
+                        if (filters_fully_covered) {
                             try targets.append(ally, .{
                                 .page_id = loc.pageId,
                                 .offset = loc.offset,
@@ -4901,15 +4931,12 @@ pub const Bucket = struct {
         return out;
     }
 
-    fn readDocAt(
+    fn readDocFromPage(
         self: *Bucket,
         ally: mem.Allocator,
         loc: DocumentLocation,
-    ) error{ OutOfMemory, PageNotFound, DocumentDeleted }!BSONDocument {
-        var page = self.loadPage(loc.page_id) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.PageNotFound,
-        };
+        page: *Page,
+    ) error{ OutOfMemory, PageNotFound, DocumentDeleted }!ReadDocResult {
         var offset: u16 = loc.offset;
 
         if (offset + @sizeOf(DocHeader) > page.data.len) {
@@ -4929,8 +4956,9 @@ pub const Bucket = struct {
         const first_chunk = @min(doc_len, page.data.len - offset);
         // std.debug.print("WTF2 remaining {}, first_chunk {}\n", .{ remaining, first_chunk });
         if (first_chunk == doc_len) {
-            return BSONDocument{
-                .buffer = page.data[offset .. offset + doc_len],
+            return .{
+                .doc = .{ .buffer = page.data[offset .. offset + doc_len] },
+                .header = header,
             };
         }
         var docBuffer = try ally.alloc(u8, doc_len);
@@ -4956,7 +4984,22 @@ pub const Bucket = struct {
             remaining -= chunk;
         }
 
-        return BSONDocument{ .buffer = docBuffer, .owned = true };
+        return .{
+            .doc = .{ .buffer = docBuffer, .owned = true },
+            .header = header,
+        };
+    }
+
+    fn readDocAt(
+        self: *Bucket,
+        ally: mem.Allocator,
+        loc: DocumentLocation,
+    ) error{ OutOfMemory, PageNotFound, DocumentDeleted }!BSONDocument {
+        const page = self.loadPage(loc.page_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PageNotFound,
+        };
+        return (try self.readDocFromPage(ally, loc, page)).doc;
     }
 
     fn readDocHeaderAt(
