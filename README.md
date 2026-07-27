@@ -12,50 +12,39 @@
 
 ## What is Albedo?
 
-Albedo is an embedded document database. It stores BSON documents in a compact
-page-based file format, indexes them with B⁺-trees, and exposes a portable
-C ABI so virtually any language can use it as a library — no server process, no
-network round-trips.
+Albedo is an embedded BSON document database. It stores documents in a compact
+page-based file, indexes them with B⁺-trees, and exposes both a Zig API and a
+portable C ABI. There is no server process or network round-trip.
 
-**Key properties:**
+Key properties:
 
-- **Single-file storage** — one `.bucket` file holds documents, indexes, and metadata.
-- **BSON native** — documents are stored and queried in BSON; no intermediate format.
-- **B⁺-tree indexing** — create indexes on any field path, including nested and array fields.
-- **Write-Ahead Log (WAL)** — enabled by default on Linux/macOS; provides crash recovery, MVCC reads, and cross-process live-tail without blocking writers.
-- **Built-in replication** — WAL-native cursor APIs stream committed frame batches; transport and retry are owned by the caller.
-- **Tunable write durability** — choose between per-write fsync (`.all`), periodic fsync (`.periodic(N)`), or fully manual (`.manual`) to trade safety for throughput.
-- **Zero external dependencies** — the core is pure Zig; bindings are thin wrappers around the C ABI.
-- **Runs everywhere** — the storage layer only needs basic file-handle read/write operations, so it cross-compiles cleanly for Linux, macOS, Windows, iOS, Android, and WASM.
+- **Single-file storage** for documents, indexes, and metadata
+- **BSON-native** storage and queries
+- **B⁺-tree indexes** on nested and array field paths
+- **Write-ahead logging** with crash recovery and MVCC reads
+- **Cross-process streaming** and real-time subscriptions
+- **WAL-native replication** with caller-owned transport
+- **Query-driven update expressions** in the Zig API
+- **Portable core** for Linux, macOS, Windows, iOS, Android, and WASM
 
----
+## Install
 
-## Install the C library via Homebrew
+Install the C library and header with Homebrew:
 
 ```sh
 brew install klirix/tap/albedo
 ```
 
-This gives you `libalbedo` (shared + static) and the C header ready to link
-from any language.
+To build from source:
 
----
+```sh
+zig build
+zig build test
+```
 
-## Language bindings
+See [building Albedo](docs/building.md) for build targets and artifacts.
 
-Albedo is designed to be consumed from many runtimes. Pick the one that fits:
-
-| Language / Runtime | Package | Description |
-|--------------------|---------|-------------|
-| **Node / Bun** | [albedo-node](https://github.com/klirix/albedo-node) | N-API native addon — works with Node, Bun, and any N-API host |
-| **JavaScript / WASM** | [albedo-wasm](https://github.com/klirix/albedo-wasm) | WebAssembly build for browsers and edge runtimes |
-| **Dart / Flutter** | [albedo_flutter](https://github.com/klirix/albedo_flutter) | FFI plugin for Flutter & standalone Dart apps |
-| **Crystal** | [albedo_cr](https://github.com/klirix/albedo_cr) | Crystal shard wrapping the C library |
-| **C / C++** | [include/albedo.h](include/albedo.h) | Use the header directly — link against `libalbedo` |
-
----
-
-## Quick start (C)
+## Quick start with C
 
 ```c
 #include "albedo.h"
@@ -63,596 +52,55 @@ Albedo is designed to be consumed from many runtimes. Pick the one that fits:
 albedo_bucket_handle *db;
 albedo_open("my.bucket", &db);
 
-// Insert a BSON document (bytes built however you like)
 albedo_insert(db, bson_buf);
 
-// Query & iterate
-albedo_list_handle *it;
-albedo_list(db, query_buf, &it);
-uint8_t *doc;
-while (albedo_data(it, &doc) != ALBEDO_EOS) {
-    // …use doc…
-}
-albedo_close_iterator(it);
-albedo_close(db);
-```
-
----
-
-## Core operations
-
-| Operation | Function | Notes |
-|-----------|----------|-------|
-| Open / close | `albedo_open`, `albedo_close` | Pass `":memory:"` for an in-memory bucket; WAL is enabled by default on POSIX |
-| Insert | `albedo_insert` | Accepts a raw BSON document buffer |
-| Query | `albedo_list` → `albedo_data` | `albedo_data` returns `ALBEDO_OK` with a document pointer, `ALBEDO_EOS` when done |
-| Delete | `albedo_delete` | Tombstones matching docs; triggers auto-vacuum when deleted > live |
-| Update | `albedo_transform` → `albedo_transform_data` / `albedo_transform_apply` | Iterate matches and apply per-document transforms |
-| Indexes | `albedo_ensure_index`, `albedo_drop_index`, `albedo_list_indexes` | B⁺-tree indexes on arbitrary field paths |
-| Maintenance | `albedo_checkpoint`, `albedo_vacuum`, `albedo_flush` | Checkpoint the WAL into the main DB file, compact the file, or force-sync to disk (`flush` fsyncs the WAL in WAL mode) |
-| Replication | `albedo_replication_cursor`, `albedo_replication_read`, `albedo_replication_apply`, `albedo_replication_cursor_close` | Cursor-based WAL replication — see [REPLICATION.md](REPLICATION.md) |
-| Subscriptions | `albedo_subscribe`, `albedo_subscribe_poll`, `albedo_subscribe_close` | Real-time oplog change stream (insert / update / delete events) — requires WAL mode |
-
-See [include/albedo.h](include/albedo.h) for the full C API surface.
-
----
-
-## Building from source
-
-Requires [Zig](https://ziglang.org) (0.15.1).
-
-```sh
-# Shared library (default)
-zig build
-
-# Static library
-zig build -Dstatic=true
-
-# Run the test suite
-zig build test
-```
-
-Build artifacts land in `zig-out/`. See [build.md](build.md) for
-platform-specific notes and Android cross-compilation.
-
----
-
-## Write-Ahead Log (WAL)
-
-On Linux and macOS, Albedo opens databases in WAL mode by default. This provides:
-
-- **Crash recovery** — uncommitted data is replayed on the next open.
-- **MVCC reads** — readers see a consistent snapshot; writers never block readers.
-- **Live-tail streaming** — keep an iterator open to observe new documents as they are written, even across multiple processes.
-- **Better throughput** — writes don't require disk synchronization on every operation.
-
-You can manually checkpoint the WAL (apply it to the main DB file and clear it) with `albedo_checkpoint` / `Bucket.checkpoint()`. This is useful to:
-
-- Bound WAL file growth during long-running processes
-- Compact the database before handing it to another tool
-- Leave the database in a clean state without waiting for all connections to close
-
----
-
-## Init options
-
-These options are passed via `OpenBucketOptions` in Zig (or as a BSON document
-to `albedo_open_with_options` in C).
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `wal` | `bool` | `true` | Enable the Write-Ahead Log. Disable only for single-process read-only workloads. |
-| `oplog_size` | `u32` | `4 MiB` | Size of the change-stream oplog buffer. Set to `0` to disable subscriptions. |
-| `write_durability` | see below | `.{ .periodic = 100 }` | Durability level for writes. |
-| `read_durability` | see below | `.shared` | Consistency level for reads. |
-| `auto_vaccuum` | `bool` | `true` | Automatically compact the database after deletions. |
-| `page_cache_capacity` | `usize` | `256` | Maximum cached pages in memory. |
-| `mode` | `ReadOnly` / `ReadWrite` | `ReadWrite` | Open read-only or read-write. |
-
-**Write-durability modes** (`write_durability`):
-
-| Mode | Behaviour |
-|------|-----------|
-| `.all` | Guarantee durability after every write (slowest) |
-| `.{ .periodic = N }` | Guarantee durability every N writes (default: 100) |
-| `.manual` | No automatic durability; call `albedo_flush()` when you need it (fastest) |
-
-**Read-durability modes** (`read_durability`):
-
-| Mode | Behaviour |
-|------|----------|
-| `.shared` | Always see the latest writes from other processes (safe for multi-process) |
-| `.process` | See local process writes immediately; other processes' writes may lag (faster for single-process) |
-
----
-
----
-
-## Query Language
-
-Albedo queries are BSON documents with up to four sections:
-
-1. **`query`** — filter expressions that match documents
-2. **`sort`** — order results by a single field (asc or desc)
-3. **`sector`** — pagination (offset and limit)
-4. **`cursor`** — resume a stream from a saved checkpoint (see [Streaming Cursors](#streaming-cursors))
-
-### Full query structure
-
-```bson
-{
-  "query": {
-    <filter expressions>
-  },
-  "sort": {
-    "asc": "field.path" | "desc": "field.path"
-  },
-  "sector": {
-    "offset": <int>,
-    "limit": <int>
-  },
-  "cursor": {
-    <cursor state from a previous query>
-  }
-}
-```
-
-All sections are **optional**. An empty document `{}` returns all documents.
-
-### Filter operators
-
-Filters are written in the `"query"` section as `"field.path": { "$operator": value }` or as logical operators (`$or`, `$and`, `$nor`).
-
-#### Comparison operators
-
-| Operator | Type | Example | Matches |
-|----------|------|---------|---------|
-| `$eq` | equality | `{ "status": { "$eq": "active" } }` | status == "active" |
-| `$ne` | not equal | `{ "age": { "$ne": 30 } }` | age ≠ 30 |
-| `$lt` | less than | `{ "score": { "$lt": 100 } }` | score < 100 |
-| `$lte` | less than or equal | `{ "score": { "$lte": 100 } }` | score ≤ 100 |
-| `$gt` | greater than | `{ "count": { "$gt": 5 } }` | count > 5 |
-| `$gte` | greater than or equal | `{ "count": { "$gte": 5 } }` | count ≥ 5 |
-
-**Notes:**
-- Comparisons use BSON type ordering: null < numbers < strings < documents < arrays < binary < objectId < boolean < datetime < maxKey.
-- Cross-type comparisons follow this order; e.g., `{ "$lt": 100 }` will match null, other numbers, strings, etc.
-
-#### Array and range operators
-
-| Operator | Type | Example | Matches |
-|----------|------|---------|---------|
-| `$in` | array contains | `{ "status": { "$in": ["active", "pending"] } }` | status ∈ {active, pending} |
-| `$between` | range | `{ "age": { "$between": [18, 65] } }` | 18 < age < 65 (exclusive) |
-
-**Notes:**
-- `$in` accepts any BSON array and performs deduplication; can match multiple values per document if the field is an array.
-- `$between` expects an array of exactly 2 elements `[lower, upper]`; the range is strictly exclusive (> lower and < upper).
-
-#### String operators
-
-| Operator | Type | Example | Matches |
-|----------|------|---------|---------|
-| `$startsWith` | prefix | `{ "name": { "$startsWith": "Jo" } }` | name starts with "Jo" |
-| `$endsWith` | suffix | `{ "domain": { "$endsWith": ".com" } }` | domain ends with ".com" |
-
-**Notes:**
-- Only work on string fields; other types do not match.
-- Case-sensitive.
-
-#### Existence operators
-
-| Operator | Type | Example | Matches |
-|----------|------|---------|---------|
-| `$exists` | field present | `{ "thumbnail": { "$exists": true } }` | field "thumbnail" exists (any value) |
-| `$notExists` | field absent | `{ "deleted_at": { "$notExists": true } }` | field "deleted_at" does not exist |
-
-**Notes:**
-- The value (`true` / `false`) is accepted but ignored; the meaning is determined by the operator name.
-
-### Logical operators
-
-Combine multiple filter groups with `$or`, `$and`, and `$nor`. Each group is an object with one or more field filters.
-
-#### `$or` — At least one group matches
-
-```bson
-{
-  "$or": [
-    { "role": "admin" },
-    { "public": true },
-    { "owner_id": ObjectId("...") }
-  ]
-}
-```
-
-Matches if **any** group matches (inclusive OR). If every branch has at least one indexable predicate, Albedo uses an index-union plan and deduplicates overlapping matches.
-
-#### `$and` — All groups must match
-
-```bson
-{
-  "$and": [
-    { "age": { "$gte": 18 } },
-    { "status": "active" },
-    { "verified": true }
-  ]
-}
-```
-
-All filters in all groups must match. Useful for explicit grouping when combining with other logical operators.
-
-Explicit `$and` participates in planning just like top-level implicit AND:
-
-- inner indexed predicates can drive the scan
-- multiple range predicates on the same indexed field can tighten bounds
-- inner `$in` predicates can use the point strategy
-
-#### `$nor` — No group matches
-
-```bson
-{
-  "$nor": [
-    { "spam": true },
-    { "deleted": true }
-  ]
-}
-```
-
-Matches if **no** group matches.
-
-When **every** `$nor` branch is index-covered, Albedo uses an exclusion plan:
-
-1. scan each branch index to collect documents that must be rejected
-2. scan the bucket's data pages
-3. compare each candidate against the document header `doc_id`
-4. return only documents not present in the exclusion set
-
-This is currently **eager** (materialized before streaming) and does **not** support cursors.
-
-#### Mixed logical operators
-
-You can combine logical operators:
-
-```bson
-{
-  "$or": [
-    { "role": "admin" },
-    {
-      "$and": [
-        { "status": "active" },
-        { "verified": true }
-      ]
-    }
-  ]
-}
-```
-
-This example matches: (role is "admin") OR (status is "active" AND verified is true).
-
-#### Leaf filters alongside logical operators
-
-Leaf filters (simple field filters) are AND-ed with logical operator results:
-
-```bson
-{
-  "$or": [
-    { "role": "admin" },
-    { "public": true }
-  ],
-  "deleted": false
-}
-```
-
-Matches: (role is "admin" OR public is true) AND deleted is false.
-
-### Sorting
-
-Specify a sort order with the `"sort"` section:
-
-```bson
-{
-  "query": { "status": "active" },
-  "sort": { "asc": "created_at" }
-}
-```
-
-- `"asc"` sorts ascending (lowest first).
-- `"desc"` sorts descending (highest first).
-- Only **one field** can be sorted.
-- If an index exists on the sorted field and the query fully uses that index, sorting is **covered** (no additional cost).
-
-**Example:** If you have an index on `"age"` and query `{ "query": { "age": { "$gte": 18 } }, "sort": { "asc": "age" } }`, the index provides both the query and the sort.
-
-### Pagination (sector)
-
-Use `"sector"` to paginate results:
-
-```bson
-{
-  "query": { "status": "active" },
-  "sector": { "offset": 20, "limit": 10 }
-}
-```
-
-- `offset` — number of documents to skip (default 0).
-- `limit` — maximum documents to return (default no limit).
-
-Both are optional. Without them, all matching documents are returned.
-
-**Note:** Sector is applied **after** the query and sort, so offset + limit works on the final sorted result set.
-
-### Query planning and index use
-
-Albedo's query planner automatically chooses the best execution strategy, including:
-
-- **Index range scan** — when filtering on an indexed field with comparison operators
-- **Index point scan** — when using `$in` on an indexed field
-- **Index union** — when a `$or` query can use multiple indexes
-- **Full scan** — when no index can help
-
-The planner prioritizes exact matches (`$eq`) and narrow ranges over broader filters. For sorted queries, if the sort field is indexed and matches the query strategy, sorting is covered (no additional cost). Otherwise results are materialized before sorting.
-
-### Example queries
-
-**Simple equality:**
-```bson
-{ "query": { "email": "alice@example.com" } }
-```
-
-**Range with sort and pagination:**
-```bson
-{
-  "query": { "age": { "$gte": 18, "$lte": 65 } },
-  "sort": { "desc": "created_at" },
-  "sector": { "offset": 0, "limit": 50 }
-}
-```
-
-**Complex filter with OR:**
-```bson
-{
-  "query": {
-    "$or": [
-      { "role": "admin" },
-      { "owner_id": ObjectId("507f1f77bcf86cd799439011") }
-    ],
-    "deleted": false
-  },
-  "sort": { "asc": "name" }
-}
-```
-
-**Nested field query:**
-```bson
-{
-  "query": { "profile.bio": { "$startsWith": "Senior" } }
-}
-```
-
-**Array field with $in:**
-```bson
-{
-  "query": { "tags": { "$in": ["urgent", "blocked"] } }
-}
-```
-
----
-
-## Streaming Queries
-
-`albedo_list` can be used as a document stream even without cursors. Open a
-list iterator, call `albedo_data` / `next()`, and keep polling after `EOS` if
-you want live-tail behavior. In WAL mode the iterator can pick up documents
-written later by another connection.
-
-> **Real-time use case?** If you need low-latency notification of individual
-> inserts, updates, and deletes — rather than a full re-scan — use the
-> [Subscriptions](#subscriptions) API instead. Subscriptions read from the
-> oplog ring and return change events immediately, with no page scanning.
-
-Basic C flow:
-
-```c
 albedo_list_handle *it;
 albedo_list(db, query_buf, &it);
 
 uint8_t *doc;
 while (albedo_data(it, &doc) == ALBEDO_OK) {
-  // consume doc
+    // Consume the BSON document.
 }
 
-// Later, poll again on the same iterator if you want to keep streaming.
-while (albedo_data(it, &doc) == ALBEDO_OK) {
-  // consume newly visible docs
-}
-```
-
-Streaming queries are useful for:
-
-- Full-scan streams over the whole bucket
-- Range-index streams such as `{ "query": { "age": { "$gte": 30 } } }`
-- Long-lived readers that want to keep an iterator open and observe new writes
-
-Current streaming limitations:
-
-- Queries with `sort` are materialized eagerly and are not stream-shaped
-- `sector` is pagination, not streaming state
-- Point-strategy index scans such as `$in` are supported as normal queries, but
-  not as resumable cursor streams
-
-## Streaming Cursors
-
-A cursor is an exported snapshot of stream progress. Use it when you want to
-close an iterator, hand the state to a client, and reopen the same streaming
-query later without replaying already delivered documents.
-
-Cursor shape:
-
-```bson
-{
-  "query": { ... },
-  "cursor": {
-    "version": 1,
-    "mode": "full_scan" | "index_range",
-    "indexPath": "field.path",
-    "anchor": {
-      "docId": ObjectId("..."),
-      "_id": <BSON value>,
-      "pageId": 42,
-      "offset": 128
-    }
-  }
-}
-```
-
-C API flow:
-
-```c
-albedo_list_handle *it;
-albedo_list(db, query_buf, &it);
-
-uint8_t *doc;
-albedo_data(it, &doc);
-
-uint8_t *cursor_buf;
-albedo_list_cursor_export(it, &cursor_buf);
 albedo_close_iterator(it);
-
-// Build a new query buffer with {"cursor": <cursor_buf>}
-albedo_list(db, resumed_query_buf, &it);
-```
-
-Cursor-specific limitations in v1:
-
-- No `sort` with `cursor`
-- No `sector` with `cursor`
-- No point-strategy index cursors such as `$in`
-- Cursor iterators are not thread-safe
-- Best-effort continuation only; this is not snapshot pagination
-
-Invalidation and resume errors:
-
-- A cursor is tied to the current document layout and stream anchor
-- After `vacuum()`, previously exported cursors are not accepted
-- If the anchor can no longer be found when reopening, resume fails with
-  `InvalidCursor` in Zig and `ALBEDO_INVALID_CURSOR` in the C API
-
----
-
-## Subscriptions
-
-Subscriptions give you a real-time change stream over a WAL-mode bucket.
-Rather than re-scanning pages, a subscription reads from a circular oplog
-ring buffer kept in the WAL shared-memory file. Each entry is a compact
-operation envelope — insert, update, or delete — with the document embedded
-inline when it fits within 1 KB.
-
-**When to prefer subscriptions over streaming queries:**
-
-- You need individual change notifications (insert / update / delete) rather than a document stream.
-- You want to observe changes made by *any* writer, not just the local connection.
-- Polling latency matters more than throughput; the oplog ring is read without any page I/O.
-
-### C API
-
-```c
-// 1. Open a bucket in WAL mode (default on Linux/macOS).
-albedo_bucket_handle *db;
-albedo_open("my.bucket", &db);
-
-// 2. Subscribe. Pass an optional BSON query to receive only matching events.
-//    An empty document {} matches everything.
-albedo_subscription_handle *sub;
-albedo_subscribe(db, query_buf, &sub);
-
-// 3. Poll in a loop. Each successful poll returns a BSON document
-//    {batch: [{seqno, op, doc_id, ts, doc?}, ...]}.
-//    The document is owned by the subscription and valid only until the
-//    next poll or close call.
-uint8_t *batch_doc;
-albedo_result r = albedo_subscribe_poll(sub, &batch_doc, 64);
-if (r == ALBEDO_HAS_DATA) {
-    // batch_doc is a BSON document: {batch: [...events]}.
-    // Parse it with your BSON library of choice.
-    // Lifetime: valid until the next albedo_subscribe_poll() or
-    //           albedo_subscribe_close() call.
-} else if (r == ALBEDO_EOS) {
-    // No new events; sleep briefly and poll again.
-} else if (r == ALBEDO_OPLOG_GAP) {
-    // The subscriber fell too far behind and the ring wrapped.
-    // Close the subscription and re-subscribe to resume.
-    albedo_subscribe_close(sub);
-    albedo_subscribe(db, query_buf, &sub);
-}
-
-// 4. Check the latest committed seqno without polling.
-uint64_t seqno = albedo_subscribe_seqno(sub);
-
-// 5. Clean up.
-albedo_subscribe_close(sub);
 albedo_close(db);
 ```
 
-### Change event fields
+See [getting started](docs/getting-started.md) for the core operations and
+the [C header](include/albedo.h) for the complete ABI.
 
-Each element of the `batch` array is a BSON document with these fields:
+## Documentation
 
-| Field | BSON type | Description |
-|-------|-----------|-------------|
-| `seqno` | int64 | Monotonically increasing oplog sequence number |
-| `op` | string | `"insert"`, `"update"`, or `"delete"` |
-| `doc_id` | objectId | Document identifier (same as the BSON `_id` bytes) |
-| `ts` | int64 | Unix nanoseconds when the operation was written |
-| `doc` | document | *(present on insert/update with inline payload ≤ 1 KB)* Full BSON document body |
+The documentation is split into task-focused guides under [`docs/`](docs/README.md):
 
-### Overflow and gap handling
+| Guide | Covers |
+|-------|--------|
+| [Getting started](docs/getting-started.md) | Installation, bindings, C quick start, and core operations |
+| [Building](docs/building.md) | Build commands, targets, and artifacts |
+| [Configuration and durability](docs/configuration.md) | Bucket options, WAL, caching, checkpoints, and durability |
+| [Query language](docs/query-language.md) | Filters, logical operators, sorting, pagination, projections, and planning |
+| [Update expressions](docs/update-expressions.md) | Query-driven Zig updates, stages, pipelines, and expressions |
+| [Streaming and cursors](docs/streaming.md) | Long-lived iterators and resumable query state |
+| [Subscriptions](docs/subscriptions.md) | Real-time insert, update, and delete events |
+| [Replication](docs/replication.md) | Committed WAL batches, cursors, apply rules, and resnapshotting |
 
-The oplog ring is by default 4 MB, configurable via `oplog_size` in init options. If a subscriber polls infrequently and the
-writer is active, the ring may wrap before the subscriber reads all entries.
-When this happens `albedo_subscribe_poll` returns `ALBEDO_OPLOG_GAP`. The
-correct recovery is to close the subscription, optionally perform a one-time
-full scan of the collection to rebuild local state, and then re-subscribe to
-resume from the current tail.
+For contributors and coding agents, [AGENTS.md](AGENTS.md) describes the
+on-disk format, storage machinery, concurrency model, and core invariants.
 
-### Filtering
+## Language bindings
 
-Pass a BSON query document (the same format as `albedo_list`) to
-`albedo_subscribe`. Only insert and update events whose inline document
-matches the query are delivered; delete events without an inline document
-always pass through.
-
----
-
-## Replication
-
-Albedo replication is built directly on committed WAL history. A primary
-publishes an opaque replication cursor handle, `albedo_replication_read`
-returns `ReplicationBatchHeader + raw WAL frames`, and
-`albedo_replication_apply` appends that exact range into a replica WAL.
-
-- `ALBEDO_HAS_DATA` means a batch was returned.
-- `ALBEDO_EOS` means there are no newer committed frames at the cursor.
-- `ALBEDO_REPLICATION_GAP` means the cursor is stale after a WAL generation
-  reset and the replica must resnapshot.
-- `albedo_replication_read` returns an owned buffer; release it with
-  `albedo_free`.
-- `albedo_replication_cursor` / `albedo_replication_apply` return opaque cursor
-  handles; release them with `albedo_replication_cursor_close`.
-
-If you want, you can tail the WAL directly SQLite-style because the payload is
-literally raw WAL frames, but the replication API is the safer contract because
-it only exposes committed frames and carries generation metadata for WAL reset
-detection. See [REPLICATION.md](REPLICATION.md) for the full protocol.
-
----
+| Language / runtime | Package |
+|--------------------|---------|
+| Node / Bun | [albedo-node](https://github.com/klirix/albedo-node) |
+| JavaScript / WASM | [albedo-wasm](https://github.com/klirix/albedo-wasm) |
+| Dart / Flutter | [albedo_flutter](https://github.com/klirix/albedo_flutter) |
+| Crystal | [albedo_cr](https://github.com/klirix/albedo_cr) |
+| C / C++ | [include/albedo.h](include/albedo.h) |
 
 ## Project status
 
-Albedo is pre 1.0. The on-disk format and public APIs may
-change between versions. Contributions and bug reports are welcome.
-
----
+Albedo is pre-1.0. The on-disk format and public APIs may change between
+versions. Contributions and bug reports are welcome.
 
 ## License
 

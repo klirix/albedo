@@ -52,8 +52,10 @@ Artifacts appear in `zig-out/` (`zig-out/lib/libalbedo.dylib`, and `zig-out/bin/
 - `src/query.zig` — Query processing and execution.
 - `src/wal.zig` — Write-ahead logging.
 - `AGENTS.md` — Detailed notes on the core database machinery.
-- `REPLICATION.md` — Replication documentation.
-- `build.zig` / `build.md` — useful flags and build targets.
+- `docs/README.md` — Task-oriented documentation index; start here for
+  public behavior before reading implementation files.
+- `docs/replication.md` — Replication documentation.
+- `build.zig` / `docs/building.md` — useful flags and build targets.
 
 ## How to add small features safely
 
