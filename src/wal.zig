@@ -937,6 +937,7 @@ pub const WAL = struct {
 
         // Rebuild the SHM index from WAL frames.
         try wal.rebuildIndex();
+        wal.publishCommittedBucketCounts();
 
         return wal;
     }
@@ -1067,10 +1068,24 @@ pub const WAL = struct {
     /// on disk, and advance `latest_committed_tx`.
     pub fn sync(self: *WAL) Error!void {
         fsync(self.io, self.write_fd) catch return Error.WalSyncFailed;
+        try self.commitHeader(true);
+    }
+
+    /// Publish the current logical commit without forcing it to stable storage.
+    ///
+    /// Periodic and manual durability still need an on-disk commit boundary
+    /// after every successful mutation. Otherwise an abrupt process exit leaves
+    /// complete page frames past the old header.frame_count, and recovery
+    /// mistakes them for a torn transaction and truncates them.
+    pub fn commit(self: *WAL) Error!void {
+        try self.commitHeader(false);
+    }
+
+    fn commitHeader(self: *WAL, sync_to_disk: bool) Error!void {
         self.latest_committed_tx = self.pending_max_tx;
         self.header.frame_count = self.live_frame_count;
         self.header.tx_timestamp = self.latest_committed_tx;
-        try self.writeHeader();
+        try self.writeHeader(sync_to_disk);
     }
 
     // ── Reading / recovery ────────────────────────────────────────────
@@ -1171,7 +1186,7 @@ pub const WAL = struct {
         // Clear embedded header — main DB file is now authoritative.
         self.header.bucket_header = [_]u8{0} ** 64;
 
-        try self.writeHeader();
+        try self.writeHeader(true);
         fsync(self.io, self.write_fd) catch return Error.WalSyncFailed;
 
         // Clear the SHM index and bump checkpoint generation so that
@@ -1209,7 +1224,25 @@ pub const WAL = struct {
         }
     }
 
-    fn writeHeader(self: *WAL) Error!void {
+    /// Restore the SHM header counters from the committed WAL header.
+    /// The SHM file survives SIGKILL and may otherwise advertise page counts
+    /// from frames that recovery just discarded as an incomplete transaction.
+    fn publishCommittedBucketCounts(self: *WAL) void {
+        const shm = self.index.shmHeader();
+        var page_count: u64 = 0;
+        var doc_count: u64 = 0;
+        if (self.data_offset >= Header.byte_size) {
+            const zero: [64]u8 = [_]u8{0} ** 64;
+            if (!std.mem.eql(u8, &self.header.bucket_header, &zero)) {
+                page_count = std.mem.readInt(u64, self.header.bucket_header[12..20], .little);
+                doc_count = std.mem.readInt(u64, self.header.bucket_header[20..28], .little);
+            }
+        }
+        atomic64.store(&shm.shm_page_count, page_count);
+        atomic64.store(&shm.shm_doc_count, doc_count);
+    }
+
+    fn writeHeader(self: *WAL, sync_to_disk: bool) Error!void {
         // The write fd is append-only, so we open a transient fd without
         // append semantics to pwrite the header at offset 0.
         const fd = openRwFd(self.io, self.path) catch return Error.WalWriteFailed;
@@ -1220,12 +1253,14 @@ pub const WAL = struct {
         // overwrite the first frame's data with bucket_header bytes.
         const write_len = @as(usize, @intCast(self.data_offset));
         pwriteAll(self.io, fd, hdr_bytes[0..write_len], 0) catch return Error.WalWriteFailed;
-        fsync(self.io, fd) catch return Error.WalSyncFailed;
+        if (sync_to_disk) {
+            fsync(self.io, fd) catch return Error.WalSyncFailed;
+        }
     }
 
     pub fn setGeneration(self: *WAL, generation: u64) Error!void {
         self.header.generation = generation;
-        try self.writeHeader();
+        try self.writeHeader(true);
     }
 
     pub fn adoptSalt(self: *WAL, salt: u64) Error!void {
@@ -1233,10 +1268,15 @@ pub const WAL = struct {
             return Error.WalWriteFailed;
         }
         self.header.salt = salt;
-        try self.writeHeader();
+        try self.writeHeader(true);
     }
 
-    pub fn appendCommittedFrames(self: *WAL, raw_frames: []const u8, latest_tx_timestamp: i64) Error!void {
+    pub fn appendCommittedFrames(
+        self: *WAL,
+        raw_frames: []const u8,
+        latest_tx_timestamp: i64,
+        committed_bucket_header: ?[64]u8,
+    ) Error!void {
         if (raw_frames.len == 0) return;
         if (raw_frames.len % frame_size != 0) return Error.WalCorrupted;
 
@@ -1284,7 +1324,14 @@ pub const WAL = struct {
         self.latest_committed_tx = @max(self.latest_committed_tx, latest_tx_timestamp);
         self.pending_max_tx = self.latest_committed_tx;
         self.header.tx_timestamp = self.latest_committed_tx;
-        try self.writeHeader();
+        const old_bucket_header = self.header.bucket_header;
+        if (committed_bucket_header) |bucket_header| {
+            self.header.bucket_header = bucket_header;
+        }
+        self.writeHeader(true) catch |err| {
+            self.header.bucket_header = old_bucket_header;
+            return err;
+        };
     }
 
     // ── Cross-platform file helpers ───────────────────────────────────

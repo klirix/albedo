@@ -1278,44 +1278,28 @@ pub const Bucket = struct {
         // Snapshot the current SHM checkpoint generation.
         self.wal_checkpoint_generation = atomicLoadU64(&w.index.shmHeader().checkpoint_generation);
 
-        // Fast path: the writer publishes page_count/doc_count to SHM
-        // atomically, so readers can pick them up without any disk I/O.
+        // The embedded header is the authoritative state for the latest
+        // committed WAL transaction. Replace the whole header: counters such
+        // as doc_count can legitimately decrease after deletes, and
+        // deleted_count must also be recovered.
+        if (w.readBucketHeader() catch null) |bh| {
+            self.header = BucketHeader.read(&bh);
+            return;
+        }
+
+        // SHM fallback for legacy WALs that do not embed a BucketHeader.
         const shm = w.index.shmHeader();
         const shm_pc = atomicLoadU64(&shm.shm_page_count);
         const shm_dc = atomicLoadU64(&shm.shm_doc_count);
         if (shm_pc > 0) {
-            if (shm_pc > self.header.page_count) {
-                self.header.page_count = shm_pc;
-            }
-            if (shm_dc > self.header.doc_count) {
-                self.header.doc_count = shm_dc;
-            }
-            return;
-        }
-
-        // Fallback: re-read the embedded BucketHeader from the WAL file
-        // on disk (used when the SHM was freshly created, e.g. after a
-        // crash where the writer had already synced the WAL header).
-        if (w.readBucketHeader() catch null) |bh| {
-            const wal_header = BucketHeader.read(&bh);
-            if (wal_header.page_count > self.header.page_count) {
-                self.header.page_count = wal_header.page_count;
-            }
-            if (wal_header.doc_count > self.header.doc_count) {
-                self.header.doc_count = wal_header.doc_count;
-            }
+            self.header.page_count = shm_pc;
+            self.header.doc_count = shm_dc;
             return;
         }
 
         // Fallback for v2 WALs: try the HEADER_PAGE_ID sentinel frame.
         const data = w.page_data(WAL.HEADER_PAGE_ID, std.math.maxInt(i64)) catch return;
-        const wal_header = BucketHeader.read(data[0..BucketHeader.byteSize]);
-        if (wal_header.page_count > self.header.page_count) {
-            self.header.page_count = wal_header.page_count;
-        }
-        if (wal_header.doc_count > self.header.doc_count) {
-            self.header.doc_count = wal_header.doc_count;
-        }
+        self.header = BucketHeader.read(data[0..BucketHeader.byteSize]);
     }
 
     /// Apply every WAL frame to the main database file and write the
@@ -1839,6 +1823,10 @@ pub const Bucket = struct {
             if (self.write_durability == .all) {
                 try w.sync();
             } else {
+                // Publish the transaction boundary even when fsync is deferred.
+                // A process crash must not make recovery discard mutations that
+                // already returned successfully to the caller.
+                try w.commit();
                 try self.maybeSyncPeriodic();
             }
 
@@ -2040,17 +2028,21 @@ pub const Bucket = struct {
 
         if (batch_header.start_frame_index != local_frame_count) return error.ReplicationGap;
 
-        try w.appendCommittedFrames(frame_bytes, batch_header.latest_tx_timestamp);
-
-        var meta_page_replicated = false;
-        // v2 batch: use the embedded BucketHeader from the batch header.
-        // v1 batch: look for HEADER_PAGE_ID sentinel frames (legacy).
         var replicated_header: ?BucketHeader = null;
         const zero: [64]u8 = [_]u8{0} ** 64;
         if (batch_header.version >= 2 and !std.mem.eql(u8, &batch_header.bucket_header, &zero)) {
             replicated_header = BucketHeader.read(&batch_header.bucket_header);
         }
 
+        try w.appendCommittedFrames(
+            frame_bytes,
+            batch_header.latest_tx_timestamp,
+            if (replicated_header != null) batch_header.bucket_header else null,
+        );
+
+        var meta_page_replicated = false;
+        // v2 batch: use the embedded BucketHeader from the batch header.
+        // v1 batch: look for HEADER_PAGE_ID sentinel frames (legacy).
         var i: u64 = 0;
         while (i < batch_header.frame_count) : (i += 1) {
             const frame_start = hdr_size + @as(usize, @intCast(i * WAL.frame_size));
@@ -2074,6 +2066,9 @@ pub const Bucket = struct {
 
         if (replicated_header) |header| {
             self.header = header;
+            const shm = w.index.shmHeader();
+            atomicStoreU64(&shm.shm_page_count, header.page_count);
+            atomicStoreU64(&shm.shm_doc_count, header.doc_count);
         }
 
         if (meta_page_replicated) {
@@ -7686,13 +7681,12 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
         const doc2 = try bson.fmt.serialize(.{ .title = "Doc B", .value = @as(i32, 2) }, ally);
         _ = try bucket.insert(doc2);
 
-        // Ensure WAL frames are committed to the WAL file.
-        try bucket.flush();
-        if (bucket.wal) |*w| {
-            try w.sync();
-        }
-
         try testing.expectEqual(@as(u64, 2), bucket.header.doc_count);
+        // Do not flush: the default periodic durability policy has not reached
+        // its fsync threshold. The successful inserts must still publish their
+        // logical WAL commit boundary so an abrupt process exit can recover
+        // them from the OS page cache.
+        try testing.expect(bucket.wal.?.header.frame_count > 0);
 
         // ── Simulate abrupt crash ──
         // Close WAL file descriptors without consuming (leaves WAL on disk).
@@ -7753,6 +7747,74 @@ test "Bucket WAL replays frames after abrupt crash (no clean shutdown)" {
     if (cwdStatFile(wal_path)) |_| {
         return error.TestUnexpectedResult; // WAL should be gone after clean close
     } else |_| {}
+}
+
+test "Bucket WAL crash recovery restores decreasing header counters" {
+    const allocator = std.testing.allocator;
+    const db_path = "albedo_test_wal_delete_crash.bucket";
+    const wal_path = "albedo_test_wal_delete_crash.bucket-wal";
+    const shm_path = "albedo_test_wal_delete_crash.bucket-wal-shm";
+
+    tryCwdDeleteFile(db_path) catch {};
+    cwdDeleteFile(wal_path);
+    cwdDeleteFile(shm_path);
+    defer tryCwdDeleteFile(db_path) catch {};
+    defer cwdDeleteFile(wal_path);
+    defer cwdDeleteFile(shm_path);
+
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const ally = arena.allocator();
+
+        var bucket = try Bucket.init(ally, std.testing.io, db_path);
+        const doc1 = try bson.fmt.serialize(.{ .title = "keep" }, ally);
+        _ = try bucket.insert(doc1);
+        const doc2 = try bson.fmt.serialize(.{ .title = "delete" }, ally);
+        _ = try bucket.insert(doc2);
+
+        // Establish a main-file baseline whose doc_count is higher than the
+        // header in the WAL transaction that follows.
+        try bucket.checkpoint();
+        try testing.expectEqual(@as(u64, 2), bucket.header.doc_count);
+
+        var delete_doc = try bson.fmt.serialize(.{ .query = .{ .title = "delete" } }, ally);
+        defer delete_doc.deinit(ally);
+        var delete_query = try query.Query.parse(ally, delete_doc);
+        defer delete_query.deinit(ally);
+        try bucket.delete(delete_query);
+
+        try testing.expectEqual(@as(u64, 1), bucket.header.doc_count);
+        try testing.expectEqual(@as(u64, 1), bucket.header.deleted_count);
+        try testing.expect(bucket.wal.?.header.frame_count > 0);
+
+        // Abrupt exit: preserve the WAL without checkpointing it.
+        if (bucket.wal) |*w| {
+            w.deinit();
+            bucket.wal = null;
+        }
+        bucket.deinit();
+    }
+
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const ally = arena.allocator();
+
+        var bucket = try Bucket.openFile(ally, std.testing.io, db_path);
+        defer bucket.deinit();
+
+        try testing.expectEqual(@as(u64, 1), bucket.header.doc_count);
+        try testing.expectEqual(@as(u64, 1), bucket.header.deleted_count);
+
+        var q_doc = try bson.fmt.serialize(.{ .sector = .{} }, ally);
+        defer q_doc.deinit(ally);
+        var q = try query.Query.parse(ally, q_doc);
+        defer q.deinit(ally);
+        const docs = try bucket.list(ally, q);
+        try testing.expectEqual(@as(usize, 1), docs.len);
+        try testing.expectEqualStrings("keep", docs[0].get("title").?.string.value);
+    }
 }
 
 test "WAL live-tail: reader polls for docs written by another connection" {
