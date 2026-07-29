@@ -3,6 +3,7 @@ const testing = std.testing;
 const albedo = @import("./albedo.zig");
 const bson = @import("./bson.zig");
 const Query = albedo.Query;
+const UpdateProgram = albedo.UpdateProgram;
 const IndexOptions = @import("./bplusindex.zig").IndexOptions;
 const builtin = @import("builtin");
 const is_wasm = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
@@ -227,6 +228,27 @@ pub export fn albedo_transaction_delete(tx: *Bucket.Transaction, queryBuffer: [*
     return Result.OK;
 }
 
+pub export fn albedo_transaction_update(
+    tx: *Bucket.Transaction,
+    queryBuffer: [*]u8,
+    queryLen: u16,
+    programBuffer: [*]u8,
+    programLen: u16,
+    outUpdated: *usize,
+) Result {
+    var arena = std.heap.ArenaAllocator.init(ally);
+    defer arena.deinit();
+    const local_ally = arena.allocator();
+
+    var query = Query.parseRaw(local_ally, queryBuffer[0..queryLen]) catch |err| return mapQueryParseError(err);
+    defer query.deinit(local_ally);
+    var program = UpdateProgram.parseRaw(local_ally, programBuffer[0..programLen]) catch return Result.InvalidFormat;
+    defer program.deinit(local_ally);
+
+    outUpdated.* = tx.transfigurate(query, program) catch |err| return mapWriteError(err);
+    return Result.OK;
+}
+
 pub export fn albedo_transaction_transform(
     tx: *Bucket.Transaction,
     queryBuffer: [*c]u8,
@@ -368,6 +390,27 @@ pub export fn albedo_delete(bucket: *albedo.Bucket, queryBuffer: [*]u8, queryLen
 
     bucket.delete(query) catch |err| return mapWriteError(err);
 
+    return Result.OK;
+}
+
+pub export fn albedo_update(
+    bucket: *albedo.Bucket,
+    queryBuffer: [*]u8,
+    queryLen: u16,
+    programBuffer: [*]u8,
+    programLen: u16,
+    outUpdated: *usize,
+) Result {
+    var arena = std.heap.ArenaAllocator.init(ally);
+    defer arena.deinit();
+    const local_ally = arena.allocator();
+
+    var query = Query.parseRaw(local_ally, queryBuffer[0..queryLen]) catch |err| return mapQueryParseError(err);
+    defer query.deinit(local_ally);
+    var program = UpdateProgram.parseRaw(local_ally, programBuffer[0..programLen]) catch return Result.InvalidFormat;
+    defer program.deinit(local_ally);
+
+    outUpdated.* = bucket.transfigurate(query, program) catch |err| return mapWriteError(err);
     return Result.OK;
 }
 
