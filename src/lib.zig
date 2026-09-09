@@ -29,7 +29,7 @@ const ApiIoState = enum(u8) {
 };
 
 var api_threaded_state: std.atomic.Value(ApiIoState) = .init(.uninitialized);
-var api_threaded: std.Io.Threaded = undefined;
+var api_threaded: if (is_wasm) void else std.Io.Threaded = undefined;
 
 fn createReplicationCursorHandle(cursor: ReplicationCursor) !*ReplicationCursorHandle {
     const handle = try ally.create(ReplicationCursorHandle);
@@ -133,7 +133,7 @@ fn mapReplicationError(err: anyerror) Result {
 
 fn apiIo() std.Io {
     if (builtin.is_test) return testing.io;
-    if (is_wasm) return wasm_io.io();
+    if (comptime is_wasm) return wasm_io.io();
 
     while (true) {
         switch (api_threaded_state.load(.acquire)) {

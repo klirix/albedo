@@ -1,7 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const bson = @import("bson.zig");
 
 const Allocator = std.mem.Allocator;
+const is_wasm = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
 
 pub const UpdateProgram = struct {
     raw: bson.BSONDocument,
@@ -107,7 +109,10 @@ pub const UpdateProgram = struct {
     pub fn apply(self: UpdateProgram, ally: Allocator, source: bson.BSONDocument) ApplyError!bson.BSONDocument {
         const needs_now = if (self.prepared) self.uses_now else documentUsesNow(self.raw);
         const now_ms: u64 = if (needs_now) blk: {
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = if (comptime is_wasm)
+                @import("wasm_io.zig").io()
+            else
+                std.Io.Threaded.global_single_threaded.io();
             break :blk @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
         } else 0;
         return self.applyWithNowMillis(ally, source, now_ms);
